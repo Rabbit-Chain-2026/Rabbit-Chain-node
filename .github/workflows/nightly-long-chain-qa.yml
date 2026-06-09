@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zero-chain-nightly-long-chain-${{ github.ref }}
+  group: rabbitchain-chain-nightly-long-chain-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout zero-chain
+      - name: Checkout rabbitchain-chain
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -34,7 +34,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zero-chain-p2p-three-node-smoke
+          name: rabbitchain-chain-p2p-three-node-smoke
           path: |
             artifacts/p2p-3node-logs
           if-no-files-found: warn
@@ -44,22 +44,22 @@ jobs:
     timeout-minutes: 75
 
     steps:
-      - name: Checkout zero-chain
+      - name: Checkout rabbitchain-chain
         uses: actions/checkout@v4
         with:
-          path: zero-chain
+          path: rabbitchain-chain
 
-      - name: Checkout zero-mining-stack
+      - name: Checkout rabbitchain-mining-stack
         uses: actions/checkout@v4
         with:
-          repository: zero-chain-devs/zero-mining-stack
-          path: zero-mining-stack
+          repository: rabbitchain-chain-devs/rabbitchain-mining-stack
+          path: rabbitchain-mining-stack
 
-      - name: Checkout zero-explore
+      - name: Checkout rabbitchain-explorer
         uses: actions/checkout@v4
         with:
-          repository: zero-chain-devs/zero-explore
-          path: zero-explore
+          repository: rabbitchain-chain-devs/rabbitchain-explorer
+          path: rabbitchain-explorer
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -68,30 +68,30 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            zero-chain -> target
-            zero-mining-stack -> target
-            zero-explore/backend -> target
+            rabbitchain-chain -> target
+            rabbitchain-mining-stack -> target
+            rabbitchain-explorer/backend -> target
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20.18.1'
           cache: npm
-          cache-dependency-path: zero-explore/frontend/package-lock.json
+          cache-dependency-path: rabbitchain-explorer/frontend/package-lock.json
 
       - name: Run full-chain native E2E
-        working-directory: zero-chain
+        working-directory: rabbitchain-chain
         env:
-          MINING_STACK_DIR: ${{ github.workspace }}/zero-mining-stack
-          EXPLORER_DIR: ${{ github.workspace }}/zero-explore
+          MINING_STACK_DIR: ${{ github.workspace }}/rabbitchain-mining-stack
+          EXPLORER_DIR: ${{ github.workspace }}/rabbitchain-explorer
         run: bash scripts/full_chain_e2e.sh
 
       - name: Upload full-chain artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zero-chain-full-chain-native-e2e
+          name: rabbitchain-chain-full-chain-native-e2e
           path: |
-            zero-chain/artifacts/release-gate/full-chain-e2e-report.md
-            zero-chain/artifacts/full-chain-e2e-logs
+            rabbitchain-chain/artifacts/release-gate/full-chain-e2e-report.md
+            rabbitchain-chain/artifacts/full-chain-e2e-logs
           if-no-files-found: warn

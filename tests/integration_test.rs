@@ -1,12 +1,12 @@
-//! ZeroChain Integration Tests
+//! RabbitChain Integration Tests
 
-use zerocore::crypto::{Address, Ed25519PrivateKey, Hash};
-use zerocore::account::{Account, AccountType, U256, InMemoryAccountManager, AccountManager};
-use zerocore::block::{Block, create_genesis_block};
-use zerocore::consensus::{PowConsensus, PowAlgorithm, MiningEngine, MiningConfig};
-use zerocore::state::{StateDb, StateExecutor};
-use zerocore::blockchain::{Blockchain, SyncManager, SyncConfig};
-use zerostore::trie::{MerklePatriciaTrie, MemTrieDB};
+use rabbitcore::crypto::{Address, Ed25519PrivateKey, Hash};
+use rabbitcore::account::{Account, AccountType, U256, InMemoryAccountManager, AccountManager};
+use rabbitcore::block::{Block, create_genesis_block};
+use rabbitcore::consensus::{PowConsensus, PowAlgorithm, MiningEngine, MiningConfig};
+use rabbitcore::state::{StateDb, StateExecutor};
+use rabbitcore::blockchain::{Blockchain, SyncManager, SyncConfig};
+use rabbitstore::trie::{MerklePatriciaTrie, MemTrieDB};
 use std::sync::Arc;
 
 /// Test fixture for integration tests
@@ -164,7 +164,7 @@ fn test_mpt_trie() {
 /// Test: RLP encoding/decoding
 #[test]
 fn test_rlp_encoding() {
-    use zerocore::rlp::{RlpEncode, RlpDecode};
+    use rabbitcore::rlp::{RlpEncode, RlpDecode};
     
     // Test u64
     let original = 1000u64;
@@ -233,8 +233,8 @@ async fn test_account_management() {
     // Update balance
     manager.update_balance(
         &account.address,
-        zerocore::account::I256::from(1000),
-        zerocore::account::BalanceChangeReason::Transfer,
+        rabbitcore::account::I256::from(1000),
+        rabbitcore::account::BalanceChangeReason::Transfer,
     ).await.unwrap();
     
     let updated = manager.get_account(&account.address).await.unwrap().unwrap();
@@ -297,7 +297,7 @@ fn bench_transaction_creation() {
     
     for _ in 0..1000 {
         let key = Ed25519PrivateKey::random();
-        let payload = b"zerochain-signature-smoke";
+        let payload = b"rabbitchain-signature-smoke";
         let signature = key.sign(payload);
         assert!(signature.verify(payload, &key.public_key()).unwrap());
     }

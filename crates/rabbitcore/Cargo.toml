@@ -1,0 +1,48 @@
+[package]
+name = "rabbitcore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "RabbitChain core protocol implementation"
+
+[dependencies]
+# Cryptography
+sha3.workspace = true
+sha2.workspace = true
+ripemd.workspace = true
+blake3.workspace = true
+ed25519-dalek = "2.1"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+hex.workspace = true
+rlp.workspace = true
+rlp-derive.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+# Utils
+bytes.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+num_cpus.workspace = true
+rand = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+proptest = "1.4"
+ed25519-dalek = "2.1"

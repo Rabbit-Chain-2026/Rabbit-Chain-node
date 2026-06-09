@@ -44,7 +44,7 @@
 建议先跑：
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/workspace_acceptance.sh --quick
 ```
 
@@ -55,7 +55,7 @@ bash scripts/workspace_acceptance.sh --quick
 如果采用节点内置挖矿：
 
 ```bash
-scripts/mainnet.sh start bootnode --mine --coinbase ZER0xYOUR_COINBASE
+scripts/mainnet.sh start bootnode --mine --coinbase 0xYOUR_COINBASE
 ```
 
 如果采用外部矿工模式，建议：
@@ -64,13 +64,13 @@ scripts/mainnet.sh start bootnode --mine --coinbase ZER0xYOUR_COINBASE
 scripts/mainnet.sh start bootnode \
   --mine \
   --disable-local-miner \
-  --coinbase ZER0xYOUR_COINBASE \
+  --coinbase 0xYOUR_COINBASE \
   --rpc-rate-limit-per-minute 0
 ```
 
 说明：
 
-- `--disable-local-miner` 表示只开放 `zero_getWork` / `zero_submitWork`，不启动节点内置本地矿工
+- `--disable-local-miner` 表示只开放 `rabbit_getWork` / `rabbit_submitWork`，不启动节点内置本地矿工
 - `--rpc-rate-limit-per-minute 0` 只建议在受控 bring-up 阶段使用，避免外部矿工 smoke 被默认限流击穿
 - 启动后优先从节点日志读取 `bootnode enode hint: ...`，将该值提供给 follower / observer
 
@@ -87,7 +87,7 @@ scripts/mainnet.sh logs
 
 ```bash
 curl -sS -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"zero_getLatestBlock","params":[],"id":1}' \
+  -d '{"jsonrpc":"2.0","method":"rabbit_getLatestBlock","params":[],"id":1}' \
   http://127.0.0.1:8545
 ```
 
@@ -124,14 +124,14 @@ scripts/mainnet.sh start observer \
 说明：
 
 - observer 的 `--bootnode` 口径与 follower 相同，可使用 `enode://peer@ip:port` 或 `wss://...`
-- 如果 bootnode 要放在 Cloudflare CDN 后面，可使用 `wss://...` WebSocket P2P bootnode，并关闭 discovery；见 [P2P_WEBSOCKET_CDN.md](P2P_WEBSOCKET_CDN.md)。
+- 如果 bootnode 要放在 Cloudflare CDN 后面，可使用 `wss://...` WebSocket P2P bootnode，并关闭 discovery；见 [P2P 传输](book/40-network/p2p-transport.md)。
 
 ### 步骤 5：启动矿池与矿工
 
 矿池：
 
 ```bash
-cd ../zero-mining-stack
+cd ../rabbitchain-mining-stack
 cargo run --release -- \
   pool \
   --host 0.0.0.0 \
@@ -154,7 +154,7 @@ cargo run --release -- \
 scripts/mainnet.sh start bootnode \
   --mine \
   --disable-local-miner \
-  --coinbase ZER0xYOUR_COINBASE \
+  --coinbase 0xYOUR_COINBASE \
   --rpc-rate-limit-per-minute 0
 ```
 
@@ -165,8 +165,8 @@ scripts/mainnet.sh start bootnode \
 后端：
 
 ```bash
-cd ../zero-explore/backend
-ZERO_RPC_URL=http://BOOTNODE_IP:8545 cargo run --release
+cd ../rabbitchain-explorer/backend
+RABBIT_RPC_URL=http://BOOTNODE_IP:8545 cargo run --release
 ```
 
 ## 4. 核心观察项
@@ -176,17 +176,17 @@ ZERO_RPC_URL=http://BOOTNODE_IP:8545 cargo run --release
 至少确认：
 
 ```bash
-zerochain wallet new --name bringup-wallet --scheme ed25519 --passphrase 'StrongPassphrase123!'
-zerochain wallet list
-zerochain wallet sign --name bringup-wallet --message hello --passphrase 'StrongPassphrase123!'
+rabbitchain wallet new --name bringup-wallet --scheme ed25519 --passphrase 'StrongPassphrase123!'
+rabbitchain wallet list
+rabbitchain wallet sign --name bringup-wallet --message hello --passphrase 'StrongPassphrase123!'
 ```
 
 ### B. 挖矿
 
 至少确认：
 
-- `zero_getWork` 可返回 job
-- `zero_submitWork` 可返回 accepted
+- `rabbit_getWork` 可返回 job
+- `rabbit_submitWork` 可返回 accepted
 - pool `/v1/stats` 中 shares 增长
 - miner `/metrics` 中 accepted/hash counters 增长
 
@@ -204,7 +204,7 @@ scripts/mainnet_checklist.sh
 - `net_version` 一致
 - `net_peerCount >= 1`
 - 区块高度差在阈值内
-- `zero_peers` 能看到对端
+- `rabbit_peers` 能看到对端
 
 ## 5. 回退动作
 
@@ -245,6 +245,4 @@ scripts/mainnet.sh logs observer
 
 ## 7. 直接命令清单
 
-如果需要直接照抄执行，见：
-
-- [MAINNET_FIRST_WAVE_COMMANDS.md](/root/workspaces/blockchain/zero-chain/docs/MAINNET_FIRST_WAVE_COMMANDS.md)
+如果需要直接照抄执行，相关命令口径已并入 [主网拉起](book/70-operations/mainnet-bringup.md)，并由 `scripts/mainnet.sh` 与 `scripts/mainnet_local_bringup.sh` 承接。

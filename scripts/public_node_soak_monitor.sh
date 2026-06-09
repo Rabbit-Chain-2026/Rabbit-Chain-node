@@ -18,7 +18,7 @@ DEFAULT_REMOTE_USER="root"
 DEFAULT_REMOTE_RPC_PORT=28545
 DEFAULT_SSH_KEY="${HOME}/.ssh/agent_139_180_207_66"
 DEFAULT_LOCAL_SOAK_ENV="${ROOT_DIR}/artifacts/public-node-soak/current.env"
-DEFAULT_REMOTE_SOAK_ENV="/root/works/zero-chain-public-soak/current.env"
+DEFAULT_REMOTE_SOAK_ENV="/root/works/Rabbit-Chain-node-public-soak/current.env"
 
 usage() {
     cat <<'EOF'
@@ -40,7 +40,7 @@ Options:
   --local-node-pid <pid>    Local public node PID override
   --remote-node-pid <pid>   Remote public node PID override
   --local-soak-env <path>   Local node env file (default: artifacts/public-node-soak/current.env)
-  --remote-soak-env <path>  Remote node env file (default: /root/works/zero-chain-public-soak/current.env)
+  --remote-soak-env <path>  Remote node env file (default: /root/works/Rabbit-Chain-node-public-soak/current.env)
   --rpc-timeout-secs <n>    curl timeout per RPC request (default: 8)
   --rpc-retries <n>         RPC retries before marking sample failed (default: 3)
   --ssh-timeout-secs <n>    SSH connect timeout (default: 8)
@@ -611,26 +611,26 @@ run_monitor() {
         local remote_node_alive=-1
 
         local local_peers_json=""
-        if local_peers_json="$(rpc_call_local_with_retries "${local_rpc_url}" "zero_peers" "[]" "${rpc_timeout_secs}" "${rpc_retries}")"; then
+        if local_peers_json="$(rpc_call_local_with_retries "${local_rpc_url}" "rabbit_peers" "[]" "${rpc_timeout_secs}" "${rpc_retries}")"; then
             local_ok=1
             local_peers="$(extract_peer_count "${local_peers_json}")"
         else
             local_rpc_errors=$((local_rpc_errors + 1))
         fi
 
-        if rpc_call_local_with_retries "${local_rpc_url}" "zero_clientVersion" "[]" "${rpc_timeout_secs}" "${rpc_retries}" >/dev/null 2>&1; then
+        if rpc_call_local_with_retries "${local_rpc_url}" "rabbit_clientVersion" "[]" "${rpc_timeout_secs}" "${rpc_retries}" >/dev/null 2>&1; then
             local_client_ok=1
         fi
 
         local remote_peers_json=""
-        if remote_peers_json="$(rpc_call_remote_with_retries "${ssh_key}" "${ssh_timeout_secs}" "${remote_user}" "${remote_host}" "${remote_rpc_port}" "zero_peers" "[]" "${rpc_timeout_secs}" "${rpc_retries}")"; then
+        if remote_peers_json="$(rpc_call_remote_with_retries "${ssh_key}" "${ssh_timeout_secs}" "${remote_user}" "${remote_host}" "${remote_rpc_port}" "rabbit_peers" "[]" "${rpc_timeout_secs}" "${rpc_retries}")"; then
             remote_ok=1
             remote_peers="$(extract_peer_count "${remote_peers_json}")"
         else
             remote_rpc_errors=$((remote_rpc_errors + 1))
         fi
 
-        if rpc_call_remote_with_retries "${ssh_key}" "${ssh_timeout_secs}" "${remote_user}" "${remote_host}" "${remote_rpc_port}" "zero_clientVersion" "[]" "${rpc_timeout_secs}" "${rpc_retries}" >/dev/null 2>&1; then
+        if rpc_call_remote_with_retries "${ssh_key}" "${ssh_timeout_secs}" "${remote_user}" "${remote_host}" "${remote_rpc_port}" "rabbit_clientVersion" "[]" "${rpc_timeout_secs}" "${rpc_retries}" >/dev/null 2>&1; then
             remote_client_ok=1
         else
             # this is optional health data; do not count as hard rpc error

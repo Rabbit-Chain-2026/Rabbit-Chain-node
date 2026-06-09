@@ -1,9 +1,9 @@
-# ZeroChain Observability (Tracing + Metrics)
+# RabbitChain Observability (Tracing + Metrics)
 
 本项目当前已支持：
 
-1. **Tracing (OTel)**：`zerochain` 可将 tracing 导出到 OTLP。
-2. **Metrics (Prometheus text via RPC)**：`zero_getMetrics` 返回 Prometheus 格式文本。
+1. **Tracing (OTel)**：`rabbitchain` 可将 tracing 导出到 OTLP。
+2. **Metrics (Prometheus text via RPC)**：`rabbit_getMetrics` 返回 Prometheus 格式文本。
 
 ---
 
@@ -23,7 +23,7 @@ docker compose up -d
 ## 2) 以 OTel 模式启动节点
 
 ```bash
-zerochain --otel-enabled --otel-endpoint http://127.0.0.1:4317 --network testnet run
+rabbitchain --otel-enabled --otel-endpoint http://127.0.0.1:4317 --network testnet run
 ```
 
 你也可以配合脚本：
@@ -36,21 +36,21 @@ scripts/testnet.sh start --nodes 3 --clean-data
 
 ## 3) 查看节点指标
 
-调用 RPC 方法 `zero_getMetrics`：
+调用 RPC 方法 `rabbit_getMetrics`：
 
 ```bash
 curl -s http://127.0.0.1:18545 \
   -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"zero_getMetrics","params":[]}' | jq -r '.result.text'
+  -d '{"jsonrpc":"2.0","id":1,"method":"rabbit_getMetrics","params":[]}' | jq -r '.result.text'
 ```
 
 关键指标：
 
-- `zero_rpc_method_calls_total{method="..."}`
-- `zero_rpc_method_errors_total{method="..."}`
-- `zero_mining_shares_accepted_total{source="zero_submitWork"}`
-- `zero_mining_shares_rejected_total{reason="..."}`
-- `zero_latest_block_height`
+- `rabbit_rpc_method_calls_total{method="..."}`
+- `rabbit_rpc_method_errors_total{method="..."}`
+- `rabbit_mining_shares_accepted_total{source="rabbit_submitWork"}`
+- `rabbit_mining_shares_rejected_total{reason="..."}`
+- `rabbit_latest_block_height`
 
 ---
 
@@ -82,7 +82,7 @@ scripts/public_node_soak_monitor.sh start
 
 - 每 `60s` 采样一次
 - 连续运行 `72h`
-- 同时采集本地节点（`http://127.0.0.1:29645`）与远端节点（通过 SSH 在远端访问 `127.0.0.1:28545`）的 `zero_peers`/`zero_clientVersion` 健康数据
+- 同时采集本地节点（`http://127.0.0.1:29645`）与远端节点（通过 SSH 在远端访问 `127.0.0.1:28545`）的 `rabbit_peers`/`rabbit_clientVersion` 健康数据
 - 输出 CSV 到 `artifacts/public-node-soak-monitor/<timestamp>/samples.csv`
 
 常用命令：

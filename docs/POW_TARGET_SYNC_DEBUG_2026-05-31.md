@@ -38,9 +38,9 @@ target = max_target / difficulty
 
 ### 2.1 现象
 
-在把 `zero_getWork / zero_submitWork / zero_importBlock / zeronet sync` 改成完整 target 比较后，代码层面虽然能编译，但测试和联调暴露出几个底层问题：
+在把 `rabbit_getWork / rabbit_submitWork / rabbit_importBlock / rabbitnet sync` 改成完整 target 比较后，代码层面虽然能编译，但测试和联调暴露出几个底层问题：
 
-- 目标值异常，`target_leading_zero_bytes` 退化成 `32`
+- 目标值异常，`target_leading_rabbit_bytes` 退化成 `32`
 - target 计算结果不连续，明显不合理
 - 真实 share 被节点拒绝，提示 `pow_below_target`
 
@@ -48,10 +48,10 @@ target = max_target / difficulty
 
 先确认了当前实现确实已经改到完整 target：
 
-- `zeroapi` 返回 `target`
-- `zerocli` 本地 miner 按 `target` 求解
-- `zero-mining-stack` pool/miner 优先消费 `target`
-- `zeronet` 校验 `version=2` 区块时使用 `digest <= target`
+- `rabbitapi` 返回 `target`
+- `rabbitcli` 本地 miner 按 `target` 求解
+- `rabbitchain-mining-stack` pool/miner 优先消费 `target`
+- `rabbitnet` 校验 `version=2` 区块时使用 `digest <= target`
 
 然后逐步定位到两类底层问题：
 
@@ -68,7 +68,7 @@ target = max_target / difficulty
 
 根因有两个：
 
-1. [crates/zerocore/src/account/account.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zerocore/src/account/account.rs) 里的 `U256` 除法实现存在位序/内部运算问题。
+1. [crates/rabbitcore/src/account/account.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitcore/src/account/account.rs) 里的 `U256` 除法实现存在位序/内部运算问题。
 2. `pow_target_from_difficulty()` 走通用 `U256 / U256` 不适合当前这条共识路径；而这里的 `difficulty` 实际上是小整数，完全可以走确定性的专用长除法。
 
 ### 2.4 修复
@@ -76,27 +76,27 @@ target = max_target / difficulty
 做了两类修复：
 
 - 修正 `U256` 除法中的位设置和中间步骤。
-- 在 [crates/zerocore/src/block/mod.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zerocore/src/block/mod.rs) 单独实现 `max_target / u128 difficulty` 的 PoW target 计算，不再依赖通用 `U256 / U256`。
+- 在 [crates/rabbitcore/src/block/mod.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitcore/src/block/mod.rs) 单独实现 `max_target / u128 difficulty` 的 PoW target 计算，不再依赖通用 `U256 / U256`。
 
 同时统一了全链路：
 
-- `zeroapi`：`zero_getWork` 返回完整 `target`
-- `zero_submitWork`：按完整 target 验证 share
-- `zero_importBlock`：按完整 target 验证 `version=2` 区块
-- `zeronet`：同步校验 `version=2` 区块按完整 target，旧 `version=1` 继续兼容旧规则
-- `zerocli`：本地矿工按完整 target 试 nonce
-- `zero-mining-stack`：pool/miner 优先使用完整 target，旧 `target_leading_zero_bytes` 只保留兼容 fallback
+- `rabbitapi`：`rabbit_getWork` 返回完整 `target`
+- `rabbit_submitWork`：按完整 target 验证 share
+- `rabbit_importBlock`：按完整 target 验证 `version=2` 区块
+- `rabbitnet`：同步校验 `version=2` 区块按完整 target，旧 `version=1` 继续兼容旧规则
+- `rabbitcli`：本地矿工按完整 target 试 nonce
+- `rabbitchain-mining-stack`：pool/miner 优先使用完整 target，旧 `target_leading_rabbit_bytes` 只保留兼容 fallback
 
 ### 2.5 验证
 
 通过的检查：
 
-- `cargo test -p zerocore pow_target`
-- `cargo test -p zeroapi zero_get_work`
-- `cargo test -p zeroapi zero_submit_work`
-- `cargo test -p zeronet`
-- `cargo check -p zerocli`
-- `cd ../zero-mining-stack && cargo test && cargo check`
+- `cargo test -p rabbitcore pow_target`
+- `cargo test -p rabbitapi rabbit_get_work`
+- `cargo test -p rabbitapi rabbit_submit_work`
+- `cargo test -p rabbitnet`
+- `cargo check -p rabbitcli`
+- `cd ../rabbitchain-mining-stack && cargo test && cargo check`
 
 ## 3. 问题二：CLI 挖矿 smoke 失败，miner 提交的 share 被节点最终拒绝
 
@@ -105,8 +105,8 @@ target = max_target / difficulty
 `bash scripts/cli_mining_smoke.sh` 首次失败，现象是：
 
 - miner 启动
-- pool 能取到 `zero_getWork`
-- `zero_submitWork` 返回内部错误
+- pool 能取到 `rabbit_getWork`
+- `rabbit_submitWork` 返回内部错误
 - 高度始终不增长
 
 pool 日志里反复出现：
@@ -120,12 +120,12 @@ failed to persist mined block: Protocol error: pow_below_target
 脚本本身带了一个开发加速参数：
 
 ```bash
---mining-work-target-leading-zero-bytes 0
+--mining-work-target-leading-rabbit-bytes 0
 ```
 
 这个参数在旧规则下表示“非常容易命中的工作模板”，方便本地 smoke。
 
-改成 full-target 后，最初实现只在 `zero_getWork / zero_submitWork` 的工作模板和 share 验证路径上尊重这个覆盖项，但真正写入全局区块缓存时，仍走标准共识校验。
+改成 full-target 后，最初实现只在 `rabbit_getWork / rabbit_submitWork` 的工作模板和 share 验证路径上尊重这个覆盖项，但真正写入全局区块缓存时，仍走标准共识校验。
 
 结果就是：
 
@@ -139,9 +139,9 @@ failed to persist mined block: Protocol error: pow_below_target
 
 ### 3.4 修复
 
-在 [crates/zeroapi/src/rpc/mod.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zeroapi/src/rpc/mod.rs) 里把这个覆盖项明确定义为：
+在 [crates/rabbitapi/src/rpc/mod.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitapi/src/rpc/mod.rs) 里把这个覆盖项明确定义为：
 
-- 仅在显式传入 `--mining-work-target-leading-zero-bytes` 时生效
+- 仅在显式传入 `--mining-work-target-leading-rabbit-bytes` 时生效
 - 只用于开发/烟测节点
 - 这种模式下本地块不进入全局已验证同步缓存
 
@@ -186,8 +186,8 @@ sync invalid headers from peer ... start 77: first_header_parent_or_pow_invalid
 
 先检查本机保护节点：
 
-- `zero_peers` 有远端 peer
-- `zero_syncStatus` 显示不再增长
+- `rabbit_peers` 有远端 peer
+- `rabbit_syncStatus` 显示不再增长
 - 日志固定失败在 `start 77`
 
 然后对比本地 `76` 和远端 `77` 的持久化记录，重点看：
@@ -218,9 +218,9 @@ first_header_parent_or_pow_invalid
 
 受影响路径：
 
-- [crates/zeronet/src/protocol.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zeronet/src/protocol.rs)
-- [crates/zeronet/src/sync.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zeronet/src/sync.rs)
-- [crates/zeronet/src/lib.rs](/home/de/works/zero-chain-workspaces/zero-chain/crates/zeronet/src/lib.rs)
+- [crates/rabbitnet/src/protocol.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitnet/src/protocol.rs)
+- [crates/rabbitnet/src/sync.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitnet/src/sync.rs)
+- [crates/rabbitnet/src/lib.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitnet/src/lib.rs)
 
 ### 4.4 修复
 
@@ -229,7 +229,7 @@ first_header_parent_or_pow_invalid
 1. `SyncHeader` 增加 `version`
 2. `sync_header_from_block()` 发送时写入 `block.header.version`
 3. `block_from_sync_header()` 恢复时使用 `header.version`
-4. `ZERO/HEADERS` 解析兼容两种格式：
+4. `RABBIT/HEADERS` 解析兼容两种格式：
    - 旧 `9` 字段格式：默认 `version=1`
    - 新 `10` 字段格式：显式带 `version`
 
@@ -241,7 +241,7 @@ first_header_parent_or_pow_invalid
 
 验证顺序：
 
-1. 重新编译 `zerochain` release
+1. 重新编译 `rabbitchain` release
 2. 本机保护节点切到新二进制
 3. 局域网挖矿节点切到新二进制
 4. 重新观察本机 follower 是否自动追平
@@ -250,7 +250,7 @@ first_header_parent_or_pow_invalid
 
 - 本机保护节点从自己的持久化头 `0x54` 自动追到远端 `0xa2`
 - 后续继续跟到 `0xa3`
-- `zero_syncStatus` 恢复为随远端增长
+- `rabbit_syncStatus` 恢复为随远端增长
 - 本机日志中不再出现 `first_header_parent_or_pow_invalid`
 
 ## 5. 最终状态
@@ -277,11 +277,11 @@ first_header_parent_or_pow_invalid
 
 2. 一旦引入 `header version` 分叉语义，协议和持久化层必须显式携带该字段，不能靠默认值猜。
 
-3. 开发便捷参数和主网语义必须严格隔离。`--mining-work-target-leading-zero-bytes` 这类覆盖项只能留在显式 dev/test 路径，不能污染默认共识面。
+3. 开发便捷参数和主网语义必须严格隔离。`--mining-work-target-leading-rabbit-bytes` 这类覆盖项只能留在显式 dev/test 路径，不能污染默认共识面。
 
 ## 7. 建议后续动作
 
-- 把 `zero_getLatestBlock` / explorer / 相关前端也统一展示 `version`
+- 把 `rabbit_getLatestBlock` / explorer / 相关前端也统一展示 `version`
 - 增加一个专门的双节点回归脚本：
   - 旧 `version=1` 历史头
   - 新 `version=2` 实时追块

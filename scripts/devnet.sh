@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${ROOT_DIR}/target/release/zerochain"
-DATA_DIR="${HOME}/.zerochain/devnet"
+BIN="${ROOT_DIR}/target/release/rabbitchain"
+DATA_DIR="${HOME}/.rabbitchain/devnet"
 LOG_FILE="${DATA_DIR}/devnet.log"
 PID_FILE="${DATA_DIR}/devnet.pid"
 
@@ -14,7 +14,7 @@ WS_PORT=28546
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/devnet.sh start [--mine] [--coinbase ZER0x...] [--clean-data]
+  scripts/devnet.sh start [--mine] [--coinbase 0x...] [--clean-data]
   scripts/devnet.sh stop
   scripts/devnet.sh status
   scripts/devnet.sh logs
@@ -26,7 +26,7 @@ ensure_binary() {
         return 0
     fi
     if command -v cargo >/dev/null 2>&1; then
-        (cd "${ROOT_DIR}" && cargo build -p zerocli --release)
+        (cd "${ROOT_DIR}" && cargo build -p rabbitcli --release)
     else
         echo "missing binary and cargo"
         exit 1

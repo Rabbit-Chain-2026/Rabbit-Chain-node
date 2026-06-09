@@ -1,17 +1,17 @@
 # Compute JSON Spec
 
-这份文档定义 ZeroChain `compute` JSON 的共享规范。
+这份文档定义 RabbitChain `compute` JSON 的共享规范。
 
 适用范围：
-- `zerochain compute send`
-- `zero_simulateComputeTx`
-- `zero_submitComputeTx`
-- `zero-wallet-chrome`
-- `zero-wallet-mobile`
+- `rabbitchain compute send`
+- `rabbit_simulateComputeTx`
+- `rabbit_submitComputeTx`
+- `rabbitchain-wallet-chrome`
+- `rabbitchain-wallet-mobile`
 
 单一事实来源：
-- RPC 解析与校验：`crates/zeroapi/src/rpc/mod.rs`
-- signing preimage：`crates/zerocore/src/compute/tx.rs`
+- RPC 解析与校验：`crates/rabbitapi/src/rpc/mod.rs`
+- signing preimage：`crates/rabbitcore/src/compute/tx.rs`
 
 ## 顶层结构
 
@@ -44,7 +44,7 @@
 ### `tx_id`
 - 类型：`0x` 前缀 32-byte hex string。
 - 语义：必须等于 `keccak256(signing_preimage)`。
-- CLI 行为：`zerochain compute send` 提交前会自动重算并覆盖错误的 `tx_id`。
+- CLI 行为：`rabbitchain compute send` 提交前会自动重算并覆盖错误的 `tx_id`。
 - 钱包行为：插件钱包和移动钱包签名时会自动生成正确 `tx_id`。
 
 ### `domain_id`
@@ -127,11 +127,11 @@
 ```
 
 ```json
-{ "type": "Address", "address": "ZER0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975" }
+{ "type": "Address", "address": "0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975" }
 ```
 
 ```json
-{ "type": "Program", "address": "ZER0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975" }
+{ "type": "Program", "address": "0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975" }
 ```
 
 ```json
@@ -139,8 +139,8 @@
 ```
 
 #### `Address` / `Program`
-- 规范口径是 `ZER0x...`。
-- RPC 解析接受 `ZER0x...`。
+- 规范口径是 `0x...`。
+- RPC 解析接受 `0x...`。
 - 钱包内部在做 signing preimage 编码时会提取为 20-byte 地址。
 - 不要把 `address` 字段手工改成 32-byte hash、公钥或其它编码。
 
@@ -271,20 +271,20 @@
 ## 三端归一化约定
 
 ### CLI
-- `zerochain compute send` 读取 JSON 后会：
+- `rabbitchain compute send` 读取 JSON 后会：
   - 要求顶层必须是 object
   - 自动规范化 `tx_id`
   - 原样提交其余字段
 - 当节点拒绝提交时，CLI 会显示 RPC `error.data`，不再只显示 `Invalid params`。
 
 ### 浏览器插件钱包
-- `Address` owner 支持 `ZER0x...`
+- `Address` owner 支持 `0x...`
 - `Ed25519.public_key` 支持单个 `0x...`，并容忍重复前缀输入
 - signing preimage 内部编码时再转换成 20-byte address / 32-byte pubkey
 
 ### 移动钱包
 - 与插件钱包保持同一规则：
-  - `Address` owner 使用 `ZER0x...`
+  - `Address` owner 使用 `0x...`
   - `Ed25519.public_key` 使用 `0x...`
   - 编码时再转换为底层字节
 
@@ -307,7 +307,7 @@
       "kind": "Asset",
       "owner": {
         "type": "Address",
-        "address": "ZER0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975"
+        "address": "0x9aea038CD4255BaaC26eAC5A74e58a07ED2f1975"
       },
       "predecessor": null,
       "version": 1,
@@ -352,7 +352,7 @@
       "kind": "Asset",
       "owner": {
         "type": "Address",
-        "address": "ZER0xA9230F7a17603f07daFD3aD5dbb1dd43Ee34FDAD"
+        "address": "0xA9230F7a17603f07daFD3aD5dbb1dd43Ee34FDAD"
       },
       "predecessor": "0x6ec3dc8a0afc5a091844381ab521fec97e4fc80443026627ba649fa45d0691f4",
       "version": 2,
@@ -381,7 +381,7 @@
 ## 变更规则
 
 以后如果 compute JSON 协议有变更：
-- 先更新 `zeroapi` / `zerocore` 实现
+- 先更新 `rabbitapi` / `rabbitcore` 实现
 - 再更新这份文档
 - 再更新插件钱包、移动钱包、CLI 的入口引用
 

@@ -78,7 +78,7 @@ bootnode_peer_json=''
 bootnode_block_json=''
 if bootnode_net_json="$(rpc_call "${BOOTNODE_RPC_URL}" net_version 2>/dev/null)" && \
    bootnode_peer_json="$(rpc_call "${BOOTNODE_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   bootnode_block_json="$(rpc_call "${BOOTNODE_RPC_URL}" zero_getLatestBlock 2>/dev/null)"; then
+   bootnode_block_json="$(rpc_call "${BOOTNODE_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)"; then
   log_pass "bootnode RPC 可达"
 else
   log_fail "bootnode RPC 不可达 (${BOOTNODE_RPC_URL})"
@@ -89,7 +89,7 @@ follower_peer_json=''
 follower_block_json=''
 if follower_net_json="$(rpc_call "${FOLLOWER_RPC_URL}" net_version 2>/dev/null)" && \
    follower_peer_json="$(rpc_call "${FOLLOWER_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   follower_block_json="$(rpc_call "${FOLLOWER_RPC_URL}" zero_getLatestBlock 2>/dev/null)"; then
+   follower_block_json="$(rpc_call "${FOLLOWER_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)"; then
   log_pass "follower RPC 可达"
 else
   log_fail "follower RPC 不可达 (${FOLLOWER_RPC_URL})"
@@ -100,7 +100,7 @@ observer_peer_json=''
 observer_block_json=''
 if observer_net_json="$(rpc_call "${OBSERVER_RPC_URL}" net_version 2>/dev/null)" && \
    observer_peer_json="$(rpc_call "${OBSERVER_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   observer_block_json="$(rpc_call "${OBSERVER_RPC_URL}" zero_getLatestBlock 2>/dev/null)"; then
+   observer_block_json="$(rpc_call "${OBSERVER_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)"; then
   log_pass "observer RPC 可达"
 else
   log_fail "observer RPC 不可达 (${OBSERVER_RPC_URL})"
@@ -179,7 +179,7 @@ else
   log_fail "miner metrics 不可达 (${MINER_METRICS_URL}/metrics)"
 fi
 
-miner_accepted="$(printf '%s' "${miner_metrics}" | sed -n 's/.*zero_miner_shares_total{[^}]*status="accepted"} \([0-9][0-9]*\).*/\1/p' | tail -n1)"
+miner_accepted="$(printf '%s' "${miner_metrics}" | sed -n 's/.*rabbit_miner_shares_total{[^}]*status="accepted"} \([0-9][0-9]*\).*/\1/p' | tail -n1)"
 miner_accepted="${miner_accepted:-0}"
 if (( miner_accepted >= MIN_MINER_ACCEPTED )); then
   log_pass "miner accepted shares 达标 (${miner_accepted})"

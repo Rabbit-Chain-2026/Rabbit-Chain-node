@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-LOCAL_ZEROCHAIN_BIN="${LOCAL_ZEROCHAIN_BIN:-${ROOT_DIR}/target/release/zerochain}"
-REMOTE_ZEROCHAIN_BIN="${REMOTE_ZEROCHAIN_BIN:-/root/zerochain_local.mainnet_sync}"
+LOCAL_RABBITCHAIN_BIN="${LOCAL_RABBITCHAIN_BIN:-${ROOT_DIR}/target/release/rabbitchain}"
+REMOTE_RABBITCHAIN_BIN="${REMOTE_RABBITCHAIN_BIN:-/root/rabbitchain_local.mainnet_sync}"
 
 REMOTE_HOST="${REMOTE_HOST:-139.180.207.66}"
 REMOTE_USER="${REMOTE_USER:-root}"
@@ -23,7 +23,7 @@ OBSERVER_P2P_PORT="${OBSERVER_P2P_PORT:-32303}"
 
 NETWORK_ID="${NETWORK_ID:-10086}"
 CHAIN_ID="${CHAIN_ID:-10086}"
-COINBASE="${COINBASE:-ZER0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
+COINBASE="${COINBASE:-0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
 
 VERIFY_TIMEOUT_SECS="${VERIFY_TIMEOUT_SECS:-180}"
 VERIFY_INTERVAL_SECS="${VERIFY_INTERVAL_SECS:-10}"
@@ -144,8 +144,8 @@ wait_remote_bootnode_enode() {
     local enode
     enode="$(ssh_cmd '
 set -euo pipefail
-if [ -f /root/works/zero-chain-public-soak/current.env ]; then
-  . /root/works/zero-chain-public-soak/current.env
+if [ -f /root/works/Rabbit-Chain-node-public-soak/current.env ]; then
+  . /root/works/Rabbit-Chain-node-public-soak/current.env
   if [ -n "${LOG_FILE:-}" ] && [ -f "${LOG_FILE}" ]; then
     grep -m1 "bootnode enode hint:" "${LOG_FILE}" 2>/dev/null | sed "s/.*hint: //"
   fi
@@ -170,8 +170,8 @@ require_cmd curl
 require_cmd ssh
 require_cmd sed
 
-if [[ ! -x "${LOCAL_ZEROCHAIN_BIN}" ]]; then
-  echo "local zerochain binary not found: ${LOCAL_ZEROCHAIN_BIN}" >&2
+if [[ ! -x "${LOCAL_RABBITCHAIN_BIN}" ]]; then
+  echo "local rabbitchain binary not found: ${LOCAL_RABBITCHAIN_BIN}" >&2
   exit 1
 fi
 if [[ ! -f "${SSH_KEY}" ]]; then
@@ -207,8 +207,8 @@ fi
 log "停止远端公网节点"
 ssh_cmd '
 set -euo pipefail
-if [ -f /root/works/zero-chain-public-soak/current.env ]; then
-  . /root/works/zero-chain-public-soak/current.env || true
+if [ -f /root/works/Rabbit-Chain-node-public-soak/current.env ]; then
+  . /root/works/Rabbit-Chain-node-public-soak/current.env || true
   if [ -n "${NODE_PID:-}" ] && kill -0 "${NODE_PID}" 2>/dev/null; then
     kill "${NODE_PID}" || true
     sleep 1
@@ -224,22 +224,22 @@ mkdir -p artifacts/public-node-observer
 log "清空远端公网数据"
 ssh_cmd '
 set -euo pipefail
-rm -rf /root/works/zero-chain-public-soak/[0-9]* \
-       /root/works/zero-chain-public-soak/current.env \
-       /root/works/zero-chain-public-soak/remote-node.pid
-mkdir -p /root/works/zero-chain-public-soak
+rm -rf /root/works/Rabbit-Chain-node-public-soak/[0-9]* \
+       /root/works/Rabbit-Chain-node-public-soak/current.env \
+       /root/works/Rabbit-Chain-node-public-soak/remote-node.pid
+mkdir -p /root/works/Rabbit-Chain-node-public-soak
 '
 
 log "启动远端公网节点"
 ssh_cmd "
 set -euo pipefail
 TS=\$(date -u +%Y%m%dT%H%M%SZ)
-RUN_DIR=/root/works/zero-chain-public-soak/\${TS}
+RUN_DIR=/root/works/Rabbit-Chain-node-public-soak/\${TS}
 DATA_DIR=\${RUN_DIR}/remote-node-data
 LOG_FILE=\${RUN_DIR}/remote-node.log
 mkdir -p \"\${RUN_DIR}\"
 if command -v setsid >/dev/null 2>&1; then
-  setsid ${REMOTE_ZEROCHAIN_BIN} \\
+  setsid ${REMOTE_RABBITCHAIN_BIN} \\
     --data-dir \"\${DATA_DIR}\" \\
     run \\
     --mine \\
@@ -253,7 +253,7 @@ if command -v setsid >/dev/null 2>&1; then
     --rpc-coinbase ${COINBASE} \\
     >\"\${LOG_FILE}\" 2>&1 < /dev/null &
 else
-  nohup ${REMOTE_ZEROCHAIN_BIN} \\
+  nohup ${REMOTE_RABBITCHAIN_BIN} \\
     --data-dir \"\${DATA_DIR}\" \\
     run \\
     --mine \\
@@ -268,13 +268,13 @@ else
     >\"\${LOG_FILE}\" 2>&1 < /dev/null &
 fi
 NEW_PID=\$!
-cat > /root/works/zero-chain-public-soak/current.env <<ENV
+cat > /root/works/Rabbit-Chain-node-public-soak/current.env <<ENV
 RUN_DIR=\${RUN_DIR}
 DATA_DIR=\${DATA_DIR}
 LOG_FILE=\${LOG_FILE}
 NODE_PID=\${NEW_PID}
 ENV
-echo \"\${NEW_PID}\" > /root/works/zero-chain-public-soak/remote-node.pid
+echo \"\${NEW_PID}\" > /root/works/Rabbit-Chain-node-public-soak/remote-node.pid
 echo \"remote_pid=\${NEW_PID}\"
 "
 
@@ -292,7 +292,7 @@ LOCAL_DATA_DIR="${LOCAL_RUN_DIR}/local-node-data"
 LOCAL_LOG_FILE="${LOCAL_RUN_DIR}/local-node.log"
 mkdir -p "${LOCAL_RUN_DIR}"
 if command -v setsid >/dev/null 2>&1; then
-  setsid "${LOCAL_ZEROCHAIN_BIN}" \
+  setsid "${LOCAL_RABBITCHAIN_BIN}" \
     --data-dir "${LOCAL_DATA_DIR}" \
     run \
     --coinbase "${COINBASE}" \
@@ -306,7 +306,7 @@ if command -v setsid >/dev/null 2>&1; then
     --network-id "${NETWORK_ID}" \
     >"${LOCAL_LOG_FILE}" 2>&1 < /dev/null &
 else
-  nohup "${LOCAL_ZEROCHAIN_BIN}" \
+  nohup "${LOCAL_RABBITCHAIN_BIN}" \
     --data-dir "${LOCAL_DATA_DIR}" \
     run \
     --coinbase "${COINBASE}" \
@@ -341,7 +341,7 @@ OBSERVER_DATA_DIR="${OBSERVER_RUN_DIR}/observer-node-data"
 OBSERVER_LOG_FILE="${OBSERVER_RUN_DIR}/observer-node.log"
 mkdir -p "${OBSERVER_RUN_DIR}"
 if command -v setsid >/dev/null 2>&1; then
-  setsid "${LOCAL_ZEROCHAIN_BIN}" \
+  setsid "${LOCAL_RABBITCHAIN_BIN}" \
     --data-dir "${OBSERVER_DATA_DIR}" \
     run \
     --http-port "${OBSERVER_RPC_PORT}" \
@@ -355,7 +355,7 @@ if command -v setsid >/dev/null 2>&1; then
     --rpc-coinbase "${COINBASE}" \
     >"${OBSERVER_LOG_FILE}" 2>&1 < /dev/null &
 else
-  nohup "${LOCAL_ZEROCHAIN_BIN}" \
+  nohup "${LOCAL_RABBITCHAIN_BIN}" \
     --data-dir "${OBSERVER_DATA_DIR}" \
     run \
     --http-port "${OBSERVER_RPC_PORT}" \
@@ -392,7 +392,7 @@ if ! wait_rpc_up observer 25; then
 fi
 
 # discover remote pid from remote env
-REMOTE_PID="$(ssh_cmd 'set -euo pipefail; . /root/works/zero-chain-public-soak/current.env; printf "%s" "${NODE_PID}"')"
+REMOTE_PID="$(ssh_cmd 'set -euo pipefail; . /root/works/Rabbit-Chain-node-public-soak/current.env; printf "%s" "${NODE_PID}"')"
 
 log "启动公网监控"
 ./scripts/public_node_soak_monitor.sh start \
@@ -422,9 +422,9 @@ while true; do
   local_peers_hex="$(rpc_local net_peerCount | extract_result_hex || true)"
   remote_peers_hex="$(rpc_remote net_peerCount | extract_result_hex || true)"
   observer_peers_hex="$(rpc_observer net_peerCount | extract_result_hex || true)"
-  local_block_hex="$(rpc_local zero_getLatestBlock | extract_block_hex || true)"
-  remote_block_hex="$(rpc_remote zero_getLatestBlock | extract_block_hex || true)"
-  observer_block_hex="$(rpc_observer zero_getLatestBlock | extract_block_hex || true)"
+  local_block_hex="$(rpc_local rabbit_getLatestBlock | extract_block_hex || true)"
+  remote_block_hex="$(rpc_remote rabbit_getLatestBlock | extract_block_hex || true)"
+  observer_block_hex="$(rpc_observer rabbit_getLatestBlock | extract_block_hex || true)"
 
   if [[ -n "${local_peers_hex}" && -n "${remote_peers_hex}" && -n "${observer_peers_hex}" && -n "${local_block_hex}" && -n "${remote_block_hex}" && -n "${observer_block_hex}" ]]; then
     local_peers_dec="$(hex_to_dec "${local_peers_hex}")"
@@ -443,19 +443,19 @@ while true; do
 
     if (( local_peers_dec >= 1 && observer_peers_dec >= 1 && remote_peers_dec >= 1 && local_block_dec >= VERIFY_MIN_HEIGHT && observer_block_dec >= VERIFY_MIN_HEIGHT && remote_block_dec >= VERIFY_MIN_HEIGHT && local_gap <= VERIFY_MAX_GAP && observer_gap <= VERIFY_MAX_OBSERVER_GAP )); then
       local_hash="$(
-        rpc_local zero_getBlockByNumber "[\"${local_block_hex}\"]" \
+        rpc_local rabbit_getBlockByNumber "[\"${local_block_hex}\"]" \
           | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p'
       )"
       remote_hash_for_local="$(
-        ssh_cmd "curl -fsS --max-time 8 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"zero_getBlockByNumber\",\"params\":[\"${local_block_hex}\"],\"id\":1}' http://127.0.0.1:${REMOTE_RPC_PORT}" \
+        ssh_cmd "curl -fsS --max-time 8 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"rabbit_getBlockByNumber\",\"params\":[\"${local_block_hex}\"],\"id\":1}' http://127.0.0.1:${REMOTE_RPC_PORT}" \
           | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p'
       )"
       observer_hash="$(
-        rpc_observer zero_getBlockByNumber "[\"${observer_block_hex}\"]" \
+        rpc_observer rabbit_getBlockByNumber "[\"${observer_block_hex}\"]" \
           | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p'
       )"
       remote_hash_for_observer="$(
-        ssh_cmd "curl -fsS --max-time 8 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"zero_getBlockByNumber\",\"params\":[\"${observer_block_hex}\"],\"id\":1}' http://127.0.0.1:${REMOTE_RPC_PORT}" \
+        ssh_cmd "curl -fsS --max-time 8 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"rabbit_getBlockByNumber\",\"params\":[\"${observer_block_hex}\"],\"id\":1}' http://127.0.0.1:${REMOTE_RPC_PORT}" \
           | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p'
       )"
 

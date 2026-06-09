@@ -7,7 +7,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BIN_PATH="${ROOT_DIR}/target/debug/zerochain"
+BIN_PATH="${ROOT_DIR}/target/debug/rabbitchain"
 REPORT_DIR="${ROOT_DIR}/artifacts/p2p-node-failure"
 LOG_DIR="${REPORT_DIR}/logs"
 REPORT_FILE="${REPORT_DIR}/report.md"
@@ -87,7 +87,7 @@ wait_rpc_ready() {
   local timeout_secs="${2:-60}"
   local i=0
   while (( i < timeout_secs )); do
-    if rpc_call "${rpc_port}" zero_clientVersion '[]' >/dev/null 2>&1; then
+    if rpc_call "${rpc_port}" rabbit_clientVersion '[]' >/dev/null 2>&1; then
       return 0
     fi
     i=$((i + 1))
@@ -117,14 +117,14 @@ wait_peer_count_at_least() {
 
 assert_rpc_alive() {
   local rpc_port="$1"
-  rpc_call "${rpc_port}" zero_clientVersion '[]' >/dev/null
+  rpc_call "${rpc_port}" rabbit_clientVersion '[]' >/dev/null
   rpc_call "${rpc_port}" net_version '[]' >/dev/null
-  rpc_call "${rpc_port}" zero_peers '[]' >/dev/null
+  rpc_call "${rpc_port}" rabbit_peers '[]' >/dev/null
 }
 
 assert_rpc_down() {
   local rpc_port="$1"
-  if rpc_call "${rpc_port}" zero_clientVersion '[]' >/dev/null 2>&1; then
+  if rpc_call "${rpc_port}" rabbit_clientVersion '[]' >/dev/null 2>&1; then
     echo "Expected RPC on :${rpc_port} to be down" >&2
     exit 1
   fi
@@ -152,8 +152,8 @@ for port in "${RPC1}" "${RPC2}" "${RPC3}" "${WS1}" "${WS2}" "${WS3}" "${P2P1}" "
   assert_port_free "${port}"
 done
 
-echo "==> Build zerocli"
-cargo build -p zerocli >/dev/null
+echo "==> Build rabbitcli"
+cargo build -p rabbitcli >/dev/null
 
 BOOTNODE_1="enode://bootnode-1@127.0.0.1:${P2P1}"
 

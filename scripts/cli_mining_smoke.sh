@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Local smoke for zerochain CLI + compute RPC + zero-mining-stack pool/miner.
+# Local smoke for rabbitchain CLI + compute RPC + rabbitchain-mining-stack pool/miner.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WORKSPACE_DIR="${WORKSPACE_DIR:-${ROOT_DIR}/..}"
-MINING_STACK_DIR="${MINING_STACK_DIR:-${WORKSPACE_DIR}/zero-mining-stack}"
+MINING_STACK_DIR="${MINING_STACK_DIR:-${WORKSPACE_DIR}/rabbitchain-mining-stack}"
 REPORT_DIR="${ROOT_DIR}/artifacts/cli-mining-smoke"
 LOG_DIR="${REPORT_DIR}/logs"
 REPORT_FILE="${REPORT_DIR}/report.md"
@@ -25,7 +25,7 @@ MINER_METRICS_URL="http://127.0.0.1:${MINER_METRICS_PORT}"
 CHAIN_ID="${CHAIN_ID:-10086}"
 NETWORK_ID="${NETWORK_ID:-10086}"
 RPC_AUTH_TOKEN="${RPC_AUTH_TOKEN:-cli-mining-smoke-token}"
-COINBASE_NATIVE="${COINBASE_NATIVE:-ZER0x0000000000000000000000000000000000000000}"
+COINBASE_NATIVE="${COINBASE_NATIVE:-0x0000000000000000000000000000000000000000}"
 MINER_ID="${MINER_ID:-miner-smoke-1}"
 FIXTURE_FILE="${FIXTURE_FILE:-${ROOT_DIR}/fixtures/compute_json/ed25519_owner_mint.json}"
 
@@ -40,16 +40,16 @@ usage() {
 Usage: bash scripts/cli_mining_smoke.sh
 
 Environment overrides:
-  MINING_STACK_DIR      Sibling zero-mining-stack checkout
-  NODE_RPC_PORT         Local zerochain RPC port (default: 18455)
-  NODE_WS_PORT          Local zerochain WS port (default: 18456)
-  NODE_P2P_PORT         Local zerochain P2P port (default: 31303)
-  POOL_PORT             zero-mining-stack pool port (default: 9332)
-  MINER_METRICS_PORT    zero-mining-stack miner metrics port (default: 9333)
-  CHAIN_ID              zerochain chain_id override (default: 10086)
-  NETWORK_ID            zerochain network_id override (default: 10086)
+  MINING_STACK_DIR      Sibling rabbitchain-mining-stack checkout
+  NODE_RPC_PORT         Local rabbitchain RPC port (default: 18455)
+  NODE_WS_PORT          Local rabbitchain WS port (default: 18456)
+  NODE_P2P_PORT         Local rabbitchain P2P port (default: 31303)
+  POOL_PORT             rabbitchain-mining-stack pool port (default: 9332)
+  MINER_METRICS_PORT    rabbitchain-mining-stack miner metrics port (default: 9333)
+  CHAIN_ID              rabbitchain chain_id override (default: 10086)
+  NETWORK_ID            rabbitchain network_id override (default: 10086)
   RPC_AUTH_TOKEN        Auth token required by node RPC write methods
-  COINBASE_NATIVE       Coinbase used for mining RPC (default: all-zero ZER0x)
+  COINBASE_NATIVE       Coinbase used for mining RPC (default: 0x0000000000000000000000000000000000000000)
   MINER_ID              Miner identifier label (default: miner-smoke-1)
   FIXTURE_FILE          Compute fixture JSON with top-level {"input":...}
 EOF
@@ -190,14 +190,14 @@ TMP_RUN_DIR="$(mktemp -d "${REPORT_DIR}/run.XXXXXX")"
 NODE_DATA_DIR="${TMP_RUN_DIR}/node-data"
 TX_INPUT_FILE="${TMP_RUN_DIR}/compute-input.json"
 
-echo "==> Build zerochain CLI"
-cargo build -p zerocli >/dev/null
+echo "==> Build rabbitchain CLI"
+cargo build -p rabbitcli >/dev/null
 
-echo "==> Build zero-mining-stack"
+echo "==> Build rabbitchain-mining-stack"
 (cd "${MINING_STACK_DIR}" && cargo build >/dev/null)
 
 echo "==> Prepare local node data"
-"${ROOT_DIR}/target/debug/zerochain" --network local --data-dir "${NODE_DATA_DIR}" init >/dev/null
+"${ROOT_DIR}/target/debug/rabbitchain" --network local --data-dir "${NODE_DATA_DIR}" init >/dev/null
 
 echo "==> Extract compute fixture input"
 python3 - "${FIXTURE_FILE}" "${TX_INPUT_FILE}" <<'PY'
@@ -212,8 +212,8 @@ with open(dest, "w", encoding="utf-8") as fh:
     fh.write("\n")
 PY
 
-echo "==> Start zerochain node"
-"${ROOT_DIR}/target/debug/zerochain" \
+echo "==> Start rabbitchain node"
+"${ROOT_DIR}/target/debug/rabbitchain" \
   --network local \
   --data-dir "${NODE_DATA_DIR}" \
   run \
@@ -226,7 +226,7 @@ echo "==> Start zerochain node"
   --network-id "${NETWORK_ID}" \
   --rpc-auth-token "${RPC_AUTH_TOKEN}" \
   --rpc-rate-limit-per-minute 0 \
-  --mining-work-target-leading-zero-bytes 0 \
+  --mining-work-target-leading-rabbit-bytes 0 \
   --coinbase "${COINBASE_NATIVE}" \
   --rpc-coinbase "${COINBASE_NATIVE}" \
   >"${NODE_LOG}" 2>&1 &
@@ -235,10 +235,10 @@ PIDS+=("$!")
 wait_rpc_ok 60
 
 echo "==> Verify block CLI and RPC"
-latest_block_json="$("${ROOT_DIR}/target/debug/zerochain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" block latest)"
-genesis_block_json="$("${ROOT_DIR}/target/debug/zerochain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" block get --number 0)"
+latest_block_json="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" block latest)"
+genesis_block_json="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" block get --number 0)"
 net_version_json="$(rpc_call "net_version" "[]")"
-get_work_before_json="$(rpc_call "zero_getWork" "[]")"
+get_work_before_json="$(rpc_call "rabbit_getWork" "[]")"
 
 if ! printf '%s' "${latest_block_json}" | grep -q 'number": "0x0"'; then
   echo "Expected latest block to start at genesis" >&2
@@ -258,7 +258,7 @@ if [[ "${net_version}" != "${NETWORK_ID}" ]]; then
 fi
 
 echo "==> Submit compute transaction via CLI"
-compute_send_output="$("${ROOT_DIR}/target/debug/zerochain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute send --tx-file "${TX_INPUT_FILE}")"
+compute_send_output="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute send --tx-file "${TX_INPUT_FILE}")"
 canonical_tx_id="$(printf '%s' "${compute_send_output}" | sed -n 's/^canonical_tx_id: \(0x[0-9a-fA-F]\+\)$/\1/p')"
 if [[ -z "${canonical_tx_id}" ]]; then
   echo "Failed to extract canonical_tx_id from compute send output" >&2
@@ -266,9 +266,9 @@ if [[ -z "${canonical_tx_id}" ]]; then
   exit 1
 fi
 
-compute_get_output="$("${ROOT_DIR}/target/debug/zerochain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${canonical_tx_id}")"
-output_json="$(rpc_call "zero_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
-object_json="$(rpc_call "zero_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
+compute_get_output="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${canonical_tx_id}")"
+output_json="$(rpc_call "rabbit_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
+object_json="$(rpc_call "rabbit_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
 
 if ! printf '%s' "${compute_get_output}" | grep -q '"ok": true'; then
   echo "Compute result did not return ok=true" >&2
@@ -276,18 +276,18 @@ if ! printf '%s' "${compute_get_output}" | grep -q '"ok": true'; then
   exit 1
 fi
 if ! printf '%s' "${output_json}" | grep -q '"output_id":"0x5656565656565656565656565656565656565656565656565656565656565656"'; then
-  echo "zero_getOutput did not return expected output" >&2
+  echo "rabbit_getOutput did not return expected output" >&2
   echo "${output_json}" >&2
   exit 1
 fi
 if ! printf '%s' "${object_json}" | grep -q '"object_id":"0x7878787878787878787878787878787878787878787878787878787878787878"'; then
-  echo "zero_getObject did not return expected object" >&2
+  echo "rabbit_getObject did not return expected object" >&2
   echo "${object_json}" >&2
   exit 1
 fi
 
 echo "==> Start mining pool"
-"${MINING_STACK_DIR}/target/debug/zero-mining-stack" \
+"${MINING_STACK_DIR}/target/debug/rabbitchain-mining-stack" \
   pool \
   --host 127.0.0.1 \
   --port "${POOL_PORT}" \
@@ -299,13 +299,13 @@ PIDS+=("$!")
 wait_http_ok "${POOL_URL}/health" 60
 
 echo "==> Start miner"
-"${MINING_STACK_DIR}/target/debug/zero-mining-stack" \
+"${MINING_STACK_DIR}/target/debug/rabbitchain-mining-stack" \
   miner \
   --pool-url "${POOL_URL}" \
   --miner-id "${MINER_ID}" \
   --metrics-host 127.0.0.1 \
   --metrics-port "${MINER_METRICS_PORT}" \
-  --target-leading-zero-bytes 0 \
+  --target-leading-rabbit-bytes 0 \
   --report-interval 1000 \
   >"${MINER_LOG}" 2>&1 &
 PIDS+=("$!")
@@ -313,10 +313,10 @@ PIDS+=("$!")
 wait_http_ok "${MINER_METRICS_URL}/health" 60
 
 echo "==> Verify mining progression"
-block_before_rpc="$(rpc_call "zero_getLatestBlock" "[]")"
+block_before_rpc="$(rpc_call "rabbit_getLatestBlock" "[]")"
 block_before_hex="$(printf '%s' "${block_before_rpc}" | extract_block_number_hex)"
 sleep 5
-block_after_rpc="$(rpc_call "zero_getLatestBlock" "[]")"
+block_after_rpc="$(rpc_call "rabbit_getLatestBlock" "[]")"
 block_after_hex="$(printf '%s' "${block_after_rpc}" | extract_block_number_hex)"
 block_before_dec="$(hex_to_dec "${block_before_hex}")"
 block_after_dec="$(hex_to_dec "${block_after_hex}")"
@@ -336,17 +336,17 @@ fi
 
 pool_metrics="$(curl -fsS "${POOL_URL}/metrics")"
 miner_metrics="$(curl -fsS "${MINER_METRICS_URL}/metrics")"
-get_work_after_json="$(rpc_call "zero_getWork" "[]")"
+get_work_after_json="$(rpc_call "rabbit_getWork" "[]")"
 
-if ! printf '%s' "${pool_metrics}" | grep -q 'zero_pool_shares_accepted_total'; then
-  echo "Pool metrics missing zero_pool_shares_accepted_total" >&2
+if ! printf '%s' "${pool_metrics}" | grep -q 'rabbit_pool_shares_accepted_total'; then
+  echo "Pool metrics missing rabbit_pool_shares_accepted_total" >&2
   exit 1
 fi
-if ! printf '%s' "${pool_metrics}" | grep -q 'zero_pool_node_rpc_requests_total{method="zero_submitWork",status="ok"}'; then
-  echo "Pool metrics missing zero_submitWork success counter" >&2
+if ! printf '%s' "${pool_metrics}" | grep -q 'rabbit_pool_node_rpc_requests_total{method="rabbit_submitWork",status="ok"}'; then
+  echo "Pool metrics missing rabbit_submitWork success counter" >&2
   exit 1
 fi
-if ! printf '%s' "${miner_metrics}" | grep -q 'zero_miner_shares_total{miner="'"${MINER_ID}"'",status="accepted"}'; then
+if ! printf '%s' "${miner_metrics}" | grep -q 'rabbit_miner_shares_total{miner="'"${MINER_ID}"'",status="accepted"}'; then
   echo "Miner metrics missing accepted share counter for ${MINER_ID}" >&2
   exit 1
 fi
@@ -366,19 +366,19 @@ cat > "${REPORT_FILE}" <<EOF
 
 ## Checks
 
-- [x] zerochain local node started with chain_id/network_id ${CHAIN_ID}/${NETWORK_ID}
-- [x] \`zerochain block latest\` returned genesis before external miner start
-- [x] \`zerochain block get --number 0\` returned genesis
+- [x] rabbitchain local node started with chain_id/network_id ${CHAIN_ID}/${NETWORK_ID}
+- [x] \`rabbitchain block latest\` returned genesis before external miner start
+- [x] \`rabbitchain block get --number 0\` returned genesis
 - [x] \`net_version\` returned ${net_version}
-- [x] \`zero_getWork\` returned a mining job before pool start
-- [x] \`zerochain compute send\` succeeded with canonical tx ${canonical_tx_id}
-- [x] \`zerochain compute get\` returned ok=true
-- [x] \`zero_getOutput\` / \`zero_getObject\` returned the minted fixture object
-- [x] zero-mining-stack pool /health reachable
-- [x] zero-mining-stack miner metrics /health reachable
+- [x] \`rabbit_getWork\` returned a mining job before pool start
+- [x] \`rabbitchain compute send\` succeeded with canonical tx ${canonical_tx_id}
+- [x] \`rabbitchain compute get\` returned ok=true
+- [x] \`rabbit_getOutput\` / \`rabbit_getObject\` returned the minted fixture object
+- [x] rabbitchain-mining-stack pool /health reachable
+- [x] rabbitchain-mining-stack miner metrics /health reachable
 - [x] block height increased after miner start (${block_before_hex} -> ${block_after_hex})
 - [x] pool shares accepted >= 1 (actual ${pool_shares})
-- [x] pool metrics include \`zero_submitWork\` success counter
+- [x] pool metrics include \`rabbit_submitWork\` success counter
 - [x] miner metrics include accepted share counter for ${MINER_ID}
 
 ## Artifacts
@@ -386,13 +386,13 @@ cat > "${REPORT_FILE}" <<EOF
 - Node log: ${NODE_LOG}
 - Pool log: ${POOL_LOG}
 - Miner log: ${MINER_LOG}
-- zero_getWork before pool:
+- rabbit_getWork before pool:
 
 \`\`\`json
 ${get_work_before_json}
 \`\`\`
 
-- zero_getWork after mining started:
+- rabbit_getWork after mining started:
 
 \`\`\`json
 ${get_work_after_json}

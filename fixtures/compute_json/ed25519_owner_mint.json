@@ -1,6 +1,6 @@
 {
   "name": "ed25519_owner_mint",
-  "description": "Ed25519 owner fixture with duplicated 0x prefix tolerated by wallet clients",
+  "description": "Ed25519 owner fixture aligned with the 0x-prefixed address format",
   "input": {
     "tx_id": "0x2222222222222222222222222222222222222222222222222222222222222222",
     "domain_id": 0,
@@ -50,7 +50,7 @@
     }
   },
   "expected": {
-    "canonical_tx_id": "0xdfe4e081c885ee95df9138effee0b77325509ac1623c55d1655f7bd9250f13da",
+    "canonical_tx_id": "0xcd84f2b40736475994a644f89f4e1a30fdb67d7666d1d6477eeecb18339a45b3",
     "owner": {
       "type": "Ed25519",
       "public_key": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"

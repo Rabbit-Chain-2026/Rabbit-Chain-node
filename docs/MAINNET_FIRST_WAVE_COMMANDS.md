@@ -24,7 +24,7 @@
 ## 1. 固定变量
 
 ```bash
-export COINBASE="ZER0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9"
+export COINBASE="0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9"
 export REMOTE_HOST="139.180.207.66"
 export REMOTE_P2P_PORT="30303"
 export BOOTNODE_ENODE="enode://bootnode-1@${REMOTE_HOST}:${REMOTE_P2P_PORT}"
@@ -41,7 +41,7 @@ export BOOTNODE_ENODE="enode://bootnode-1@${REMOTE_HOST}:${REMOTE_P2P_PORT}"
 如果当前机器承担首个主节点，并且要给外部矿池/矿工提供 work：
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 ./scripts/mainnet.sh start bootnode \
   --mine \
   --disable-local-miner \
@@ -59,7 +59,7 @@ cd zero-chain
 ## 3. 启动 follower
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 ./scripts/mainnet.sh start follower \
   --bootnode "${BOOTNODE_ENODE}"
 ```
@@ -74,7 +74,7 @@ cd zero-chain
 ## 4. 启动 observer
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 ./scripts/mainnet.sh start observer \
   --bootnode "${BOOTNODE_ENODE}"
 ```
@@ -89,7 +89,7 @@ cd zero-chain
 ## 5. 启动矿池
 
 ```bash
-cd zero-mining-stack
+cd rabbitchain-mining-stack
 cargo run --release -- \
   pool \
   --host 0.0.0.0 \
@@ -100,7 +100,7 @@ cargo run --release -- \
 ## 6. 启动矿工
 
 ```bash
-cd zero-mining-stack
+cd rabbitchain-mining-stack
 cargo run --release -- \
   miner \
   --pool-url "http://${REMOTE_HOST}:9332" \
@@ -112,30 +112,30 @@ cargo run --release -- \
 推荐先接 observer：
 
 ```bash
-cd zero-explore/backend
-ZERO_RPC_URL="http://127.0.0.1:39745" cargo run --release
+cd rabbitchain-explorer/backend
+RABBIT_RPC_URL="http://127.0.0.1:39745" cargo run --release
 ```
 
 如果 observer 尚未就绪，可临时接 bootnode：
 
 ```bash
-cd zero-explore/backend
-ZERO_RPC_URL="http://${REMOTE_HOST}:8545" cargo run --release
+cd rabbitchain-explorer/backend
+RABBIT_RPC_URL="http://${REMOTE_HOST}:8545" cargo run --release
 ```
 
 ## 8. 命令行钱包验收
 
 ```bash
-cd zero-chain
-./target/release/zerochain wallet new --name bringup-wallet --scheme ed25519 --passphrase 'StrongPassphrase123!'
-./target/release/zerochain wallet list
-./target/release/zerochain wallet sign --name bringup-wallet --message hello --passphrase 'StrongPassphrase123!'
+cd Rabbit-Chain-node
+./target/release/rabbitchain wallet new --name bringup-wallet --scheme ed25519 --passphrase 'StrongPassphrase123!'
+./target/release/rabbitchain wallet list
+./target/release/rabbitchain wallet sign --name bringup-wallet --message hello --passphrase 'StrongPassphrase123!'
 ```
 
 ## 9. 同步检查
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 scripts/node_sync_check.sh
 scripts/mainnet_checklist.sh
 ```
@@ -143,7 +143,7 @@ scripts/mainnet_checklist.sh
 ## 10. 停止命令
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 ./scripts/mainnet.sh stop observer
 ./scripts/mainnet.sh stop follower
 ./scripts/mainnet.sh stop bootnode

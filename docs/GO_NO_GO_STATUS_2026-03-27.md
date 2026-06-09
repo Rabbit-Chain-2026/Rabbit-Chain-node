@@ -1,4 +1,4 @@
-# ZeroChain Mainnet Bring-up Status (2026-03-27)
+# RabbitChain Mainnet Bring-up Status (2026-03-27)
 
 ## 结论
 
@@ -21,9 +21,9 @@
 
 依据：
 
-- `zerochain wallet new` / `zerochain account new` 入口已存在并可正常使用，见：
-  - [README.md](/root/workspaces/blockchain/zero-chain/README.md)
-  - [GETTING_STARTED.md](/root/workspaces/blockchain/zero-chain/docs/GETTING_STARTED.md)
+- `rabbitchain wallet new` / `rabbitchain account new` 入口已存在并可正常使用，见：
+  - [README.md](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/README.md)
+  - [GETTING_STARTED.md](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/docs/GETTING_STARTED.md)
 - 本轮实际已验证：
   - `wallet new`
   - `wallet list`
@@ -45,12 +45,12 @@
 依据：
 
 - 节点侧挖矿 RPC：
-  - `zero_getWork`
-  - `zero_submitWork`
-  已存在且测试覆盖，见 [API.md](/root/workspaces/blockchain/zero-chain/docs/API.md) 与 [zeroapi/src/rpc/mod.rs](/root/workspaces/blockchain/zero-chain/crates/zeroapi/src/rpc/mod.rs)
-- `zero-mining-stack` 已与节点真实联通，见：
-  - [README.md](/root/workspaces/blockchain/zero-mining-stack/README.md)
-  - [nightly_local_qa.sh](/root/workspaces/blockchain/zero-mining-stack/scripts/nightly_local_qa.sh)
+  - `rabbit_getWork`
+  - `rabbit_submitWork`
+  已存在且测试覆盖，见 [API.md](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/docs/API.md) 与 [rabbitapi/src/rpc/mod.rs](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/crates/rabbitapi/src/rpc/mod.rs)
+- `rabbitchain-mining-stack` 已与节点真实联通，见：
+  - [README.md](/home/de/works/RabbitChain-workspaces/rabbitchain-mining-stack/README.md)
+  - [nightly_local_qa.sh](/home/de/works/RabbitChain-workspaces/rabbitchain-mining-stack/scripts/nightly_local_qa.sh)
 - 本轮实际已验证：
   - pool 可启动
   - miner 可启动
@@ -60,10 +60,10 @@
 补充说明：
 
 - 为了让本地 smoke 稳定，当前已显式支持：
-  - `zerochain run --mine --disable-local-miner`
-  - `--mining-work-target-leading-zero-bytes`
+  - `rabbitchain run --mine --disable-local-miner`
+  - `--mining-work-target-leading-rabbit-bytes`
   - `--rpc-rate-limit-per-minute 0`
-  - `zero-mining-stack miner --target-leading-zero-bytes 0`
+  - `rabbitchain-mining-stack miner --target-leading-rabbit-bytes 0`
 - 这说明外部矿工路径已经是可控、可验证的，而不是只能靠节点内置矿工。
 
 判断：
@@ -77,10 +77,10 @@
 依据：
 
 - 仓内已有同步检查与主网检查入口：
-  - [node_sync_check.sh](/root/workspaces/blockchain/zero-chain/scripts/node_sync_check.sh)
-  - [mainnet_checklist.sh](/root/workspaces/blockchain/zero-chain/scripts/mainnet_checklist.sh)
-  - [p2p_three_node_smoke.sh](/root/workspaces/blockchain/zero-chain/scripts/p2p_three_node_smoke.sh)
-- 项目文档已明确要求检查纯 P2P 同步而非旁路同步，见 [mainnet_checklist.sh](/root/workspaces/blockchain/zero-chain/scripts/mainnet_checklist.sh)
+  - [node_sync_check.sh](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/scripts/node_sync_check.sh)
+  - [mainnet_checklist.sh](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/scripts/mainnet_checklist.sh)
+  - [p2p_three_node_smoke.sh](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/scripts/p2p_three_node_smoke.sh)
+- 项目文档已明确要求检查纯 P2P 同步而非旁路同步，见 [mainnet_checklist.sh](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/scripts/mainnet_checklist.sh)
 - 当前跨仓主路径与 explorer / mining 联通已经打通，节点区块高度可以持续推进。
 
 判断：

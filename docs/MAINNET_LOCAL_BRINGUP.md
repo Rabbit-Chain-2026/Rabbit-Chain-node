@@ -5,21 +5,21 @@
 - `bootnode`
 - `follower`
 - `observer`
-- `zero-mining-stack pool`
-- `zero-mining-stack miner`
-- `zero-explore backend`
+- `rabbitchain-mining-stack pool`
+- `rabbitchain-mining-stack miner`
+- `rabbitchain-explorer backend`
 
 ## 一键启动
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/mainnet_local_bringup.sh
 ```
 
 ## 一键闭环
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/mainnet_local_cycle.sh
 ```
 
@@ -60,13 +60,13 @@ curl -fsS http://127.0.0.1:19080/api/overview
   - `--disable-local-miner`
   - `--rpc-rate-limit-per-minute 0`
 - 本地 miner 使用：
-  - `--target-leading-zero-bytes 0`
+  - `--target-leading-rabbit-bytes 0`
 - `bootnode` 日志会打印 `bootnode enode hint=...`
 - follower / observer 使用该 `enode` 作为 bootnode
 
 ## 停止
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/mainnet_local_stop.sh
 ```

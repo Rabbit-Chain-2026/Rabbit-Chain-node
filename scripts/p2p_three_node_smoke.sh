@@ -2,12 +2,12 @@
 # 3-node P2P convergence smoke:
 # - node-2 / node-3 dial node-1 as bootnode
 # - verify net_peerCount converges
-# - verify zero_peers returns peer metadata
+# - verify rabbit_peers returns peer metadata
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BIN_PATH="${ROOT_DIR}/target/debug/zerochain"
+BIN_PATH="${ROOT_DIR}/target/debug/rabbitchain"
 LOG_DIR="${ROOT_DIR}/artifacts/p2p-3node-logs"
 TMP_RUN_DIR="$(mktemp -d "${ROOT_DIR}/artifacts/p2p-3node-run.XXXXXX")"
 
@@ -75,7 +75,7 @@ wait_rpc_ready() {
   local timeout_secs="${2:-60}"
   local i=0
   while (( i < timeout_secs )); do
-    if rpc_call "${rpc_port}" "zero_clientVersion" "[]" >/dev/null 2>&1; then
+    if rpc_call "${rpc_port}" "rabbit_clientVersion" "[]" >/dev/null 2>&1; then
       return 0
     fi
     i=$((i + 1))
@@ -123,8 +123,8 @@ assert_port_free "${P2P1}"
 assert_port_free "${P2P2}"
 assert_port_free "${P2P3}"
 
-echo "==> Build zerocli"
-cargo build -p zerocli >/dev/null
+echo "==> Build rabbitcli"
+cargo build -p rabbitcli >/dev/null
 
 BOOTNODE_1="enode://bootnode-1@127.0.0.1:${P2P1}"
 
@@ -178,22 +178,22 @@ wait_peer_count_at_least "${RPC1}" 2 90
 wait_peer_count_at_least "${RPC2}" 1 90
 wait_peer_count_at_least "${RPC3}" 1 90
 
-echo "==> Verify zero_peers"
+echo "==> Verify rabbit_peers"
 network_version_json="$(rpc_call "${RPC1}" "net_version" "[]")"
 expected_network_id="$(printf '%s' "${network_version_json}" | sed -n 's/.*"result":"\([^"]*\)".*/\1/p')"
 if [[ -z "${expected_network_id}" ]]; then
   echo "Failed to parse net_version from node-1: ${network_version_json}" >&2
   exit 1
 fi
-node1_peers_json="$(rpc_call "${RPC1}" "zero_peers" "[]")"
+node1_peers_json="$(rpc_call "${RPC1}" "rabbit_peers" "[]")"
 node1_peer_items="$(printf '%s' "${node1_peers_json}" | grep -o '"peer_id"' | wc -l | tr -d ' ')"
 if (( node1_peer_items < 2 )); then
-  echo "node-1 zero_peers expected >=2 entries, got ${node1_peer_items}" >&2
+  echo "node-1 rabbit_peers expected >=2 entries, got ${node1_peer_items}" >&2
   echo "${node1_peers_json}" >&2
   exit 1
 fi
 if ! printf '%s' "${node1_peers_json}" | grep -q "\"network_id\":${expected_network_id}"; then
-  echo "node-1 zero_peers missing expected network_id=${expected_network_id}" >&2
+  echo "node-1 rabbit_peers missing expected network_id=${expected_network_id}" >&2
   echo "${node1_peers_json}" >&2
   exit 1
 fi

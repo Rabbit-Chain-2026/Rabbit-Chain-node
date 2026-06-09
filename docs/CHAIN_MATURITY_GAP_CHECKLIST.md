@@ -10,14 +10,14 @@
 - [ ] M2: 主路径性能基线与回归阈值
 - [ ] M3: 节点故障恢复演练（断电/磁盘/网络分区）
 - [ ] M4: 发布门禁自动化（构建、测试、e2e）
-- [ ] M5: API 快照（`zero_clientVersion` / `zero_keccak256` / `net_*` / `zero_*`）
+- [ ] M5: API 快照（`rabbit_clientVersion` / `rabbit_keccak256` / `net_*` / `rabbit_*`）
 - [ ] M6: 安全审计与密钥管理流程复核
 
 ## 已完成
 
-- [x] ZeroChain 方法集对齐（节点/CLI/钱包）
+- [x] RabbitChain 方法集对齐（节点/CLI/钱包）
 - [x] 原生签名流程对齐（`ed25519`）
-- [x] 矿工工作流联通（`zero_getWork`/`zero_submitWork`）
+- [x] 矿工工作流联通（`rabbit_getWork`/`rabbit_submitWork`）
 
 ## 发布前最低条件
 

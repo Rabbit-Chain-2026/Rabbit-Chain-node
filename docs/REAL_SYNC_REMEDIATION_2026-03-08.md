@@ -7,19 +7,19 @@
 - 修复：
   - `SyncStateSnapshot` 增加 `accounts`、`compute_txs`。
   - 新增同步记录类型：`SyncComputeTxRecord`。
-  - 控制帧增加 `*_V2` 编码：`ZERO/BLOCK_BODY_V2`、`ZERO/STATE_SNAPSHOT_V2`，负载为 JSON(hex)。
+  - 控制帧增加 `*_V2` 编码：`RABBIT/BLOCK_BODY_V2`、`RABBIT/STATE_SNAPSHOT_V2`，负载为 JSON(hex)。
 - 代码：
-  - `crates/zeronet/src/protocol.rs`
-  - `crates/zeronet/src/lib.rs`
+  - `crates/rabbitnet/src/protocol.rs`
+  - `crates/rabbitnet/src/lib.rs`
 
 ## 2. 同步执行层丢弃 body，仅写空交易块
 - 现状（修复前）：`Ok(_body) => {}`，随后写入空块体。
 - 修复：
   - body 阶段缓存 `SyncBlockBody`，并在 compute-only 模式下要求 `tx_count == 0`。
-  - 写块时保持 header-only block，不再承载旧 transaction 列表。
-  - `transactions_root` 固定为空根。
+  - 迁移期间的 legacy 兼容路径只保留 header 语义，不再承载旧 transaction 列表。
+  - 对 legacy 块保留空根兼容；新生产块则由 body 计算 `transactions_root`。
 - 代码：
-  - `crates/zeronet/src/sync.rs`
+  - `crates/rabbitnet/src/sync.rs`
 
 ## 3. 状态快照是合成摘要，不来自真实状态
 - 现状（修复前）：`derive_state_root/proof` 仅基于 block hash 合成。
@@ -30,31 +30,31 @@
   - follower 验证通过后落地替换本地同步缓存。
   - 增加“同高度周期性状态刷新”：即使高度已追平，也继续拉最新快照，避免高度不变时状态漂移。
 - 代码：
-  - `crates/zeronet/src/sync.rs`
-  - `crates/zeronet/src/lib.rs`（全局同步缓存）
+  - `crates/rabbitnet/src/sync.rs`
+  - `crates/rabbitnet/src/lib.rs`（全局同步缓存）
 
 ## 4. RPC 只读本地状态/本地索引
-- 现状（修复前）：`zero_getAccount`、`zero_getOperationByHash` 不看同步缓存。
+- 现状（修复前）：`rabbit_getAccount`、`rabbit_getOperationByHash` 不看同步缓存。
 - 修复：
-  - `zero_getAccount`：本地账户缺失时回退读取同步账户快照。
-  - `zero_getOperationByHash`：本地未命中时回退读取同步 compute 索引。
-  - `zero_listOperations`、`zero_listComputeTxResults` 合并本地 + 同步索引并去重。
+  - `rabbit_getAccount`：本地账户缺失时回退读取同步账户快照。
+  - `rabbit_getOperationByHash`：本地未命中时回退读取同步 compute 索引。
+  - `rabbit_listOperations`、`rabbit_listComputeTxResults` 合并本地 + 同步索引并去重。
   - 本地状态变更时把账户/索引写入全局同步缓存（compute、block reward）。
 - 代码：
-  - `crates/zeroapi/src/rpc/mod.rs`
+  - `crates/rabbitapi/src/rpc/mod.rs`
 
-## 5. `zero_importBlock` 导入逻辑
+## 5. `rabbit_importBlock` 导入逻辑
 - 现状（修复前）：导入时强制写空块体。
 - 修复：
   - compute-only 模式下显式拒绝 legacy `transactions` 参数。
-  - 导入块时只保留 header 语义，并固定 `transactions_root` 为空根。
+  - 导入块时对 legacy 兼容块保留 header 语义；对 body-bearing 块则校验并写入真实 `transactions_root`。
 - 代码：
-  - `crates/zeroapi/src/rpc/mod.rs`
+  - `crates/rabbitapi/src/rpc/mod.rs`
 
 ## 检查与验证
 - 单元/集成测试：
-  - `cargo test -p zeronet -p zeroapi` 通过。
-  - 新增测试：`test_zero_import_block_with_transactions_updates_tx_index`。
+  - `cargo test -p rabbitnet -p rabbitapi` 通过。
+  - 新增测试：`test_rabbit_import_block_with_transactions_updates_tx_index`。
 - 本地双节点联调（A 挖矿 + B follower）：
   - 高度同步后验证区块高度、矿工状态与 compute 结果查询保持一致。
 - 检查脚本增强：

@@ -8,8 +8,8 @@ REPORT_DIR="${ROOT_DIR}/artifacts/release-gate"
 REPORT_FILE="${REPORT_DIR}/full-chain-e2e-report.md"
 LOG_DIR="${ROOT_DIR}/artifacts/full-chain-e2e-logs"
 
-MINING_STACK_DIR="${MINING_STACK_DIR:-${ROOT_DIR}/../zero-mining-stack}"
-EXPLORER_DIR="${EXPLORER_DIR:-${ROOT_DIR}/../zero-explore}"
+MINING_STACK_DIR="${MINING_STACK_DIR:-${ROOT_DIR}/../rabbitchain-mining-stack}"
+EXPLORER_DIR="${EXPLORER_DIR:-${ROOT_DIR}/../rabbitchain-explorer}"
 EXPLORER_BACKEND_DIR="${EXPLORER_BACKEND_DIR:-${EXPLORER_DIR}/backend}"
 EXPLORER_FRONTEND_DIR="${EXPLORER_FRONTEND_DIR:-${EXPLORER_DIR}/frontend}"
 
@@ -28,8 +28,8 @@ EXPLORER_BACKEND_URL="http://127.0.0.1:${EXPLORER_BACKEND_PORT}"
 EXPLORER_FRONTEND_URL="http://127.0.0.1:${EXPLORER_FRONTEND_PORT}"
 RPC_AUTH_TOKEN="${RPC_AUTH_TOKEN:-full-chain-e2e-token}"
 
-COINBASE_NATIVE="${COINBASE_NATIVE:-ZER0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
-RECIPIENT_NATIVE="${RECIPIENT_NATIVE:-ZER0x1111111111111111111111111111111111111111}"
+COINBASE_NATIVE="${COINBASE_NATIVE:-0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
+RECIPIENT_NATIVE="${RECIPIENT_NATIVE:-0x1111111111111111111111111111111111111111}"
 MINER_ID="${MINER_ID:-miner-ci-1}"
 
 mkdir -p "${REPORT_DIR}" "${LOG_DIR}"
@@ -137,19 +137,19 @@ assert_port_free "${MINER_METRICS_PORT}"
 assert_port_free "${EXPLORER_BACKEND_PORT}"
 assert_port_free "${EXPLORER_FRONTEND_PORT}"
 
-echo "==> Build zero-chain CLI"
-cargo build -p zerocli >/dev/null
+echo "==> Build Rabbit-Chain-node CLI"
+cargo build -p rabbitcli >/dev/null
 
 echo "==> Build explorer frontend"
 (cd "${EXPLORER_FRONTEND_DIR}" && npm ci >/dev/null && npm run build >/dev/null)
 
 echo "==> Start node"
-"${ROOT_DIR}/target/debug/zerochain" \
+"${ROOT_DIR}/target/debug/rabbitchain" \
   --data-dir "${TMP_RUN_DIR}/node-data" \
   run \
   --mine \
   --disable-local-miner \
-  --mining-work-target-leading-zero-bytes 1 \
+  --mining-work-target-leading-rabbit-bytes 1 \
   --rpc-rate-limit-per-minute 0 \
   --coinbase "${COINBASE_NATIVE}" \
   --rpc-coinbase "${COINBASE_NATIVE}" \
@@ -176,14 +176,14 @@ echo "==> Start miner"
   --miner-id "${MINER_ID}" \
   --metrics-host 127.0.0.1 \
   --metrics-port "${MINER_METRICS_PORT}" \
-  --target-leading-zero-bytes 0 \
+  --target-leading-rabbit-bytes 0 \
   >"${MINER_LOG}" 2>&1) &
 PIDS+=("$!")
 
 echo "==> Start explorer backend"
 (cd "${EXPLORER_BACKEND_DIR}" && \
-  ZERO_RPC_URL="${NODE_RPC_URL}" \
-  ZERO_EXPLORER_BACKEND_BIND="127.0.0.1:${EXPLORER_BACKEND_PORT}" \
+  RABBIT_RPC_URL="${NODE_RPC_URL}" \
+  RABBIT_EXPLORER_BACKEND_BIND="127.0.0.1:${EXPLORER_BACKEND_PORT}" \
   cargo run --release \
   >"${EXPLORER_BACKEND_LOG}" 2>&1) &
 PIDS+=("$!")
@@ -198,10 +198,10 @@ wait_http_ok "${EXPLORER_BACKEND_URL}/health" 90
 wait_http_ok "${EXPLORER_FRONTEND_URL}/" 90
 
 echo "==> Verify block growth"
-block_before_json="$(rpc_call "zero_getLatestBlock" "[]")"
+block_before_json="$(rpc_call "rabbit_getLatestBlock" "[]")"
 block_before_hex="$(printf '%s' "${block_before_json}" | extract_block_number_hex)"
 sleep 5
-block_after_json="$(rpc_call "zero_getLatestBlock" "[]")"
+block_after_json="$(rpc_call "rabbit_getLatestBlock" "[]")"
 block_after_hex="$(printf '%s' "${block_after_json}" | extract_block_number_hex)"
 block_before_dec="$(hex_to_dec "${block_before_hex}")"
 block_after_dec="$(hex_to_dec "${block_after_hex}")"
@@ -221,15 +221,15 @@ if (( pool_shares < 1 )); then
   exit 1
 fi
 
-echo "==> Verify zero_getAccount for canonical native prefix"
-account_json="$(rpc_call "zero_getAccount" "[\"${COINBASE_NATIVE}\"]")"
+echo "==> Verify rabbit_getAccount for canonical native prefix"
+account_json="$(rpc_call "rabbit_getAccount" "[\"${COINBASE_NATIVE}\"]")"
 if ! printf '%s' "${account_json}" | grep -q "\"address\":\"${COINBASE_NATIVE}\""; then
-  echo "zero_getAccount did not return canonical native address" >&2
+  echo "rabbit_getAccount did not return canonical native address" >&2
   echo "${account_json}" >&2
   exit 1
 fi
 
-echo "==> Verify explorer API accepts ZER0x and rejects native1"
+echo "==> Verify explorer API accepts 0x and rejects invalid prefixes"
 explorer_account_json="$(curl -fsS "${EXPLORER_BACKEND_URL}/api/accounts/${COINBASE_NATIVE}")"
 if ! printf '%s' "${explorer_account_json}" | grep -q "\"address\":\"${COINBASE_NATIVE}\""; then
   echo "Explorer account endpoint missing canonical address" >&2
@@ -242,9 +242,10 @@ if ! printf '%s' "${explorer_search_json}" | grep -q "\"kind\":\"address\""; the
   exit 1
 fi
 
-legacy_http_code="$(curl -sS -o /dev/null -w '%{http_code}' "${EXPLORER_BACKEND_URL}/api/accounts/native1526Dc404e751C7d52F6fFF75d563d8D0857C94E9")"
-if [[ "${legacy_http_code}" != "400" ]]; then
-  echo "Expected legacy native1 address to be rejected with 400, got ${legacy_http_code}" >&2
+invalid_address="BAD0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9"
+invalid_http_code="$(curl -sS -o /dev/null -w '%{http_code}' "${EXPLORER_BACKEND_URL}/api/accounts/${invalid_address}")"
+if [[ "${invalid_http_code}" != "400" ]]; then
+  echo "Expected invalid 0x prefix to be rejected with 400, got ${invalid_http_code}" >&2
   exit 1
 fi
 
@@ -266,9 +267,9 @@ cat > "${REPORT_FILE}" <<EOF
 - [x] Services health endpoints reachable
 - [x] Block number progressed (${block_before_hex} -> ${block_after_hex})
 - [x] Pool shares accepted (>=1, actual ${pool_shares})
-- [x] \`zero_getAccount\` returns canonical \`ZER0x\` address
-- [x] Explorer \`/api/accounts\` and \`/api/search\` accept \`ZER0x\`
-- [x] Explorer rejects legacy \`native1...\` with HTTP 400
+- [x] \`rabbit_getAccount\` returns canonical \`0x\` address
+- [x] Explorer \`/api/accounts\` and \`/api/search\` accept \`0x\`
+- [x] Explorer rejects invalid \`BAD0x...\` with HTTP 400
 EOF
 
 echo "✅ Full-chain E2E passed"

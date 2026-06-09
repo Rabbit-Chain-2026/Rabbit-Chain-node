@@ -19,7 +19,7 @@ MIN_PUBLIC_BLOCK_HEIGHT="${MIN_PUBLIC_BLOCK_HEIGHT:-1}"
 MIN_OBSERVER_BLOCK_HEIGHT="${MIN_OBSERVER_BLOCK_HEIGHT:-1}"
 REQUIRE_OBSERVER_SYNC="${REQUIRE_OBSERVER_SYNC:-1}"
 MAX_OBSERVER_SYNC_LAG="${MAX_OBSERVER_SYNC_LAG:-2}"
-CHECK_ADDRESS="${CHECK_ADDRESS:-ZER0x1111111111111111111111111111111111111111}"
+CHECK_ADDRESS="${CHECK_ADDRESS:-0x1111111111111111111111111111111111111111}"
 CHECK_TX_HASH="${CHECK_TX_HASH:-}"
 
 RPC_TIMEOUT_SECS="${RPC_TIMEOUT_SECS:-8}"
@@ -198,12 +198,12 @@ printf 'public_remote_rpc=%s@%s:%s\n' "${REMOTE_USER}" "${REMOTE_HOST}" "${REMOT
 printf 'explorer=%s\n' "${EXPLORER_BASE_URL}"
 printf '\n'
 
-local_net_json=''; local_peer_json=''; local_block_json=''; local_sync_json=''; local_zero_peers_json=''
+local_net_json=''; local_peer_json=''; local_block_json=''; local_sync_json=''; local_rabbit_peers_json=''
 if local_net_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" net_version 2>/dev/null)" && \
    local_peer_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   local_block_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_getLatestBlock 2>/dev/null)" && \
-   local_sync_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_syncStatus 2>/dev/null)" && \
-   local_zero_peers_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_peers 2>/dev/null)"; then
+   local_block_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)" && \
+   local_sync_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_syncStatus 2>/dev/null)" && \
+   local_rabbit_peers_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_peers 2>/dev/null)"; then
   log_pass "本地公网节点 RPC 可达"
 else
   log_fail "本地公网节点 RPC 不可达 (${PUBLIC_LOCAL_RPC_URL})"
@@ -212,8 +212,8 @@ fi
 remote_net_json=''; remote_peer_json=''; remote_block_json=''; remote_sync_json=''
 if remote_net_json="$(rpc_remote net_version 2>/dev/null)" && \
    remote_peer_json="$(rpc_remote net_peerCount 2>/dev/null)" && \
-   remote_block_json="$(rpc_remote zero_getLatestBlock 2>/dev/null)" && \
-   remote_sync_json="$(rpc_remote zero_syncStatus 2>/dev/null)"; then
+   remote_block_json="$(rpc_remote rabbit_getLatestBlock 2>/dev/null)" && \
+   remote_sync_json="$(rpc_remote rabbit_syncStatus 2>/dev/null)"; then
   log_pass "远端公网节点 RPC 可达"
 else
   log_fail "远端公网节点 RPC 不可达 (${REMOTE_HOST}:${REMOTE_RPC_PORT})"
@@ -222,8 +222,8 @@ fi
 observer_net_json=''; observer_peer_json=''; observer_block_json=''; observer_sync_json=''
 if observer_net_json="$(rpc_local "${OBSERVER_RPC_URL}" net_version 2>/dev/null)" && \
    observer_peer_json="$(rpc_local "${OBSERVER_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   observer_block_json="$(rpc_local "${OBSERVER_RPC_URL}" zero_getLatestBlock 2>/dev/null)" && \
-   observer_sync_json="$(rpc_local "${OBSERVER_RPC_URL}" zero_syncStatus 2>/dev/null)"; then
+   observer_block_json="$(rpc_local "${OBSERVER_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)" && \
+   observer_sync_json="$(rpc_local "${OBSERVER_RPC_URL}" rabbit_syncStatus 2>/dev/null)"; then
   log_pass "observer 节点 RPC 可达"
 else
   log_fail "observer 节点 RPC 不可达 (${OBSERVER_RPC_URL})"
@@ -258,8 +258,8 @@ fi
 remote_cmdline="$(
   ssh_remote_with_retries \
     'set -euo pipefail
-if [ -f /root/works/zero-chain-public-soak/current.env ]; then
-  . /root/works/zero-chain-public-soak/current.env || true
+if [ -f /root/works/Rabbit-Chain-node-public-soak/current.env ]; then
+  . /root/works/Rabbit-Chain-node-public-soak/current.env || true
   if [ -n "${NODE_PID:-}" ]; then
     ps -p "${NODE_PID}" -o args= 2>/dev/null || true
   fi
@@ -377,8 +377,8 @@ if [[ -n "${observer_sync_json}" ]]; then
 fi
 
 local_account_json=''; remote_account_json=''
-if local_account_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_getAccount "[\"${CHECK_ADDRESS}\"]" 2>/dev/null)" && \
-   remote_account_json="$(rpc_remote zero_getAccount "[\"${CHECK_ADDRESS}\"]" 2>/dev/null)"; then
+if local_account_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_getAccount "[\"${CHECK_ADDRESS}\"]" 2>/dev/null)" && \
+   remote_account_json="$(rpc_remote rabbit_getAccount "[\"${CHECK_ADDRESS}\"]" 2>/dev/null)"; then
   local_balance="$(printf '%s' "${local_account_json}" | extract_account_balance)"
   local_nonce="$(printf '%s' "${local_account_json}" | extract_account_nonce)"
   remote_balance="$(printf '%s' "${remote_account_json}" | extract_account_balance)"
@@ -396,8 +396,8 @@ fi
 
 if [[ -n "${CHECK_TX_HASH}" ]]; then
   local_tx_json=''; remote_tx_json=''
-  if local_tx_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_getOperationByHash "[\"${CHECK_TX_HASH}\"]" 2>/dev/null)" && \
-     remote_tx_json="$(rpc_remote zero_getOperationByHash "[\"${CHECK_TX_HASH}\"]" 2>/dev/null)"; then
+  if local_tx_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_getOperationByHash "[\"${CHECK_TX_HASH}\"]" 2>/dev/null)" && \
+     remote_tx_json="$(rpc_remote rabbit_getOperationByHash "[\"${CHECK_TX_HASH}\"]" 2>/dev/null)"; then
     local_is_null=0
     remote_is_null=0
     [[ "${local_tx_json}" == *'"result":null'* ]] && local_is_null=1

@@ -1,10 +1,10 @@
 #!/bin/bash
-# ZeroChain 项目修复脚本
+# RabbitChain 项目修复脚本
 # 用于快速修复编译问题和添加缺失的文件
 
 set -e
 
-echo "🔧 ZeroChain 项目修复脚本"
+echo "🔧 RabbitChain 项目修复脚本"
 echo "========================="
 echo ""
 
@@ -19,8 +19,8 @@ cat > benches/trie_bench.rs << 'EOF'
 //! MPT Trie 性能基准测试
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use zerostore::trie::{Trie, TrieNode};
-use zerostore::db::MemoryDB;
+use rabbitstore::trie::{Trie, TrieNode};
+use rabbitstore::db::MemoryDB;
 use rand::RngCore;
 
 fn generate_random_key() -> Vec<u8> {
@@ -104,7 +104,7 @@ echo ""
 echo "📝 创建数据库迁移脚本..."
 
 cat > migrations/001_initial_schema.sql << 'EOF'
--- ZeroChain 初始数据库架构
+-- RabbitChain 初始数据库架构
 -- 版本：0.1.0
 -- 日期：2026-03-05
 
@@ -208,20 +208,20 @@ echo "📝 创建工具脚本..."
 
 cat > scripts/devnet.sh << 'EOF'
 #!/bin/bash
-# ZeroChain 开发网络启动脚本
+# RabbitChain 开发网络启动脚本
 
 set -e
 
-echo "🚀 启动 ZeroChain 开发网络"
+echo "🚀 启动 RabbitChain 开发网络"
 
 # 检查构建
-if [ ! -f "target/release/zerochain" ]; then
+if [ ! -f "target/release/rabbitchain" ]; then
     echo "📦 构建项目..."
     cargo build --release
 fi
 
 # 创建数据目录
-DATA_DIR="${HOME}/.zerochain/devnet"
+DATA_DIR="${HOME}/.rabbitchain/devnet"
 mkdir -p "$DATA_DIR"
 
 # 生成配置文件
@@ -242,7 +242,7 @@ ws_addr = "127.0.0.1"
 [mining]
 enabled = true
 threads = 2
-coinbase = "ZER0x0000000000000000000000000000000000000000"
+coinbase = "0x0000000000000000000000000000000000000000"
 
 [logging]
 level = "info"
@@ -253,7 +253,7 @@ echo "✅ 配置文件已创建：$DATA_DIR/config.toml"
 
 # 启动节点
 echo "🔗 启动节点..."
-./target/release/zerochain run --config "$DATA_DIR/config.toml" --datadir "$DATA_DIR"
+./target/release/rabbitchain run --config "$DATA_DIR/config.toml" --datadir "$DATA_DIR"
 EOF
 
 chmod +x scripts/devnet.sh
@@ -261,20 +261,20 @@ echo "✅ 创建 scripts/devnet.sh"
 
 cat > scripts/testnet.sh << 'EOF'
 #!/bin/bash
-# ZeroChain 测试网启动脚本
+# RabbitChain 测试网启动脚本
 
 set -e
 
-echo "🌐 启动 ZeroChain 测试网"
+echo "🌐 启动 RabbitChain 测试网"
 
 # 检查构建
-if [ ! -f "target/release/zerochain" ]; then
+if [ ! -f "target/release/rabbitchain" ]; then
     echo "📦 构建项目..."
     cargo build --release
 fi
 
 # 创建数据目录
-DATA_DIR="${HOME}/.zerochain/testnet"
+DATA_DIR="${HOME}/.rabbitchain/testnet"
 mkdir -p "$DATA_DIR"
 
 # 测试网配置
@@ -282,8 +282,8 @@ cat > "$DATA_DIR/config.toml" << 'TOML'
 [network]
 port = 30303
 bootnodes = [
-    "enode://testnet-bootnode-1.zerochain.io:30303",
-    "enode://testnet-bootnode-2.zerochain.io:30303"
+    "enode://testnet-bootnode-1.rabbitchain.io:30303",
+    "enode://testnet-bootnode-2.rabbitchain.io:30303"
 ]
 max_peers = 50
 
@@ -307,7 +307,7 @@ echo "✅ 配置文件已创建：$DATA_DIR/config.toml"
 
 # 启动节点
 echo "🔗 启动节点..."
-./target/release/zerochain run --config "$DATA_DIR/config.toml" --datadir "$DATA_DIR"
+./target/release/rabbitchain run --config "$DATA_DIR/config.toml" --datadir "$DATA_DIR"
 EOF
 
 chmod +x scripts/testnet.sh
@@ -315,11 +315,11 @@ echo "✅ 创建 scripts/testnet.sh"
 
 cat > scripts/run_tests.sh << 'EOF'
 #!/bin/bash
-# ZeroChain 测试运行脚本
+# RabbitChain 测试运行脚本
 
 set -e
 
-echo "🧪 运行 ZeroChain 测试"
+echo "🧪 运行 RabbitChain 测试"
 echo "======================"
 echo ""
 
@@ -344,11 +344,11 @@ echo "✅ 创建 scripts/run_tests.sh"
 
 cat > scripts/benchmark.sh << 'EOF'
 #!/bin/bash
-# ZeroChain 性能基准测试脚本
+# RabbitChain 性能基准测试脚本
 
 set -e
 
-echo "⚡ 运行 ZeroChain 基准测试"
+echo "⚡ 运行 RabbitChain 基准测试"
 echo "========================="
 echo ""
 
@@ -369,7 +369,7 @@ echo ""
 echo "📝 创建文档..."
 
 cat > docs/GETTING_STARTED.md << 'EOF'
-# ZeroChain 快速入门指南
+# RabbitChain 快速入门指南
 
 ## 环境要求
 
@@ -383,14 +383,14 @@ cat > docs/GETTING_STARTED.md << 'EOF'
 
 ```bash
 # 克隆仓库
-git clone https://github.com/zerochain/zero-chain.git
-cd zero-chain
+git clone https://github.com/Rabbit-Chain-2026/Rabbit-Chain-node.git
+cd Rabbit-Chain-node
 
 # 构建
 cargo build --release
 
 # 验证安装
-./target/release/zerochain --version
+./target/release/rabbitchain --version
 ```
 
 ## 快速启动
@@ -402,23 +402,23 @@ cargo build --release
 ./scripts/devnet.sh
 
 # 或手动启动
-./target/release/zerochain run --dev
+./target/release/rabbitchain run --dev
 ```
 
 ### 创建账户
 
 ```bash
 # 创建新账户
-./target/release/zerochain account new
+./target/release/rabbitchain account new
 
 # 查看账户列表
-./target/release/zerochain account list
+./target/release/rabbitchain account list
 ```
 
 ### 发送 Compute 操作
 
 ```bash
-./target/release/zerochain compute send \
+./target/release/rabbitchain compute send \
   --tx-file ./tx.json
 ```
 
@@ -435,7 +435,7 @@ cargo build --release
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"zero_getLatestBlock","id":1}'
+  -d '{"jsonrpc":"2.0","method":"rabbit_getLatestBlock","id":1}'
 ```
 
 ### 获取余额
@@ -445,7 +445,7 @@ curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_getAccount",
+    "method":"rabbit_getAccount",
     "params":["0xYourAddress", "latest"],
     "id":1
   }'
@@ -455,27 +455,27 @@ curl -X POST http://localhost:8545 \
 
 - 阅读 [架构文档](../ARCHITECTURE.md)
 - 查看 [API 文档](../docs/API.md)
-- 加入 [Discord 社区](https://discord.gg/zerochain)
+- 加入 [Discord 社区](https://discord.gg/rabbitchain)
 EOF
 
 echo "✅ 创建 docs/GETTING_STARTED.md"
 
 cat > docs/API.md << 'EOF'
-# ZeroChain API 文档
+# RabbitChain API 文档
 
 ## JSON-RPC 端点
 
 - HTTP: `http://localhost:8545`
 - WebSocket: `ws://localhost:8546`
 
-## ZeroChain 信息方法与网络方法
+## RabbitChain 信息方法与网络方法
 
-### zero_clientVersion
+### rabbit_clientVersion
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"zero_clientVersion","id":1}'
+  -d '{"jsonrpc":"2.0","method":"rabbit_clientVersion","id":1}'
 ```
 
 响应:
@@ -483,82 +483,82 @@ curl -X POST http://localhost:8545 \
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": "ZeroChain/v0.1.0/linux/rustc1.75"
+  "result": "RabbitChain/v0.1.0/linux/rustc1.75"
 }
 ```
 
-### zero_keccak256
+### rabbit_keccak256
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_keccak256",
+    "method":"rabbit_keccak256",
     "params":["0x68656c6c6f20776f726c64"],
     "id":1
   }'
 ```
 
-### zero_*
+### rabbit_*
 
-#### zero_getLatestBlock
+#### rabbit_getLatestBlock
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"zero_getLatestBlock","id":1}'
+  -d '{"jsonrpc":"2.0","method":"rabbit_getLatestBlock","id":1}'
 ```
 
-#### zero_getAccount
+#### rabbit_getAccount
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_getAccount",
+    "method":"rabbit_getAccount",
     "params":["0xAddress", "latest"],
     "id":1
   }'
 ```
 
-#### zero_submitComputeTx
+#### rabbit_submitComputeTx
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_submitComputeTx",
+    "method":"rabbit_submitComputeTx",
     "params":["0xSignedTx"],
     "id":1
   }'
 ```
 
-## ZeroChain 扩展方法
+## RabbitChain 扩展方法
 
-### zero_getAccount
+### rabbit_getAccount
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_getAccount",
+    "method":"rabbit_getAccount",
     "params":["0xAddress"],
     "id":1
   }'
 ```
 
-### zero_getUtxos
+### rabbit_getUtxos
 
 ```bash
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
-    "method":"zero_getUtxos",
+    "method":"rabbit_getUtxos",
     "params":["0xAddress"],
     "id":1
   }'
@@ -574,7 +574,7 @@ const ws = new WebSocket('ws://localhost:8546');
 ws.onopen = () => {
   ws.send(JSON.stringify({
     jsonrpc: '2.0',
-    method: 'zero_subscribe',
+    method: 'rabbit_subscribe',
     params: ['newHeads'],
     id: 1
   }));
@@ -590,7 +590,7 @@ ws.onmessage = (msg) => {
 ```javascript
 ws.send(JSON.stringify({
   jsonrpc: '2.0',
-  method: 'zero_subscribe',
+  method: 'rabbit_subscribe',
   params: ['pendingOperations'],
   id: 2
 }));

@@ -102,7 +102,7 @@ mining_peer_json=''
 mining_block_json=''
 if mining_net_json="$(rpc_local "${MINING_RPC_URL}" net_version 2>/dev/null)" && \
    mining_peer_json="$(rpc_local "${MINING_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   mining_block_json="$(rpc_local "${MINING_RPC_URL}" zero_getLatestBlock 2>/dev/null)"; then
+   mining_block_json="$(rpc_local "${MINING_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)"; then
   log_pass "主挖矿节点 RPC 可达"
 else
   log_fail "主挖矿节点 RPC 不可达 (${MINING_RPC_URL})"
@@ -111,11 +111,11 @@ fi
 local_net_json=''
 local_peer_json=''
 local_block_json=''
-local_zero_peers_json=''
+local_rabbit_peers_json=''
 if local_net_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" net_version 2>/dev/null)" && \
    local_peer_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" net_peerCount 2>/dev/null)" && \
-   local_block_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_getLatestBlock 2>/dev/null)" && \
-   local_zero_peers_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" zero_peers 2>/dev/null)"; then
+   local_block_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_getLatestBlock 2>/dev/null)" && \
+   local_rabbit_peers_json="$(rpc_local "${PUBLIC_LOCAL_RPC_URL}" rabbit_peers 2>/dev/null)"; then
   log_pass "本地公网节点 RPC 可达"
 else
   log_fail "本地公网节点 RPC 不可达 (${PUBLIC_LOCAL_RPC_URL})"
@@ -124,11 +124,11 @@ fi
 remote_net_json=''
 remote_peer_json=''
 remote_block_json=''
-remote_zero_peers_json=''
+remote_rabbit_peers_json=''
 if remote_net_json="$(rpc_remote net_version 2>/dev/null)" && \
    remote_peer_json="$(rpc_remote net_peerCount 2>/dev/null)" && \
-   remote_block_json="$(rpc_remote zero_getLatestBlock 2>/dev/null)" && \
-   remote_zero_peers_json="$(rpc_remote zero_peers 2>/dev/null)"; then
+   remote_block_json="$(rpc_remote rabbit_getLatestBlock 2>/dev/null)" && \
+   remote_rabbit_peers_json="$(rpc_remote rabbit_peers 2>/dev/null)"; then
   log_pass "远端公网节点 RPC 可达"
 else
   log_fail "远端公网节点 RPC 不可达 (${REMOTE_HOST}:${REMOTE_RPC_PORT})"
@@ -192,10 +192,10 @@ else
   log_fail "无法解析公网节点区块高度"
 fi
 
-if [[ -n "${local_zero_peers_json}" ]] && printf '%s' "${local_zero_peers_json}" | grep -q "${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"; then
-  log_pass "本地公网节点 zero_peers 包含远端端点 ${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"
+if [[ -n "${local_rabbit_peers_json}" ]] && printf '%s' "${local_rabbit_peers_json}" | grep -q "${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"; then
+  log_pass "本地公网节点 rabbit_peers 包含远端端点 ${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"
 else
-  log_fail "本地公网节点 zero_peers 未包含远端端点 ${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"
+  log_fail "本地公网节点 rabbit_peers 未包含远端端点 ${EXPECTED_REMOTE_ENDPOINT_ON_LOCAL}"
 fi
 
 monitor_status=''

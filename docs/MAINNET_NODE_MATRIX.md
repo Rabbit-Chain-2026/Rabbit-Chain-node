@@ -26,7 +26,7 @@
 scripts/mainnet.sh start bootnode \
   --mine \
   --disable-local-miner \
-  --coinbase ZER0xYOUR_COINBASE \
+  --coinbase 0xYOUR_COINBASE \
   --rpc-rate-limit-per-minute 0
 ```
 
@@ -52,7 +52,7 @@ scripts/mainnet.sh start follower \
 说明：
 
 - 初期不开挖矿
-- 初期不开放 `zero_getWork` / `zero_submitWork`
+- 初期不开放 `rabbit_getWork` / `rabbit_submitWork`
 - `--bootnode` 当前优先使用 `enode://peer@ip:port`
 
 ### 3. observer
@@ -80,13 +80,13 @@ scripts/mainnet.sh start observer \
 
 | 组件 | 推荐连接对象 | 默认端口 | 说明 |
 |---|---|---:|---|
-| `zero-mining-stack pool` | `bootnode` RPC | `9332` | 只连一个受控节点即可开始 bring-up |
-| `zero-mining-stack miner` | `pool` | `9333` metrics | 初期建议白名单矿工 |
+| `rabbitchain-mining-stack pool` | `bootnode` RPC | `9332` | 只连一个受控节点即可开始 bring-up |
+| `rabbitchain-mining-stack miner` | `pool` | `9333` metrics | 初期建议白名单矿工 |
 
 矿池：
 
 ```bash
-cd ../zero-mining-stack
+cd ../rabbitchain-mining-stack
 cargo run --release -- \
   pool \
   --host 0.0.0.0 \
@@ -107,8 +107,8 @@ cargo run --release -- \
 
 | 组件 | 推荐连接对象 | 默认端口 | 说明 |
 |---|---|---:|---|
-| `zero-explore backend` | `observer` 或 `bootnode` RPC | `18080` | 优先接 observer |
-| `zero-explore frontend` | backend | Vite preview 自定 | 生产时由 backend/静态托管统一承接 |
+| `rabbitchain-explorer backend` | `observer` 或 `bootnode` RPC | `18080` | 优先接 observer |
+| `rabbitchain-explorer frontend` | backend | Vite preview 自定 | 生产时由 backend/静态托管统一承接 |
 
 推荐：
 

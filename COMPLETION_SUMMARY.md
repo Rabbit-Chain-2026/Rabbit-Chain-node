@@ -2,7 +2,7 @@
 
 本文件原为阶段性开发记录。
 
-自 2026-03-07 起，项目交付基线统一为 ZeroChain 计算模型（UTXO Compute + ed25519 + zero_* 接口）。
+自 2026-03-07 起，项目交付基线统一为 RabbitChain 计算模型（UTXO Compute + ed25519 + rabbit_* 接口）。
 
 请以以下文档为准：
 

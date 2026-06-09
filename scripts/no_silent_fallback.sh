@@ -23,7 +23,7 @@ Options:
 Examples:
   $(basename "$0")
   $(basename "$0") --scope repo
-  $(basename "$0") -d ../zero-chain -d ../zero-explore
+  $(basename "$0") -d ../Rabbit-Chain-node -d ../rabbitchain-explorer
 EOF
 }
 

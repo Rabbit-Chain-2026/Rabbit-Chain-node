@@ -1,6 +1,6 @@
 # 上线前阻断清单（Go/No-Go Checklist）
 
-> 适用范围：ZeroChain 节点、RPC/API、存储、计算交易（UTXO Compute）功能的版本发布。  
+> 适用范围：RabbitChain 节点、RPC/API、存储、计算交易（UTXO Compute）功能的版本发布。
 > 目标：在“真实用户 + 真实资产”场景前，明确**必须满足**的上线门槛，避免带病发布。
 
 ---
@@ -30,7 +30,7 @@
   **证据**：CI 日志。
 - [ ] A3. `cargo test --workspace` 通过（不得跳过关键测试）。  
   **证据**：CI 测试报告。
-- [ ] A4. 关键 crate（`zerocore/zeroapi/zerostore`）无 `panic!` 热路径风险（已人工审查）。
+- [ ] A4. 关键 crate（`rabbitcore/rabbitapi/rabbitstore`）无 `panic!` 热路径风险（已人工审查）。
 
 ### B. 协议与交易安全（Compute 必查）
 
@@ -50,10 +50,10 @@
 ### D. RPC/API 稳定性
 
 - [ ] D1. 核心 RPC 方法冒烟通过：
-  - `zero_simulateComputeTx`
-  - `zero_submitComputeTx`
-  - `zero_getComputeTxResult`
-  - `zero_getObject` / `zero_getOutput` / `zero_getDomain`
+  - `rabbit_simulateComputeTx`
+  - `rabbit_submitComputeTx`
+  - `rabbit_getComputeTxResult`
+  - `rabbit_getObject` / `rabbit_getOutput` / `rabbit_getDomain`
 - [ ] D2. 错误码与 API 文档一致（包括分类/数值/message）。
 - [ ] D3. 向后兼容评估完成（旧客户端是否受影响已确认）。
 

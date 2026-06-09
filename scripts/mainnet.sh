@@ -3,9 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${ROOT_DIR}/target/release/zerochain"
+BIN="${ROOT_DIR}/target/release/rabbitchain"
 
-DATA_BASE_DIR="${HOME}/.zerochain/mainnet"
+DATA_BASE_DIR="${HOME}/.rabbitchain/mainnet"
 
 DEFAULT_BOOTNODE_HTTP_PORT=8545
 DEFAULT_BOOTNODE_WS_PORT=8546
@@ -35,7 +35,7 @@ Roles:
 Options:
   --mine
   --no-mine
-  --coinbase ZER0x...
+  --coinbase 0x...
   --clean-data
   --bootnode enode://...|wss://... repeatable
   --p2p-listen-addr ADDR
@@ -52,10 +52,10 @@ Options:
   --p2p-port PORT
 
 Examples:
-  scripts/mainnet.sh start bootnode --mine --coinbase ZER0x0000000000000000000000000000000000000001
+  scripts/mainnet.sh start bootnode --mine --coinbase 0x0000000000000000000000000000000000000001
   scripts/mainnet.sh start bootnode --p2p-listen-addr 127.0.0.1
   scripts/mainnet.sh start follower --bootnode enode://bootnode-1@1.2.3.4:30303
-  scripts/mainnet.sh start follower --disable-p2p-tcp --bootnode wss://boot1.zerochain.org/p2p
+  scripts/mainnet.sh start follower --disable-p2p-tcp --bootnode wss://boot1.rabbitchain.org/p2p
   scripts/mainnet.sh start observer --bootnode enode://bootnode-1@1.2.3.4:30303
   scripts/mainnet.sh status bootnode
   scripts/mainnet.sh logs follower
@@ -70,8 +70,8 @@ ensure_binary() {
 
     echo "Binary not found: ${BIN}"
     if command -v cargo >/dev/null 2>&1; then
-        echo "Building zerocli release binary..."
-        (cd "${ROOT_DIR}" && cargo build -p zerocli --release)
+        echo "Building rabbitcli release binary..."
+        (cd "${ROOT_DIR}" && cargo build -p rabbitcli --release)
     else
         echo "cargo not available, please build ${BIN} manually."
         exit 1

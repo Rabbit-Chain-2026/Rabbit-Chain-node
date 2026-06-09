@@ -1,6 +1,6 @@
 {
   "name": "address_owner_mint",
-  "description": "Address owner fixture shared across zero-chain CLI and both wallets",
+  "description": "Address owner fixture shared across Rabbit-Chain-node CLI and both wallets",
   "input": {
     "tx_id": "0x1111111111111111111111111111111111111111111111111111111111111111",
     "domain_id": 0,
@@ -15,7 +15,7 @@
         "kind": "Asset",
         "owner": {
           "type": "Address",
-          "address": "ZER0x1111111111111111111111111111111111111111"
+          "address": "0x1111111111111111111111111111111111111111"
         },
         "predecessor": null,
         "version": 1,
@@ -59,10 +59,10 @@
     }
   },
   "expected": {
-    "canonical_tx_id": "0xe4c108e8ac98f76ed61fdb2c5c7113ae2138ccf4a6e30ac2649cd1f8b1a30c6a",
+    "canonical_tx_id": "0x317589b60ef5241794453994ca7959fdbc35ced0f48bb091beb5eb17edbba1c9",
     "owner": {
       "type": "Address",
-      "address": "ZER0x1111111111111111111111111111111111111111"
+      "address": "0x1111111111111111111111111111111111111111"
     },
     "resource_asset_ids_sorted": [
       "0x0101010101010101010101010101010101010101010101010101010101010101",

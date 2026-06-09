@@ -1,0 +1,498 @@
+version: 1
+
+book:
+  id: rabbitchain-handbook
+  title: RabbitChain Handbook
+  language: zh-CN
+  root: docs/book
+  nav_mode: generated
+  status: active
+
+chapters:
+  - kind: chapter
+    id: overview
+    title: 总览
+    path: docs/book/00-preface/overview.md
+    order: 10
+    status: verified
+    owner: core-docs
+    primary_topic: overview
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-09
+
+  - kind: chapter
+    id: design.principles
+    title: 设计原则
+    path: docs/book/00-preface/design-principles.md
+    order: 15
+    status: verified
+    owner: core-docs
+    primary_topic: design.principles
+    topics: []
+    depends_on:
+      - overview
+    aliases:
+      - design.philosophy
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: engineering.redlines
+    title: 工程红线
+    path: docs/book/00-preface/engineering-redlines.md
+    order: 16
+    status: verified
+    owner: core-docs
+    primary_topic: engineering.redlines
+    topics: []
+    depends_on:
+      - design.principles
+    aliases:
+      - engineering.redline
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: foundations.api
+    title: API 参考
+    path: docs/book/10-foundations/api.md
+    order: 20
+    status: verified
+    owner: core-docs
+    primary_topic: api.reference
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: foundations.getting_started
+    title: 快速入门
+    path: docs/book/10-foundations/getting-started.md
+    order: 30
+    status: verified
+    owner: core-docs
+    primary_topic: getting.started
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: tx.compute_json
+    title: Compute JSON 规范
+    path: docs/book/20-transaction-path/compute-json.md
+    order: 150
+    status: verified
+    owner: core-docs
+    primary_topic: compute.json
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: compute.protocol
+    title: UTXO Compute 协议
+    path: docs/book/20-transaction-path/utxo-compute-protocol.md
+    order: 160
+    status: verified
+    owner: core-docs
+    primary_topic: compute.protocol
+    topics: []
+    depends_on:
+      - tx.validation
+      - tx.execution
+    aliases:
+      - utxo.compute.yellowpaper
+      - utxo2.0.yellowpaper
+    review_due: 2026-07-05
+
+  - kind: chapter
+    id: mining.flow
+    title: 挖矿流程
+    path: docs/book/60-mining/mining-flow.md
+    order: 410
+    status: verified
+    owner: core-docs
+    primary_topic: mining.flow
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: mining.halving_schedule
+    title: 减半时间表
+    path: docs/book/60-mining/halving-schedule.md
+    order: 411
+    status: verified
+    owner: core-docs
+    primary_topic: mining.halving_schedule
+    topics: []
+    depends_on:
+      - mining.flow
+    aliases: []
+    review_due: 2026-07-09
+
+  - kind: chapter
+    id: ops.mainnet_bringup
+    title: 主网拉起
+    path: docs/book/70-operations/mainnet-bringup.md
+    order: 540
+    status: verified
+    owner: core-docs
+    primary_topic: ops.mainnet_bringup
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: ops.workspace_acceptance
+    title: Workspace 验收
+    path: docs/book/70-operations/workspace-acceptance.md
+    order: 550
+    status: verified
+    owner: core-docs
+    primary_topic: ops.workspace_acceptance
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: tx.submission
+    title: 交易提交
+    path: docs/book/20-transaction-path/submission.md
+    order: 110
+    status: verified
+    owner: core-docs
+    primary_topic: transaction.submission
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: tx.validation
+    title: 交易验证
+    path: docs/book/20-transaction-path/validation.md
+    order: 120
+    status: verified
+    owner: core-docs
+    primary_topic: transaction.validation
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: tx.execution
+    title: 交易执行
+    path: docs/book/20-transaction-path/execution.md
+    order: 130
+    status: verified
+    owner: core-docs
+    primary_topic: transaction.execution
+    topics: []
+    depends_on:
+      - tx.validation
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: tx.receipt
+    title: 交易回执
+    path: docs/book/20-transaction-path/receipt.md
+    order: 140
+    status: verified
+    owner: core-docs
+    primary_topic: transaction.receipt
+    topics: []
+    depends_on:
+      - tx.execution
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: block.header
+    title: 区块头
+    path: docs/book/30-block-model/header.md
+    order: 210
+    status: verified
+    owner: core-docs
+    primary_topic: block.header
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: block.body
+    title: 区块体
+    path: docs/book/30-block-model/body.md
+    order: 220
+    status: verified
+    owner: core-docs
+    primary_topic: block.body
+    topics: []
+    depends_on:
+      - block.header
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: block.commitments
+    title: 承诺关系
+    path: docs/book/30-block-model/commitments.md
+    order: 230
+    status: verified
+    owner: core-docs
+    primary_topic: block.commitments
+    topics: []
+    depends_on:
+      - block.header
+      - block.body
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: network.p2p_transport
+    title: P2P 传输
+    path: docs/book/40-network/p2p-transport.md
+    order: 305
+    status: verified
+    owner: core-docs
+    primary_topic: network.p2p_transport
+    topics: []
+    depends_on:
+      - sync.gossip
+    aliases:
+      - p2p.websocket.cdn
+    review_due: 2026-07-05
+
+  - kind: chapter
+    id: sync.gossip
+    title: Gossip
+    path: docs/book/50-sync/gossip.md
+    order: 310
+    status: verified
+    owner: core-docs
+    primary_topic: sync.gossip
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: sync.headers
+    title: 头同步
+    path: docs/book/50-sync/headers.md
+    order: 320
+    status: verified
+    owner: core-docs
+    primary_topic: sync.headers
+    topics: []
+    depends_on:
+      - sync.gossip
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: sync.body
+    title: 体同步
+    path: docs/book/50-sync/body.md
+    order: 330
+    status: verified
+    owner: core-docs
+    primary_topic: sync.body
+    topics: []
+    depends_on:
+      - sync.headers
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: sync.snapshot
+    title: 状态快照
+    path: docs/book/50-sync/snapshot.md
+    order: 340
+    status: verified
+    owner: core-docs
+    primary_topic: sync.snapshot
+    topics: []
+    depends_on:
+      - sync.body
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: sync.reorg
+    title: 重组
+    path: docs/book/50-sync/reorg.md
+    order: 350
+    status: verified
+    owner: core-docs
+    primary_topic: sync.reorg
+    topics: []
+    depends_on:
+      - sync.headers
+      - sync.body
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: ops.runbook
+    title: 运行手册
+    path: docs/book/70-operations/runbook.md
+    order: 510
+    status: verified
+    owner: core-docs
+    primary_topic: ops.runbook
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: ops.benchmarks
+    title: 性能基准
+    path: docs/book/70-operations/benchmarks.md
+    order: 520
+    status: verified
+    owner: core-docs
+    primary_topic: ops.benchmarks
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: ops.troubleshooting
+    title: 故障排查
+    path: docs/book/70-operations/troubleshooting.md
+    order: 530
+    status: verified
+    owner: core-docs
+    primary_topic: ops.troubleshooting
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: ops.release_readiness
+    title: 发布就绪
+    path: docs/book/70-operations/release-readiness.md
+    order: 535
+    status: verified
+    owner: core-docs
+    primary_topic: ops.release_readiness
+    topics: []
+    depends_on:
+      - ops.runbook
+      - ops.mainnet_bringup
+      - ops.benchmarks
+    aliases:
+      - ops.go_no_go
+      - ops.release_gate
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: storage.block_store
+    title: 区块存储
+    path: docs/book/40-storage/block-store.md
+    order: 610
+    status: verified
+    owner: core-docs
+    primary_topic: storage.block_store
+    topics: []
+    depends_on:
+      - block.header
+      - block.body
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: storage.body_store
+    title: 区块体存储
+    path: docs/book/40-storage/body-store.md
+    order: 620
+    status: verified
+    owner: core-docs
+    primary_topic: storage.body_store
+    topics: []
+    depends_on:
+      - storage.block_store
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: storage.receipt_index
+    title: 回执索引
+    path: docs/book/40-storage/receipt-index.md
+    order: 630
+    status: verified
+    owner: core-docs
+    primary_topic: storage.receipt_index
+    topics: []
+    depends_on:
+      - storage.body_store
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: security.auth
+    title: RPC 认证
+    path: docs/book/80-security/auth.md
+    order: 810
+    status: verified
+    owner: core-docs
+    primary_topic: security.auth
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: security.keys
+    title: 密钥
+    path: docs/book/80-security/keys.md
+    order: 820
+    status: verified
+    owner: core-docs
+    primary_topic: security.keys
+    topics: []
+    depends_on:
+      - security.auth
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: chapter
+    id: security.audits
+    title: 审计
+    path: docs/book/80-security/audits.md
+    order: 830
+    status: verified
+    owner: core-docs
+    primary_topic: security.audits
+    topics: []
+    depends_on:
+      - security.auth
+      - security.keys
+    aliases: []
+    review_due: 2026-07-04
+
+  - kind: legacy
+    id: legacy.archive
+    title: 旧文档索引
+    path: docs/book/95-legacy/archive.md
+    order: 930
+    status: verified
+    owner: core-docs
+    primary_topic: legacy.archive
+    topics: []
+    depends_on: []
+    aliases: []
+    review_due: 2026-07-04

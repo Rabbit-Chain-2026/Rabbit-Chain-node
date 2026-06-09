@@ -1,16 +1,6 @@
-#!/bin/bash
-# ZeroChain 性能基准测试脚本
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-echo "⚡ 运行 ZeroChain 基准测试"
-echo "========================="
-echo ""
-
-# 运行基准测试
-echo "📊 运行基准测试..."
-cargo bench -- --output-format bencher | tee benchmark_results.txt
-
-echo ""
-echo "✅ 基准测试完成!"
-echo "📁 结果保存在：benchmark_results.txt"
+echo "[deprecated] scripts/benchmark.sh is deprecated; use scripts/perf_compute_tps.sh instead." >&2
+exec "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/perf_compute_tps.sh" "$@"

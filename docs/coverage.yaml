@@ -1,0 +1,126 @@
+version: 1
+
+required_topics:
+  - id: design-principles
+    title: 设计原则
+    required_chapters:
+      - design.principles
+    evidence_min:
+      code: 1
+      doc: 1
+
+  - id: engineering-redlines
+    title: 工程红线
+    required_chapters:
+      - engineering.redlines
+    evidence_min:
+      code: 1
+      doc: 1
+
+  - id: transaction
+    title: 交易生命周期
+    required_chapters:
+      - tx.submission
+      - tx.validation
+      - tx.execution
+      - tx.receipt
+    evidence_min:
+      code: 1
+      test: 1
+
+  - id: compute-json
+    title: Compute JSON
+    required_chapters:
+      - tx.compute_json
+    evidence_min:
+      code: 1
+      doc: 1
+
+  - id: compute-protocol
+    title: UTXO Compute 协议
+    required_chapters:
+      - compute.protocol
+    evidence_min:
+      code: 5
+      doc: 2
+
+  - id: foundations
+    title: 基础
+    required_chapters:
+      - foundations.api
+      - foundations.getting_started
+    evidence_min:
+      code: 2
+      doc: 2
+
+  - id: block-model
+    title: 区块模型
+    required_chapters:
+      - block.header
+      - block.body
+      - block.commitments
+    evidence_min:
+      code: 1
+      test: 1
+
+  - id: sync
+    title: 对等节点同步
+    required_chapters:
+      - sync.gossip
+      - sync.headers
+      - sync.body
+      - sync.snapshot
+      - sync.reorg
+    evidence_min:
+      code: 1
+      test: 1
+      log: 1
+
+  - id: network
+    title: 网络
+    required_chapters:
+      - network.p2p_transport
+    evidence_min:
+      code: 3
+      doc: 1
+
+  - id: operations
+    title: 运行与压测
+    required_chapters:
+      - ops.runbook
+      - ops.benchmarks
+      - ops.troubleshooting
+      - ops.mainnet_bringup
+      - ops.release_readiness
+      - ops.workspace_acceptance
+    evidence_min:
+      code: 1
+      report: 1
+
+  - id: mining
+    title: 挖矿
+    required_chapters:
+      - mining.flow
+    evidence_min:
+      code: 1
+      doc: 1
+
+  - id: storage
+    title: 存储
+    required_chapters:
+      - storage.block_store
+      - storage.body_store
+      - storage.receipt_index
+    evidence_min:
+      code: 1
+      test: 1
+
+  - id: security
+    title: 安全
+    required_chapters:
+      - security.auth
+      - security.keys
+      - security.audits
+    evidence_min:
+      code: 1
+      doc: 1

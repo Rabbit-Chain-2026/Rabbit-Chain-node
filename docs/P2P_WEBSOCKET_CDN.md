@@ -1,6 +1,6 @@
 # P2P WebSocket CDN Transport
 
-ZeroChain supports two independently switchable P2P bootnode endpoint forms:
+RabbitChain supports two independently switchable P2P bootnode endpoint forms:
 
 - `enode://peer@ip:port` for the existing direct TCP transport.
 - `ws://...` or `wss://...` for WebSocket P2P transport behind an HTTP/CDN reverse proxy.
@@ -16,17 +16,17 @@ WebSocket listener starts only when `--p2p-ws-listen-port` is set.
 
 ```bash
 # TCP only
-zerochain run --disable-p2p-ws
+rabbitchain run --disable-p2p-ws
 
 # WebSocket only
-zerochain run \
+rabbitchain run \
   --disable-p2p-tcp \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --bootnode wss://boot1.zerochain.org/p2p
+  --bootnode wss://boot1.rabbitchain.org/p2p
 
 # TCP and WebSocket together
-zerochain run \
+rabbitchain run \
   --p2p-listen-addr 0.0.0.0 \
   --p2p-listen-port 30303 \
   --p2p-ws-listen-addr 127.0.0.1 \
@@ -41,12 +41,12 @@ ENR-based and advertises direct TCP endpoints.
 Run the node with both direct TCP P2P and a local WebSocket P2P listener:
 
 ```bash
-zerochain run \
+rabbitchain run \
   --p2p-listen-addr 0.0.0.0 \
   --p2p-listen-port 30303 \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --p2p-ws-external-url wss://boot1.zerochain.org/p2p
+  --p2p-ws-external-url wss://boot1.rabbitchain.org/p2p
 ```
 
 The `mainnet.sh` wrapper exposes the same flags:
@@ -56,7 +56,7 @@ scripts/mainnet.sh start bootnode \
   --p2p-listen-addr 0.0.0.0 \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --p2p-ws-external-url wss://boot1.zerochain.org/p2p
+  --p2p-ws-external-url wss://boot1.rabbitchain.org/p2p
 ```
 
 Use `--disable-p2p-tcp` or `--disable-p2p-ws` with `mainnet.sh` to run only one transport.
@@ -81,8 +81,8 @@ location /p2p {
 Peers can connect through Cloudflare:
 
 ```bash
-zerochain run \
-  --bootnode wss://boot1.zerochain.org/p2p \
+rabbitchain run \
+  --bootnode wss://boot1.rabbitchain.org/p2p \
   --disable-discovery
 ```
 

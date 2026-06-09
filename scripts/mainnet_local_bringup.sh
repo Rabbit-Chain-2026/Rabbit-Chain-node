@@ -3,10 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_DIR="${ROOT_DIR}/.."
-MINING_STACK_DIR="${WORKSPACE_DIR}/zero-mining-stack"
-EXPLORER_BACKEND_DIR="${WORKSPACE_DIR}/zero-explore/backend"
+MINING_STACK_DIR="${WORKSPACE_DIR}/rabbitchain-mining-stack"
+EXPLORER_BACKEND_DIR="${WORKSPACE_DIR}/rabbitchain-explorer/backend"
 
-COINBASE="${COINBASE:-ZER0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
+COINBASE="${COINBASE:-0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
 RPC_AUTH_TOKEN="${RPC_AUTH_TOKEN:-mainnet-local-bringup-token}"
 POOL_PORT="${POOL_PORT:-9332}"
 MINER_METRICS_PORT="${MINER_METRICS_PORT:-9333}"
@@ -66,7 +66,7 @@ echo "==> start bootnode"
   --rpc-rate-limit-per-minute 0 \
   --p2p-listen-addr 127.0.0.1
 
-BOOTNODE_ENODE="$(grep -m1 'bootnode enode hint:' /root/.zerochain/mainnet/bootnode/bootnode.log 2>/dev/null | sed 's/.*hint: //')"
+BOOTNODE_ENODE="$(grep -m1 'bootnode enode hint:' /root/.rabbitchain/mainnet/bootnode/bootnode.log 2>/dev/null | sed 's/.*hint: //')"
 if [[ -z "${BOOTNODE_ENODE}" ]]; then
   BOOTNODE_ENODE="${BOOTNODE_ENODE_PLACEHOLDER}"
 fi
@@ -100,7 +100,7 @@ echo "==> start miner"
   --miner-id "${MINER_ID}" \
   --metrics-host 127.0.0.1 \
   --metrics-port "${MINER_METRICS_PORT}" \
-  --target-leading-zero-bytes 0 \
+  --target-leading-rabbit-bytes 0 \
   > "${LOG_DIR}/miner.log" 2>&1) &
 miner_pid=$!
 PIDS+=("${miner_pid}")
@@ -108,8 +108,8 @@ echo "${miner_pid}" > "${RUN_STATE_DIR}/miner.pid"
 
 echo "==> start explorer backend"
 (cd "${EXPLORER_BACKEND_DIR}" && \
-  ZERO_RPC_URL="http://127.0.0.1:39745" \
-  ZERO_EXPLORER_BACKEND_BIND="127.0.0.1:${EXPLORER_BACKEND_PORT}" \
+  RABBIT_RPC_URL="http://127.0.0.1:39745" \
+  RABBIT_EXPLORER_BACKEND_BIND="127.0.0.1:${EXPLORER_BACKEND_PORT}" \
   cargo run --release \
   > "${LOG_DIR}/explorer-backend.log" 2>&1) &
 explorer_pid=$!

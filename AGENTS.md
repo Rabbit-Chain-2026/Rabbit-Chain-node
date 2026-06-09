@@ -1,4 +1,4 @@
-# zero-chain Repo Rules
+# Rabbit-Chain-node Repo Rules
 
 ## Redline First
 
@@ -14,6 +14,6 @@
 
 ```bash
 bash scripts/no_silent_fallback.sh
-cargo test -p zeronet -p zeroapi
-cargo check -p zerocli
+cargo test -p rabbitnet -p rabbitapi
+cargo check -p rabbitcli
 ```

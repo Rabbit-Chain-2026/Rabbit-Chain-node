@@ -1,0 +1,44 @@
+- 序章:
+  - 总览: docs/book/00-preface/overview.md
+  - 设计原则: docs/book/00-preface/design-principles.md
+  - 工程红线: docs/book/00-preface/engineering-redlines.md
+- 基础:
+  - API 参考: docs/book/10-foundations/api.md
+  - 快速入门: docs/book/10-foundations/getting-started.md
+- 交易路径:
+  - 交易提交: docs/book/20-transaction-path/submission.md
+  - 交易验证: docs/book/20-transaction-path/validation.md
+  - 交易执行: docs/book/20-transaction-path/execution.md
+  - 交易回执: docs/book/20-transaction-path/receipt.md
+  - Compute JSON 规范: docs/book/20-transaction-path/compute-json.md
+  - UTXO Compute 协议: docs/book/20-transaction-path/utxo-compute-protocol.md
+- 区块模型:
+  - 区块头: docs/book/30-block-model/header.md
+  - 区块体: docs/book/30-block-model/body.md
+  - 承诺关系: docs/book/30-block-model/commitments.md
+- P2P 传输: docs/book/40-network/p2p-transport.md
+- 同步:
+  - Gossip: docs/book/50-sync/gossip.md
+  - 头同步: docs/book/50-sync/headers.md
+  - 体同步: docs/book/50-sync/body.md
+  - 状态快照: docs/book/50-sync/snapshot.md
+  - 重组: docs/book/50-sync/reorg.md
+- 挖矿:
+  - 挖矿流程: docs/book/60-mining/mining-flow.md
+  - 减半时间表: docs/book/60-mining/halving-schedule.md
+- 运行与运维:
+  - 运行手册: docs/book/70-operations/runbook.md
+  - 性能基准: docs/book/70-operations/benchmarks.md
+  - 故障排查: docs/book/70-operations/troubleshooting.md
+  - 发布就绪: docs/book/70-operations/release-readiness.md
+  - 主网拉起: docs/book/70-operations/mainnet-bringup.md
+  - Workspace 验收: docs/book/70-operations/workspace-acceptance.md
+- 存储:
+  - 区块存储: docs/book/40-storage/block-store.md
+  - 区块体存储: docs/book/40-storage/body-store.md
+  - 回执索引: docs/book/40-storage/receipt-index.md
+- 安全:
+  - RPC 认证: docs/book/80-security/auth.md
+  - 密钥: docs/book/80-security/keys.md
+  - 审计: docs/book/80-security/audits.md
+- 旧文档索引: docs/book/95-legacy/archive.md

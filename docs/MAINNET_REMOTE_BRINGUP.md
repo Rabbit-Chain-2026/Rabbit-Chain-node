@@ -9,21 +9,21 @@
 ## 1. 先做预检
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/mainnet_remote_preflight.sh
 ```
 
 预检项：
 
 - SSH 可达
-- 远端 `zerochain` 二进制存在
+- 远端 `rabbitchain` 二进制存在
 - 远端工作目录可用
 - 远端 RPC / P2P 端口空闲
 
 ## 2. 受控 bring-up
 
 ```bash
-cd zero-chain
+cd Rabbit-Chain-node
 bash scripts/mainnet_remote_cycle.sh
 ```
 

@@ -29,9 +29,9 @@ usage() {
 Usage: bash scripts/storage_resilience_smoke.sh
 
 Environment overrides:
-  RPC_PORT        Local zerochain RPC port (default: 28455)
-  WS_PORT         Local zerochain WS port (default: 28456)
-  P2P_PORT        Local zerochain P2P port (default: 38455)
+  RPC_PORT        Local rabbitchain RPC port (default: 28455)
+  WS_PORT         Local rabbitchain WS port (default: 28456)
+  P2P_PORT        Local rabbitchain P2P port (default: 38455)
   RPC_AUTH_TOKEN  Auth token required by node RPC write methods
   FIXTURE_FILE    Compute fixture JSON with top-level {"input":...}
 EOF
@@ -113,7 +113,7 @@ PY
 }
 
 submit_compute_tx() {
-  "${ROOT_DIR}/target/debug/zerochain" \
+  "${ROOT_DIR}/target/debug/rabbitchain" \
     --rpc-url "${RPC_URL}" \
     --rpc-token "${RPC_AUTH_TOKEN}" \
     compute send \
@@ -132,13 +132,13 @@ assert_port_free "${P2P_PORT}"
 rm -rf "${RUN_DIR}"
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
-echo "==> Build zerochain CLI"
-cargo build -p zerocli >/dev/null
+echo "==> Build rabbitchain CLI"
+cargo build -p rabbitcli >/dev/null
 
 extract_compute_input
 
 echo "==> Start node with RocksDB compute backend"
-"${ROOT_DIR}/target/debug/zerochain" \
+"${ROOT_DIR}/target/debug/rabbitchain" \
   --network mainnet \
   --data-dir "${RUN_DIR}/node" \
   run \
@@ -167,7 +167,7 @@ COMPUTE_DB="${RUN_DIR}/node/compute-db"
 
 echo "==> Verify rebuild refuses locked DB"
 set +e
-locked_output="$("${ROOT_DIR}/target/debug/zerochain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --dry-run 2>&1)"
+locked_output="$("${ROOT_DIR}/target/debug/rabbitchain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --dry-run 2>&1)"
 locked_status=$?
 set -e
 if [[ "${locked_status}" -eq 0 ]]; then
@@ -182,7 +182,7 @@ wait "${NODE_PID}" >/dev/null 2>&1 || true
 NODE_PID=""
 
 echo "==> Rebuild dry-run on populated DB"
-rebuild_dry_output="$("${ROOT_DIR}/target/debug/zerochain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --dry-run)"
+rebuild_dry_output="$("${ROOT_DIR}/target/debug/rabbitchain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --dry-run)"
 if ! printf '%s' "${rebuild_dry_output}" | grep -q 'source entries: 3'; then
   echo "Expected rebuild dry-run to scan 3 entries" >&2
   echo "${rebuild_dry_output}" >&2
@@ -194,7 +194,7 @@ if find "${RUN_DIR}/node" -maxdepth 1 -name 'compute-db.backup-*' | grep -q .; t
 fi
 
 echo "==> Real rebuild on populated DB"
-rebuild_output="$("${ROOT_DIR}/target/debug/zerochain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}")"
+rebuild_output="$("${ROOT_DIR}/target/debug/rabbitchain" storage rebuild-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}")"
 if ! printf '%s' "${rebuild_output}" | grep -q 'installed entries: 3'; then
   echo "Expected real rebuild to install 3 entries" >&2
   echo "${rebuild_output}" >&2
@@ -207,13 +207,13 @@ if (( backup_count < 1 )); then
 fi
 
 echo "==> Prune dry-run and real prune"
-prune_dry_output="$("${ROOT_DIR}/target/debug/zerochain" storage prune-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --retention-profile mainnet --retention-window-secs 1 --now-unix-secs 9999999999 --dry-run)"
+prune_dry_output="$("${ROOT_DIR}/target/debug/rabbitchain" storage prune-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --retention-profile mainnet --retention-window-secs 1 --now-unix-secs 9999999999 --dry-run)"
 if ! printf '%s' "${prune_dry_output}" | grep -q 'deleted entries: 0'; then
   echo "Prune dry-run deleted entries unexpectedly" >&2
   echo "${prune_dry_output}" >&2
   exit 1
 fi
-prune_output="$("${ROOT_DIR}/target/debug/zerochain" storage prune-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --retention-profile mainnet --retention-window-secs 1 --now-unix-secs 9999999999)"
+prune_output="$("${ROOT_DIR}/target/debug/rabbitchain" storage prune-compute-db --compute-backend rocksdb --compute-db-path "${COMPUTE_DB}" --retention-profile mainnet --retention-window-secs 1 --now-unix-secs 9999999999)"
 if ! printf '%s' "${prune_output}" | grep -q 'deleted entries: 1'; then
   echo "Expected real prune to delete old tx result only" >&2
   echo "${prune_output}" >&2

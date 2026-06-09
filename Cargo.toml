@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/zerocore",
-    "crates/zeronet",
-    "crates/zerostore",
-    "crates/zeroapi",
-    "crates/zerocli",
+    "crates/rabbitcore",
+    "crates/rabbitnet",
+    "crates/rabbitstore",
+    "crates/rabbitapi",
+    "crates/rabbitcli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["ZeroChain Team <team@zerocchain.io>"]
+authors = ["RabbitChain Team <team@rabbitchain.io>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zerocchain/zero-chain"
-homepage = "https://zerocchain.io"
+repository = "https://github.com/Rabbit-Chain-2026/Rabbit-Chain-node"
+homepage = "https://rabbitchain.io"
 
 [workspace.dependencies]
 # Cryptography
@@ -66,11 +66,11 @@ uuid = { version = "1.6", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 num_cpus = "1.16"
 
-# ZeroChain crates
-zerocore = { path = "crates/zerocore" }
-zeronet = { path = "crates/zeronet" }
-zerostore = { path = "crates/zerostore" }
-zeroapi = { path = "crates/zeroapi" }
+# RabbitChain crates
+rabbitcore = { path = "crates/rabbitcore" }
+rabbitnet = { path = "crates/rabbitnet" }
+rabbitstore = { path = "crates/rabbitstore" }
+rabbitapi = { path = "crates/rabbitapi" }
 
 [profile.release]
 lto = true

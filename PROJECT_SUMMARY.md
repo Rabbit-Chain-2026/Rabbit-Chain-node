@@ -1,17 +1,17 @@
-# ZeroChain 项目摘要
+# RabbitChain 项目摘要
 
 ## 当前基线
 
 - 共识：PoW
 - 执行：UTXO Compute
 - 签名：`ed25519`
-- 节点接口：`zero_clientVersion` / `zero_keccak256` / `net_*` / `zero_*`
+- 节点接口：`rabbit_clientVersion` / `rabbit_keccak256` / `net_*` / `rabbit_*`
 - CLI：钱包、账户、交易、区块、RPC、节点运行
 
 ## 已完成
 
 - Compute 操作提交与结果查询链路
-- 钱包与 CLI 统一 `ZER0x...` 地址与签名流程
+- 钱包与 CLI 统一 `0x...` 地址与签名流程
 - 矿池/矿工与节点联调
 - Explorer 与节点地址语义对齐
 

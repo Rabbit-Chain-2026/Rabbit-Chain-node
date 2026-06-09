@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${ROOT_DIR}/target/release/zerochain"
-BASE_DIR="${HOME}/.zerochain/testnet"
+BIN="${ROOT_DIR}/target/release/rabbitchain"
+BASE_DIR="${HOME}/.rabbitchain/testnet"
 LOG_DIR="${BASE_DIR}/logs"
 PID_DIR="${BASE_DIR}/pids"
 
@@ -16,7 +16,7 @@ BASE_P2P_PORT=30303
 usage() {
     cat <<'EOF_USAGE'
 Usage:
-  scripts/testnet.sh start [--nodes N] [--mine] [--coinbase ZER0x...] [--clean-data]
+  scripts/testnet.sh start [--nodes N] [--mine] [--coinbase 0x...] [--clean-data]
   scripts/testnet.sh stop
   scripts/testnet.sh status
   scripts/testnet.sh logs [NODE_INDEX]
@@ -24,7 +24,7 @@ Usage:
 Examples:
   scripts/testnet.sh start
   scripts/testnet.sh start --nodes 4
-  scripts/testnet.sh start --nodes 3 --mine --coinbase ZER0x0000000000000000000000000000000000000001
+  scripts/testnet.sh start --nodes 3 --mine --coinbase 0x0000000000000000000000000000000000000001
   scripts/testnet.sh start --nodes 5 --clean-data
   scripts/testnet.sh status
   scripts/testnet.sh logs 2
@@ -39,8 +39,8 @@ ensure_binary() {
 
     echo "Binary not found: ${BIN}"
     if command -v cargo >/dev/null 2>&1; then
-        echo "Building zerocli release binary..."
-        (cd "${ROOT_DIR}" && cargo build -p zerocli --release)
+        echo "Building rabbitcli release binary..."
+        (cd "${ROOT_DIR}" && cargo build -p rabbitcli --release)
     else
         echo "cargo is not available. Please install Rust toolchain or build ${BIN} manually."
         exit 1

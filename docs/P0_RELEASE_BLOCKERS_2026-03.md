@@ -1,6 +1,6 @@
 # P0 发布阻塞推进板（2026-03）
 
-> 目标：关闭 `GO_NO_GO_CHECKLIST.md` 中当前阻塞上线的 P0 项，并保留可审计证据。
+> 目标：关闭 [发布就绪](book/70-operations/release-readiness.md) 中当前阻塞上线的 P0 项，并保留可审计证据。
 >
 > 范围：E1、E3、F1-F4、G1-G3、Rollback rehearsal。
 
@@ -66,7 +66,7 @@
 
 ### G1-G3 压测与长稳
 
-1. 压测：记录 TPS、P95/P99、CPU、内存。
+1. 压测：按 [运行手册](book/70-operations/runbook.md) / [性能基准](book/70-operations/benchmarks.md) 和 [`scripts/perf_compute_tps.sh`](/home/de/works/RabbitChain-workspaces/Rabbit-Chain-node/scripts/perf_compute_tps.sh) 执行，记录 TPS、P95/P99、CPU、内存。
 2. 长稳：至少 24h，记录异常、重启次数、内存趋势。
 3. 峰值故障注入：验证是否可自动恢复。
 4. 输出 `artifacts/perf/perf-soak-<date>.md`。
@@ -77,8 +77,8 @@
 
 | 时间(UTC) | 组件 | 问题 | 影响 | 解决方案 | 状态 |
 |---|---|---|---|---|---|
-| 2026-03-07 | zero-explore backend | `/api/accounts/ZER0x...` 返回 400 | 浏览器地址详情失败 | 接口统一接受 `0x`/`ZER0x` 解析（`ef99457`） | Closed |
-| 2026-03-07 | zero-wallet-mobile | 转账页仅接受 `0x...`，易误导粘贴 `ZER0x...` | 用户可能误操作 | 增加地址类型识别、混用二次确认、链 ID 强校验 | Closed |
+| 2026-03-07 | rabbitchain-explorer backend | `/api/accounts/0x...` 返回 400 | 浏览器地址详情失败 | 接口统一接受 `0x`/`0x` 解析（`ef99457`） | Closed |
+| 2026-03-07 | rabbitchain-wallet-mobile | 转账页仅接受 `0x...`，易误导粘贴 `0x...` | 用户可能误操作 | 增加地址类型识别、混用二次确认、链 ID 强校验 | Closed |
 
 ---
 

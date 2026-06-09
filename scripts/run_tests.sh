@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ZeroChain release gate runner
+# RabbitChain release gate runner
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ REPORT_FILE="${REPORT_DIR}/go-no-go-report.md"
 
 mkdir -p "${REPORT_DIR}"
 
-echo "🧪 ZeroChain release gate"
+echo "🧪 RabbitChain release gate"
 echo "========================="
 
 echo "[1/5] redline guard (no silent fallback)"
@@ -43,7 +43,7 @@ TAG="$(git -C "${ROOT_DIR}" tag --points-at HEAD | tr '\n' ' ' || true)"
 DATE_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 cat > "${REPORT_FILE}" <<EOF
-# ZeroChain Go/No-Go Report
+# RabbitChain Go/No-Go Report
 
 - Generated at: ${DATE_UTC}
 - Commit: ${COMMIT}

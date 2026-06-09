@@ -9,7 +9,7 @@ REPORT_FILE="${REPORT_DIR}/report.md"
 LOG_DIR="${REPORT_DIR}/logs"
 
 RPC_AUTH_TOKEN="${RPC_AUTH_TOKEN:-mainnet-strict-smoke-token}"
-COINBASE="${COINBASE:-ZER0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
+COINBASE="${COINBASE:-0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9}"
 
 BOOTNODE_HTTP_PORT="${BOOTNODE_HTTP_PORT:-8545}"
 BOOTNODE_WS_PORT="${BOOTNODE_WS_PORT:-8546}"
@@ -145,14 +145,14 @@ echo "==> start strict mainnet observer"
   --p2p-listen-addr 127.0.0.1 | tee "${LOG_DIR}/observer-start.log"
 
 echo "==> wait for height progression"
-bootnode_before_json="$(rpc_call "${BOOTNODE_RPC_URL}" zero_getLatestBlock)"
+bootnode_before_json="$(rpc_call "${BOOTNODE_RPC_URL}" rabbit_getLatestBlock)"
 bootnode_before_hex="$(printf '%s' "${bootnode_before_json}" | extract_block_hex)"
 bootnode_before_dec="$(hex_to_dec "${bootnode_before_hex}")"
 bootnode_after_hex="${bootnode_before_hex}"
 bootnode_after_dec="${bootnode_before_dec}"
 for _ in {1..12}; do
   sleep 5
-  bootnode_after_json="$(rpc_call "${BOOTNODE_RPC_URL}" zero_getLatestBlock)"
+  bootnode_after_json="$(rpc_call "${BOOTNODE_RPC_URL}" rabbit_getLatestBlock)"
   bootnode_after_hex="$(printf '%s' "${bootnode_after_json}" | extract_block_hex)"
   bootnode_after_dec="$(hex_to_dec "${bootnode_after_hex}")"
   if (( bootnode_after_dec > bootnode_before_dec )); then
@@ -182,8 +182,8 @@ if (( follower_peer_dec < 1 || observer_peer_dec < 1 )); then
   exit 1
 fi
 
-follower_block_hex="$(rpc_call "${FOLLOWER_RPC_URL}" zero_getLatestBlock | extract_block_hex)"
-observer_block_hex="$(rpc_call "${OBSERVER_RPC_URL}" zero_getLatestBlock | extract_block_hex)"
+follower_block_hex="$(rpc_call "${FOLLOWER_RPC_URL}" rabbit_getLatestBlock | extract_block_hex)"
+observer_block_hex="$(rpc_call "${OBSERVER_RPC_URL}" rabbit_getLatestBlock | extract_block_hex)"
 follower_block_dec="$(hex_to_dec "${follower_block_hex}")"
 observer_block_dec="$(hex_to_dec "${observer_block_hex}")"
 follower_gap=$(( bootnode_after_dec - follower_block_dec ))
@@ -195,9 +195,9 @@ if (( follower_gap > 2 || observer_gap > 2 )); then
   exit 1
 fi
 
-bootnode_sync_json="$(rpc_call "${BOOTNODE_RPC_URL}" zero_syncStatus)"
-follower_sync_json="$(rpc_call "${FOLLOWER_RPC_URL}" zero_syncStatus)"
-observer_sync_json="$(rpc_call "${OBSERVER_RPC_URL}" zero_syncStatus)"
+bootnode_sync_json="$(rpc_call "${BOOTNODE_RPC_URL}" rabbit_syncStatus)"
+follower_sync_json="$(rpc_call "${FOLLOWER_RPC_URL}" rabbit_syncStatus)"
+observer_sync_json="$(rpc_call "${OBSERVER_RPC_URL}" rabbit_syncStatus)"
 
 DATE_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 COMMIT="$(git -C "${ROOT_DIR}" rev-parse --short HEAD)"

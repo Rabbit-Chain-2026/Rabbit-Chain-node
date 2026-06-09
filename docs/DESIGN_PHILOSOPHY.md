@@ -1,11 +1,11 @@
-# ZeroChain 设计理念（Design Philosophy）
+# RabbitChain 设计理念（Design Philosophy）
 
 > 最后更新：2026-03-11  
-> 交付基线（自 2026-03-07 起）：**ZeroChain 计算模型（UTXO Compute + ed25519 + `zero_*` 接口）**
+> 交付基线（自 2026-03-07 起）：**RabbitChain 计算模型（UTXO Compute + ed25519 + `rabbit_*` 接口）**
 
 本文件用于回答三个问题：
 
-1. ZeroChain **是什么**（定位与边界）？
+1. RabbitChain **是什么**（定位与边界）？
 2. 我们 **为什么** 这样设计（核心权衡）？
 3. 这些理念对实现与贡献意味着 **什么**（工程红线与约束）？
 
@@ -13,7 +13,7 @@
 
 ## 1. 定位：PoW 安全底座上的 UTXO Compute
 
-ZeroChain 是一条以 **PoW 共识**提供无许可安全性的主链，其执行与状态表达采用 **UTXO Compute** 的原生路径：把链上状态统一为“**版本化资源对象**”，用 UTXO 的不可变性承载对象的每一次状态演化，并以显式依赖与确定性执行保证可验证性与可复现性。
+RabbitChain 是一条以 **PoW 共识**提供无许可安全性的主链，其执行与状态表达采用 **UTXO Compute** 的原生路径：把链上状态统一为“**版本化资源对象**”，用 UTXO 的不可变性承载对象的每一次状态演化，并以显式依赖与确定性执行保证可验证性与可复现性。
 
 我们把“协议的结算与最终性”与“高频应用执行”解耦：主链优先承担最终结算、锚定与安全边界；上层扩展（域/实例/通道/代理）在不破坏主链验证性的前提下获取吞吐与交互性能。
 
@@ -36,9 +36,9 @@ ZeroChain 是一条以 **PoW 共识**提供无许可安全性的主链，其执�
 
 ## 3. 核心设计原则（Non-negotiables）
 
-### 3.1 单一路径：默认只保留 ZeroChain 计算路径
+### 3.1 单一路径：默认只保留 RabbitChain 计算路径
 
-- 默认对外暴露 ZeroChain RPC 方法集：`zero_*`，并保留 `net_*` 网络探针方法与 `zero_clientVersion` / `zero_keccak256` 信息方法。
+- 默认对外暴露 RabbitChain RPC 方法集：`rabbit_*`，并保留 `net_*` 网络探针方法与 `rabbit_clientVersion` / `rabbit_keccak256` 信息方法。
 - 任何兼容逻辑都必须是**显式开关**、默认关闭，并且需要评审确认。
 
 ### 3.2 输出不可变：用“消费旧版本 + 创建新版本”表达更新
@@ -78,7 +78,7 @@ ZeroChain 是一条以 **PoW 共识**提供无许可安全性的主链，其执�
 - **兼容逻辑必须显式开关**：默认关闭；允许例外必须 `REDLINE_ALLOW` + 原因注释。
 - **修复必须有反向测试**：证明旧行为会掩盖问题，新行为会显式失败。
 
-> 详见：`docs/ENGINEERING_REDLINES.md`
+> 详见：`book/00-preface/engineering-redlines.md`
 
 ---
 
@@ -115,9 +115,8 @@ ZeroChain 是一条以 **PoW 共识**提供无许可安全性的主链，其执�
 
 - 架构：`ARCHITECTURE.md`
 - API：`docs/API.md`
-- 工程红线：`docs/ENGINEERING_REDLINES.md`
+- 工程红线：`book/00-preface/engineering-redlines.md`
 - UTXO Compute（协议理念与形式化细节）：  
-  - `docs/UTXO-Compute-Yellowpaper-v1.1.md`  
-  - `docs/UTXO-2.0-YELLOWPAPER.md`
+  - `book/20-transaction-path/utxo-compute-protocol.md`
 - 挖矿与发行：`docs/MINING.md`
-- 可观测性：`docs/OBSERVABILITY.md`
+- 可观测性：[运行手册](book/70-operations/runbook.md) / [故障排查](book/70-operations/troubleshooting.md)

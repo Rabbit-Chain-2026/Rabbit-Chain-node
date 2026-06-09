@@ -1,6 +1,6 @@
-# ZeroChain Storage Architecture
+# RabbitChain Storage Architecture
 
-This document defines the storage direction for ZeroChain nodes after the initial RocksDB/Redb
+This document defines the storage direction for RabbitChain nodes after the initial RocksDB/Redb
 compute store implementation.
 
 ## Goals
@@ -108,9 +108,9 @@ Compute DB rebuilds are explicit operator actions. They rewrite output values th
 codec and recreate file-based backends with the active backend options, including RocksDB ZSTD:
 
 ```bash
-zerochain --network mainnet storage rebuild-compute-db
-zerochain --network mainnet storage rebuild-compute-db --dry-run
-zerochain storage rebuild-compute-db \
+rabbitchain --network mainnet storage rebuild-compute-db
+rabbitchain --network mainnet storage rebuild-compute-db --dry-run
+rabbitchain storage rebuild-compute-db \
   --compute-backend rocksdb \
   --compute-db-path ./data/compute-db
 ```
@@ -131,11 +131,11 @@ the error message names any temporary or backup path that needs inspection or cl
 Compute hot-state pruning is also explicit:
 
 ```bash
-zerochain --network mainnet storage prune-compute-db --dry-run
-zerochain --network mainnet storage prune-compute-db \
+rabbitchain --network mainnet storage prune-compute-db --dry-run
+rabbitchain --network mainnet storage prune-compute-db \
   --retention-profile full \
   --retention-window-secs 604800
-zerochain storage prune-compute-db \
+rabbitchain storage prune-compute-db \
   --compute-backend rocksdb \
   --compute-db-path ./data/compute-db \
   --retention-profile archive
@@ -154,7 +154,7 @@ and height separately because `BlockHeader.hash` is skipped by normal block seri
 Disk savings reports are generated from a fixed synthetic workload:
 
 ```bash
-zerochain storage benchmark-compute-db \
+rabbitchain storage benchmark-compute-db \
   --outputs 10000 \
   --queries 2000 \
   --overwrite

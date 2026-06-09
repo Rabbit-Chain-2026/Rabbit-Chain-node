@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zero-chain-pr-fast-${{ github.event.pull_request.number || github.ref }}
+  group: rabbitchain-chain-pr-fast-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,8 +29,8 @@ jobs:
       - name: Run redline guard
         run: bash scripts/no_silent_fallback.sh
 
-      - name: Test zeroapi and zeronet
-        run: cargo test -p zeronet -p zeroapi
+      - name: Test rabbitapi and rabbitnet
+        run: cargo test -p rabbitnet -p rabbitapi
 
-      - name: Check zerocli
-        run: cargo check -p zerocli
+      - name: Check rabbitcli
+        run: cargo check -p rabbitcli
