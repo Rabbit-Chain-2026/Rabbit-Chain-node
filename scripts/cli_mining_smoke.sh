@@ -266,23 +266,9 @@ if [[ -z "${canonical_tx_id}" ]]; then
   exit 1
 fi
 
-compute_get_output="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${canonical_tx_id}")"
-output_json="$(rpc_call "rabbit_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
-object_json="$(rpc_call "rabbit_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
-
-if ! printf '%s' "${compute_get_output}" | grep -q '"ok": true'; then
-  echo "Compute result did not return ok=true" >&2
-  echo "${compute_get_output}" >&2
-  exit 1
-fi
-if ! printf '%s' "${output_json}" | grep -q '"output_id":"0x5656565656565656565656565656565656565656565656565656565656565656"'; then
-  echo "rabbit_getOutput did not return expected output" >&2
-  echo "${output_json}" >&2
-  exit 1
-fi
-if ! printf '%s' "${object_json}" | grep -q '"object_id":"0x7878787878787878787878787878787878787878787878787878787878787878"'; then
-  echo "rabbit_getObject did not return expected object" >&2
-  echo "${object_json}" >&2
+if ! printf '%s' "${compute_send_output}" | grep -q '"queued": true'; then
+  echo "Expected compute submit to be queued (BlockTime), got:" >&2
+  echo "${compute_send_output}" >&2
   exit 1
 fi
 
@@ -322,6 +308,27 @@ block_before_dec="$(hex_to_dec "${block_before_hex}")"
 block_after_dec="$(hex_to_dec "${block_after_hex}")"
 if (( block_after_dec <= block_before_dec )); then
   echo "Block number did not increase after miner start: ${block_before_hex} -> ${block_after_hex}" >&2
+  exit 1
+fi
+
+echo "==> Verify block-time execution of queued compute tx"
+compute_get_output="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${canonical_tx_id}")"
+output_json="$(rpc_call "rabbit_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
+object_json="$(rpc_call "rabbit_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
+
+if ! printf '%s' "${compute_get_output}" | grep -q '"ok": true'; then
+  echo "Compute result did not return ok=true after block-time execution" >&2
+  echo "${compute_get_output}" >&2
+  exit 1
+fi
+if ! printf '%s' "${output_json}" | grep -q '"output_id":"0x5656565656565656565656565656565656565656565656565656565656565656"'; then
+  echo "rabbit_getOutput did not return expected output" >&2
+  echo "${output_json}" >&2
+  exit 1
+fi
+if ! printf '%s' "${object_json}" | grep -q '"object_id":"0x7878787878787878787878787878787878787878787878787878787878787878"'; then
+  echo "rabbit_getObject did not return expected object" >&2
+  echo "${object_json}" >&2
   exit 1
 fi
 
@@ -371,9 +378,9 @@ cat > "${REPORT_FILE}" <<EOF
 - [x] \`rabbitchain block get --number 0\` returned genesis
 - [x] \`net_version\` returned ${net_version}
 - [x] \`rabbit_getWork\` returned a mining job before pool start
-- [x] \`rabbitchain compute send\` succeeded with canonical tx ${canonical_tx_id}
-- [x] \`rabbitchain compute get\` returned ok=true
-- [x] \`rabbit_getOutput\` / \`rabbit_getObject\` returned the minted fixture object
+- [x] \`rabbitchain compute send\` succeeded with canonical tx ${canonical_tx_id} (queued for block-time execution)
+- [x] \`rabbitchain compute get\` returned ok=true after block-time execution
+- [x] \`rabbit_getOutput\` / \`rabbit_getObject\` returned the minted fixture object after block-time execution
 - [x] rabbitchain-mining-stack pool /health reachable
 - [x] rabbitchain-mining-stack miner metrics /health reachable
 - [x] block height increased after miner start (${block_before_hex} -> ${block_after_hex})

@@ -354,7 +354,13 @@ async fn wait_for_mining_alignment(network_service: Arc<NetworkService>) -> Resu
             .unwrap_or(0);
         let peer_head = rabbitnet::global_highest_peer_height();
 
-        if peer_count > 0 && peer_head > 0 && local_head >= peer_head.saturating_sub(1) {
+        // 单节点/solo 场景：没有对等节点就没有可对齐的链，立即开始挖矿；
+        // 矿工循环内部仍会在发现远端更高 head 时暂停，防分叉保护保留。
+        if peer_count == 0 {
+            println!("   ⛏️  Mining alignment: no peers yet, starting solo miner");
+            return Ok(());
+        }
+        if peer_head > 0 && local_head >= peer_head.saturating_sub(1) {
             println!(
                 "   ⛏️  Mining alignment ready: peers={}, local_head={}, peer_head={}",
                 peer_count, local_head, peer_head

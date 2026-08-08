@@ -1519,7 +1519,7 @@ impl RpcApi {
             "prev_hash": format!("0x{}", hex::encode(work.prev_hash.as_bytes())),
             "height": work.height,
             "version": global_block_version_for_height(work.height),
-            "difficulty": format!("0x{:x}", work.difficulty.as_u128()),
+            "difficulty": format!("0x{}", hex::encode(work.difficulty.to_big_endian())),
             "timestamp": work.header_timestamp,
             "gas_limit": 30_000_000u64,
             "target": pow_target_to_hex(work.target),
@@ -1527,6 +1527,19 @@ impl RpcApi {
             "coinbase": format_rabbit_address(work.coinbase),
             "pending_tx_count": pool_snapshot.0,
             "top_tip_rate": pool_snapshot.1,
+            "base_fee_per_gas": format!(
+                "0x{}",
+                hex::encode(
+                    U256::from(
+                        latest
+                            .header
+                            .base_fee_per_gas
+                            .as_u64()
+                            .max(rabbitcore::compute::INITIAL_BASE_FEE)
+                    )
+                    .to_big_endian()
+                )
+            ),
             "base_fee_hopps": latest.header.base_fee_per_gas.as_u64(),
         }))
     }

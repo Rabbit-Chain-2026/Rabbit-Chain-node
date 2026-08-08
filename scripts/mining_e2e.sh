@@ -316,36 +316,14 @@ if [[ -z "${CANONICAL_TX_ID}" ]]; then
   exit 1
 fi
 
-COMPUTE_GET_OUTPUT="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${CANONICAL_TX_ID}")"
-if ! printf '%s' "${COMPUTE_GET_OUTPUT}" | grep -q '"ok": true'; then
-  echo "compute get did not return ok=true" >&2
-  echo "${COMPUTE_GET_OUTPUT}" >&2
+if ! printf '%s' "${COMPUTE_SEND_OUTPUT}" | grep -q '"queued": true'; then
+  echo "Expected compute submit to be queued (BlockTime), got:" >&2
+  echo "${COMPUTE_SEND_OUTPUT}" >&2
   exit 1
 fi
-
-EXECUTION_RECEIPT_JSON="$(rpc_call "rabbit_getComputeTxResult" "[\"${CANONICAL_TX_ID}\"]")"
 
 BLOCK_BEFORE_JSON="$(rpc_call "rabbit_getLatestBlock" "[]")"
 BLOCK_BEFORE_HEX="$(printf '%s' "${BLOCK_BEFORE_JSON}" | extract_block_number_hex)"
-
-RECEIPT_JSON="$(rpc_call "rabbit_getReceipt" "[\"${CANONICAL_TX_ID}\"]")"
-if printf '%s' "${RECEIPT_JSON}" | grep -q '"tx_id"'; then
-  CHAIN_RECEIPT_PRESENT="true"
-else
-  CHAIN_RECEIPT_PRESENT="false"
-fi
-echo "chain_receipt_present=${CHAIN_RECEIPT_PRESENT}" >>"${META_FILE}"
-
-output_json="$(rpc_call "rabbit_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
-object_json="$(rpc_call "rabbit_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
-if ! printf '%s' "${output_json}" | grep -q '"output_id"'; then
-  echo "rabbit_getOutput did not return expected output" >&2
-  exit 1
-fi
-if ! printf '%s' "${object_json}" | grep -q '"object_id"'; then
-  echo "rabbit_getObject did not return expected object" >&2
-  exit 1
-fi
 
 echo "==> Start mining pool"
 "${MINING_STACK_DIR}/target/debug/rabbitchain-mining-stack" \
@@ -381,6 +359,35 @@ BLOCK_BEFORE_DEC="$(hex_to_dec "${BLOCK_BEFORE_HEX}")"
 BLOCK_AFTER_DEC="$(hex_to_dec "${BLOCK_AFTER_HEX}")"
 if (( BLOCK_AFTER_DEC <= BLOCK_BEFORE_DEC )); then
   echo "Block number did not increase after miner start: ${BLOCK_BEFORE_HEX} -> ${BLOCK_AFTER_HEX}" >&2
+  exit 1
+fi
+
+echo "==> Verify block-time execution of queued compute tx"
+COMPUTE_GET_OUTPUT="$("${ROOT_DIR}/target/debug/rabbitchain" --rpc-url "${NODE_RPC_URL}" --rpc-token "${RPC_AUTH_TOKEN}" compute get --tx-id "${CANONICAL_TX_ID}")"
+if ! printf '%s' "${COMPUTE_GET_OUTPUT}" | grep -q '"ok": true'; then
+  echo "compute get did not return ok=true after block-time execution" >&2
+  echo "${COMPUTE_GET_OUTPUT}" >&2
+  exit 1
+fi
+
+EXECUTION_RECEIPT_JSON="$(rpc_call "rabbit_getComputeTxResult" "[\"${CANONICAL_TX_ID}\"]")"
+
+RECEIPT_JSON="$(rpc_call "rabbit_getReceipt" "[\"${CANONICAL_TX_ID}\"]")"
+if printf '%s' "${RECEIPT_JSON}" | grep -q '"tx_id"'; then
+  CHAIN_RECEIPT_PRESENT="true"
+else
+  CHAIN_RECEIPT_PRESENT="false"
+fi
+echo "chain_receipt_present=${CHAIN_RECEIPT_PRESENT}" >>"${META_FILE}"
+
+output_json="$(rpc_call "rabbit_getOutput" "[\"0x5656565656565656565656565656565656565656565656565656565656565656\"]")"
+object_json="$(rpc_call "rabbit_getObject" "[\"0x7878787878787878787878787878787878787878787878787878787878787878\"]")"
+if ! printf '%s' "${output_json}" | grep -q '"output_id"'; then
+  echo "rabbit_getOutput did not return expected output" >&2
+  exit 1
+fi
+if ! printf '%s' "${object_json}" | grep -q '"object_id"'; then
+  echo "rabbit_getObject did not return expected object" >&2
   exit 1
 fi
 
