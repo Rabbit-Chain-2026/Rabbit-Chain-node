@@ -19,6 +19,10 @@ Cargo.lock
 *~
 .DS_Store
 
+# Local deploy scripts (VPS credentials)
+deploy-*.sh
+scripts/deploy-*.sh
+
 # Test coverage
 *.gcno
 *.gcda
@@ -56,6 +60,7 @@ dag_cache/
 # Node data (local)
 chaindata/
 keystore/
+crates/rabbitnet/data/
 
 # Documentation build
 doc/

@@ -71,6 +71,9 @@ async fn compute_submit_result_output_smoke_redb_backend() {
             signatures: vec![],
             threshold: Some(1),
         },
+                    max_fee: 0,
+                    priority_fee: 0,
+                    gas_limit: 0,
     };
     tx.assign_expected_tx_id();
     let sig = signer.sign(&tx.signing_preimage()).to_bytes();

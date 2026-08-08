@@ -7,10 +7,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use rabbitapi::rpc::{ComputeBackend, RpcConfig};
 use rabbitapi::ApiConfig;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
 
@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long)]
         mine: bool,
 
+        /// Enable mining RPC for external miners without starting a local miner
+        #[arg(long, default_value_t = false)]
+        enable_mining_rpc: bool,
+
         /// Do not start the built-in local mining worker when mining RPC is enabled
         #[arg(long, default_value_t = false)]
         disable_local_miner: bool,
@@ -116,10 +120,6 @@ enum Commands {
         /// Optional legacy override for rabbit_getWork target as a count of leading zero bytes (0..=32)
         #[arg(long)]
         mining_work_target_leading_rabbit_bytes: Option<usize>,
-
-        /// Optional activation height for canonical block-body blocks
-        #[arg(long)]
-        canonical_block_activation_height: Option<u64>,
 
         /// P2P listen address
         #[arg(long, default_value = "0.0.0.0")]
@@ -227,6 +227,19 @@ enum Commands {
     Storage {
         #[command(subcommand)]
         action: StorageAction,
+    },
+
+    /// Run a miner against a remote node RPC endpoint
+    Mine {
+        /// Node RPC URL, e.g. http://127.0.0.1:8545
+        #[arg(long)]
+        rpc_url: String,
+        /// Optional Bearer/x-rabbit-token auth token
+        #[arg(long)]
+        rpc_token: Option<String>,
+        /// Miner label sent in rabbit_submitWork
+        #[arg(long, default_value = "rabbitchain-local")]
+        miner_id: String,
     },
 
     /// Console placeholder (not implemented)
@@ -338,7 +351,6 @@ enum WalletAction {
         #[arg(long, default_value_t = 600)]
         ttl_secs: u64,
     },
-
 }
 
 #[derive(Subcommand, Debug)]
@@ -384,6 +396,9 @@ pub(crate) enum ComputeAction {
 enum BlockAction {
     /// Get latest block
     Latest,
+    /// Get latest block height only
+    #[command(alias = "latest-height")]
+    Height,
     /// Get block by number
     Get {
         /// Block height in decimal
@@ -493,6 +508,7 @@ async fn main() -> Result<()> {
     match command {
         Some(Commands::Run {
             mine,
+            enable_mining_rpc,
             disable_local_miner,
             coinbase,
             coinbase_file,
@@ -506,7 +522,6 @@ async fn main() -> Result<()> {
             rpc_auth_token,
             rpc_rate_limit_per_minute,
             mining_work_target_leading_rabbit_bytes,
-            canonical_block_activation_height,
             p2p_listen_addr,
             p2p_listen_port,
             disable_p2p_tcp,
@@ -569,11 +584,10 @@ async fn main() -> Result<()> {
                 network_id,
                 coinbase: rpc_coinbase,
                 coinbase_addresses,
-                mining_enabled: mine,
+                mining_enabled: mine || enable_mining_rpc,
                 auth_token: rpc_auth_token,
                 rate_limit_per_minute: rpc_rate_limit_per_minute,
                 mining_work_target_leading_rabbit_bytes,
-                canonical_block_activation_height,
                 ..api_config.http_rpc
             };
             api_config.ws.port = ws_port;
@@ -648,6 +662,7 @@ async fn main() -> Result<()> {
 
             commands::run::run_node(commands::run::RunNodeConfig {
                 mine,
+                enable_mining_rpc,
                 disable_local_miner,
                 coinbase,
                 coinbase_count: api_config.http_rpc.coinbase_addresses.len(),
@@ -666,9 +681,6 @@ async fn main() -> Result<()> {
                 p2p_peer_id,
                 p2p_peer_id_path,
                 p2p_sync_blocks_path,
-                canonical_block_activation_height: api_config
-                    .http_rpc
-                    .canonical_block_activation_height,
                 max_peers,
                 enable_discovery,
                 enable_sync: !disable_sync,
@@ -776,6 +788,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Mine {
+            rpc_url,
+            rpc_token,
+            miner_id,
+        }) => {
+            commands::run::run_remote_miner(rpc_url, rpc_token, miner_id).await?;
+        }
         Some(Commands::Console) => {
             commands::console::start_console().await?;
         }
@@ -805,10 +824,7 @@ fn init_otel_tracer(endpoint: &str) -> Result<opentelemetry_sdk::trace::Tracer> 
         .tracing()
         .with_exporter(exporter)
         .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
-            opentelemetry_sdk::Resource::new(vec![KeyValue::new(
-                "service.name",
-                "rabbitchain",
-            )]),
+            opentelemetry_sdk::Resource::new(vec![KeyValue::new("service.name", "rabbitchain")]),
         ))
         .install_batch(opentelemetry_sdk::runtime::Tokio)
         .map_err(|e| anyhow::anyhow!("failed to init otel tracer: {e}"))?;
@@ -1011,6 +1027,15 @@ impl NetworkProfile {
         cfg.rest.port = self.default_http_port().saturating_add(10);
         if cfg.http_rpc.compute_db_path == "./data/compute-db" {
             cfg.http_rpc.compute_db_path = format!("{}/compute-db", data_dir);
+        }
+        // Production profiles (mainnet/testnet/devnet) require every compute tx
+        // to carry explicit fee fields. Local development keeps the legacy
+        // fee-less path for tooling convenience.
+        match self {
+            Self::Mainnet | Self::Testnet | Self::Devnet => {
+                cfg.http_rpc.require_fee_for_compute_tx = true;
+            }
+            Self::Local => {}
         }
     }
 }

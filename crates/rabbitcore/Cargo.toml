@@ -40,6 +40,8 @@ uuid.workspace = true
 chrono.workspace = true
 num_cpus.workspace = true
 rand = "0.8"
+# 山海共享确定性规则（游戏域结算验证）：跨仓库 path 依赖，见 AGENTS.md 约束
+shanhai-core = { path = "../../../shanhai-onchain-mmo/shanhai-core" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

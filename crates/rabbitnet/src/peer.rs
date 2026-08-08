@@ -3,6 +3,7 @@
 use crate::protocol::ProtocolMessage;
 use crate::{set_global_peer_count, set_global_peers, NetworkError, Result};
 use parking_lot::RwLock;
+use rabbitcore::crypto::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -10,7 +11,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use rabbitcore::crypto::Hash;
 
 /// Peer ID
 pub type PeerId = String;
@@ -161,6 +161,8 @@ pub struct PeerManager {
     heights: RwLock<HashMap<PeerId, u64>>,
     /// Peer scores
     scores: RwLock<HashMap<PeerId, i32>>,
+    /// Outbound/inbound monitor task handles (aborted on remove/stop).
+    peer_tasks: RwLock<HashMap<PeerId, tokio::task::JoinHandle<()>>>,
     /// Persisted banlist path
     banlist_path: Option<PathBuf>,
     /// Default ban duration in seconds
@@ -192,6 +194,7 @@ impl PeerManager {
             activity: RwLock::new(HashMap::new()),
             heights: RwLock::new(HashMap::new()),
             scores: RwLock::new(HashMap::new()),
+            peer_tasks: RwLock::new(HashMap::new()),
             banlist_path,
             default_ban_duration_secs,
             banned_peers: RwLock::new(persisted_peer_bans),
@@ -280,9 +283,27 @@ impl PeerManager {
         self.activity.write().remove(peer_id);
         self.heights.write().remove(peer_id);
         self.scores.write().remove(peer_id);
+        if let Some(handle) = self.peer_tasks.write().remove(peer_id) {
+            handle.abort();
+        }
         set_global_peer_count(self.peer_count());
         set_global_peers(self.get_active_peer_infos());
         Ok(())
+    }
+
+    /// Register the monitor task for a peer so stop/remove can abort it.
+    pub fn register_peer_task(&self, peer_id: &str, handle: tokio::task::JoinHandle<()>) {
+        if let Some(prev) = self.peer_tasks.write().insert(peer_id.to_string(), handle) {
+            prev.abort();
+        }
+    }
+
+    /// Abort and clear all registered peer tasks (used on network stop).
+    pub fn abort_all_peer_tasks(&self) {
+        let mut tasks = self.peer_tasks.write();
+        for (_, handle) in tasks.drain() {
+            handle.abort();
+        }
     }
 
     /// Get peer by ID
@@ -337,6 +358,7 @@ impl PeerManager {
             let _ = peer.send(ProtocolMessage::Disconnect("Shutting down".into()));
         }
 
+        self.abort_all_peer_tasks();
         self.peers.write().clear();
         self.activity.write().clear();
         self.heights.write().clear();
@@ -344,12 +366,23 @@ impl PeerManager {
         set_global_peers(Vec::new());
     }
 
-    /// Get best peers for sync (by score)
+    /// Get best peers for sync (height first, then score)
     pub fn get_best_peers(&self, limit: usize) -> Vec<Arc<Peer>> {
         let mut peers: Vec<_> = self.peers.read().values().cloned().collect();
 
-        // Sort by score
         peers.sort_by(|a, b| {
+            let height_a = self
+                .heights
+                .read()
+                .get(&a.info.peer_id)
+                .copied()
+                .unwrap_or(0);
+            let height_b = self
+                .heights
+                .read()
+                .get(&b.info.peer_id)
+                .copied()
+                .unwrap_or(0);
             let score_a = self
                 .scores
                 .read()
@@ -362,10 +395,16 @@ impl PeerManager {
                 .get(&b.info.peer_id)
                 .copied()
                 .unwrap_or(0);
-            score_b.cmp(&score_a)
+            height_b
+                .cmp(&height_a)
+                .then_with(|| score_b.cmp(&score_a))
         });
 
-        peers.into_iter().take(limit).collect()
+        peers
+            .into_iter()
+            .filter(|peer| peer.status == PeerStatus::Connected)
+            .take(limit)
+            .collect()
     }
 
     /// Update peer score
@@ -373,6 +412,12 @@ impl PeerManager {
         let mut scores = self.scores.write();
         let score = scores.entry(peer_id.to_string()).or_insert(0);
         *score = (*score + delta).clamp(-1000, 1000);
+        let current = *score;
+        drop(scores);
+        // Auto-ban persistently abusive peers.
+        if current <= -100 {
+            self.ban_peer(peer_id, 0);
+        }
     }
 
     /// Ban peer
@@ -472,11 +517,14 @@ impl PeerManager {
     }
 
     /// Broadcast a message to all active peers except one source peer.
+    /// Full outbound buffers drop the message and lower score (do not disconnect).
     pub fn broadcast_except(&self, source_peer_id: &str, message: ProtocolMessage) {
         for peer in self.peers.read().values().filter(|peer| {
             peer.status == PeerStatus::Connected && peer.info.peer_id.as_str() != source_peer_id
         }) {
-            let _ = peer.send(message.clone());
+            if peer.send(message.clone()).is_err() {
+                self.update_score(&peer.info.peer_id, -1);
+            }
         }
     }
 
@@ -515,6 +563,10 @@ impl PeerManager {
             return false;
         };
         *entry = height;
+        // Keep global highest peer height up-to-date for out-of-sync checks.
+        let max = heights.values().copied().max().unwrap_or(0);
+        drop(heights);
+        crate::set_global_highest_peer_height(max);
         true
     }
 

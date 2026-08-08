@@ -25,8 +25,8 @@ review_due: 2026-07-04
 
 ## 主线
 
-1. 先起 `bootnode / coordinator`。
-2. 再起 `follower` 和 `observer`。
+1. 先起 `bootnode`（首节点）。
+2. 再起 `follower`（同步节点）和 `observer`（只读节点）。
 3. 再接外部 `pool + miner`。
 4. 再起 explorer backend。
 

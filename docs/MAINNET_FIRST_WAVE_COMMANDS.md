@@ -14,10 +14,10 @@
 
 适用前提：
 
-- `bootnode`：当前机器或首个受控主节点
-- `follower`：本地公网 follower
-- `observer`：本地 observer
-- `remote public node`：当前既有远端主机口径 `139.180.207.66`
+- `bootnode`：首节点
+- `follower`：同步节点
+- `observer`：只读节点
+- `远端主机`：示例 IP `139.180.207.66`
 
 若 IP / 机器不同，只替换文中的地址与 coinbase。
 
@@ -27,12 +27,14 @@
 export COINBASE="0x526Dc404e751C7d52F6fFF75d563d8D0857C94E9"
 export REMOTE_HOST="139.180.207.66"
 export REMOTE_P2P_PORT="30303"
-export BOOTNODE_ENODE="enode://bootnode-1@${REMOTE_HOST}:${REMOTE_P2P_PORT}"
+export BOOTNODE_WSS_URL="wss://wss.rabbitchain.wedevs.org/p2p"
+export BOOTNODE_ENODE="enode://peer@${REMOTE_HOST}:${REMOTE_P2P_PORT}"
 ```
 
 注意：
 
 - 这里的 `BOOTNODE_ENODE` 应使用 `enode://peer@ip:port`
+- 如果你已经有公网 `wss://.../p2p` 入口，优先使用 `BOOTNODE_WSS_URL`
 - 不要直接把节点日志里的 `discovery local ENR:` 字符串原样传给 `--bootnode`
 - 启动 `bootnode` 后，优先使用日志里打印出来的 `bootnode enode hint: ...`
 
@@ -61,7 +63,7 @@ cd Rabbit-Chain-node
 ```bash
 cd Rabbit-Chain-node
 ./scripts/mainnet.sh start follower \
-  --bootnode "${BOOTNODE_ENODE}"
+  --bootnode "${BOOTNODE_WSS_URL}"
 ```
 
 查看状态：
@@ -76,7 +78,7 @@ cd Rabbit-Chain-node
 ```bash
 cd Rabbit-Chain-node
 ./scripts/mainnet.sh start observer \
-  --bootnode "${BOOTNODE_ENODE}"
+  --bootnode "${BOOTNODE_WSS_URL}"
 ```
 
 查看状态：
@@ -94,7 +96,7 @@ cargo run --release -- \
   pool \
   --host 0.0.0.0 \
   --port 9332 \
-  --node-rpc "http://${REMOTE_HOST}:8545"
+  --node-rpc "https://rpc.rabbitchain.wedevs.org"
 ```
 
 ## 6. 启动矿工
@@ -120,7 +122,7 @@ RABBIT_RPC_URL="http://127.0.0.1:39745" cargo run --release
 
 ```bash
 cd rabbitchain-explorer/backend
-RABBIT_RPC_URL="http://${REMOTE_HOST}:8545" cargo run --release
+RABBIT_RPC_URL="https://rpc.rabbitchain.wedevs.org" cargo run --release
 ```
 
 ## 8. 命令行钱包验收

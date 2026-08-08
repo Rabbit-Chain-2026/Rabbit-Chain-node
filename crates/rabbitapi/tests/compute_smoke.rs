@@ -60,6 +60,9 @@ async fn compute_submit_result_output_smoke() {
             signatures: vec![],
             threshold: Some(1),
         },
+                    max_fee: 0,
+                    priority_fee: 0,
+                    gas_limit: 0,
     };
     tx.assign_expected_tx_id();
     let sig = signer.sign(&tx.signing_preimage()).to_bytes();
@@ -121,6 +124,18 @@ async fn compute_submit_result_output_smoke() {
     let result_resp = api.handle_request(result_req).await;
     let result_value = parse_result(&result_resp);
     assert_eq!(result_value.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    // BlockTime：提交仅入队；区块执行后对象才存在（与 rabbit_submit_work 相同路径）
+    let executor = api.state_executor().new_basic_executor();
+    let (receipts, _) = api
+        .state_executor()
+        .execute_txs(
+            std::slice::from_ref(&tx),
+            rabbitcore::compute::INITIAL_BASE_FEE,
+            &executor,
+        )
+        .expect("block-time execute");
+    assert_eq!(receipts[0].status, rabbitcore::block::ReceiptStatus::Success);
 
     let output_req = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),

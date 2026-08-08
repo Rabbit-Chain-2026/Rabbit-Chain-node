@@ -97,6 +97,9 @@ fn build_signed_mint_tx(index: u64, signer: &ed25519_dalek::SigningKey) -> Compu
             signatures: vec![],
             threshold: Some(1),
         },
+                    max_fee: 0,
+                    priority_fee: 0,
+                    gas_limit: 0,
     };
 
     tx.assign_expected_tx_id();

@@ -35,6 +35,7 @@ Roles:
 Options:
   --mine
   --no-mine
+  --enable-mining-rpc
   --coinbase 0x...
   --clean-data
   --bootnode enode://...|wss://... repeatable
@@ -157,7 +158,10 @@ wait_rpc_ready() {
             -d '{"jsonrpc":"2.0","method":"net_version","params":[],"id":1}'
         )
         if [[ -n "${rpc_auth_token}" ]]; then
-            curl_args+=(-H "authorization: Bearer ${rpc_auth_token}")
+            curl_args+=(
+                -H "authorization: Bearer ${rpc_auth_token}"
+                -H "x-rabbit-token: ${rpc_auth_token}"
+            )
         fi
         if curl "${curl_args[@]}" "http://127.0.0.1:${port}" >/dev/null 2>&1; then
             return 0
@@ -171,21 +175,22 @@ wait_rpc_ready() {
 start_node() {
     local role="$1"
     local mine="$2"
-    local coinbase="$3"
-    local clean_data="$4"
-    local disable_local_miner="$5"
-    local rpc_rate_limit_per_minute="$6"
-    local rpc_auth_token="$7"
-    local p2p_listen_addr="$8"
-    local http_port="$9"
-    local ws_port="${10}"
-    local p2p_port="${11}"
-    local p2p_ws_listen_addr="${12}"
-    local p2p_ws_listen_port="${13}"
-    local p2p_ws_external_url="${14}"
-    local disable_p2p_tcp="${15}"
-    local disable_p2p_ws="${16}"
-    shift 16
+    local enable_mining_rpc="$3"
+    local coinbase="$4"
+    local clean_data="$5"
+    local disable_local_miner="$6"
+    local rpc_rate_limit_per_minute="$7"
+    local rpc_auth_token="$8"
+    local p2p_listen_addr="$9"
+    local http_port="${10}"
+    local ws_port="${11}"
+    local p2p_port="${12}"
+    local p2p_ws_listen_addr="${13}"
+    local p2p_ws_listen_port="${14}"
+    local p2p_ws_external_url="${15}"
+    local disable_p2p_tcp="${16}"
+    local disable_p2p_ws="${17}"
+    shift 17
     local bootnodes=("$@")
 
     ensure_binary
@@ -236,6 +241,9 @@ start_node() {
     if [[ "${mine}" == "true" ]]; then
         args+=(--mine)
     fi
+    if [[ "${enable_mining_rpc}" == "true" ]]; then
+        args+=(--enable-mining-rpc)
+    fi
     if [[ "${disable_local_miner}" == "true" ]]; then
         args+=(--disable-local-miner)
     fi
@@ -275,7 +283,7 @@ start_node() {
         if [[ "${disable_p2p_ws}" != "true" && -n "${p2p_ws_external_url}" ]]; then
             echo "p2p_ws_external_url=${p2p_ws_external_url}"
         fi
-        echo "mine=${mine} disable_local_miner=${disable_local_miner} rpc_rate_limit_per_minute=${rpc_rate_limit_per_minute:-default}"
+        echo "mine=${mine} enable_mining_rpc=${enable_mining_rpc} disable_local_miner=${disable_local_miner} rpc_rate_limit_per_minute=${rpc_rate_limit_per_minute:-default}"
         if [[ "${role}" == "bootnode" && "${disable_p2p_tcp}" != "true" ]]; then
             local peer_id
             peer_id="$(tr -d '[:space:]' < "${DATA_DIR}/p2p-peer-id" 2>/dev/null || true)"
@@ -370,6 +378,7 @@ role_defaults "${role}"
 case "${cmd}" in
     start)
         mine="${DEFAULT_MINE}"
+        enable_mining_rpc="false"
         coinbase=""
         clean_data="false"
         disable_local_miner="${DEFAULT_DISABLE_LOCAL_MINER}"
@@ -393,6 +402,10 @@ case "${cmd}" in
                     ;;
                 --no-mine)
                     mine="false"
+                    shift
+                    ;;
+                --enable-mining-rpc)
+                    enable_mining_rpc="true"
                     shift
                     ;;
                 --coinbase)
@@ -462,7 +475,7 @@ case "${cmd}" in
                     ;;
             esac
         done
-        start_node "${role}" "${mine}" "${coinbase}" "${clean_data}" "${disable_local_miner}" "${rpc_rate_limit_per_minute}" "${rpc_auth_token}" "${p2p_listen_addr}" "${http_port}" "${ws_port}" "${p2p_port}" "${p2p_ws_listen_addr}" "${p2p_ws_listen_port}" "${p2p_ws_external_url}" "${disable_p2p_tcp}" "${disable_p2p_ws}" "${bootnodes[@]}"
+        start_node "${role}" "${mine}" "${enable_mining_rpc}" "${coinbase}" "${clean_data}" "${disable_local_miner}" "${rpc_rate_limit_per_minute}" "${rpc_auth_token}" "${p2p_listen_addr}" "${http_port}" "${ws_port}" "${p2p_port}" "${p2p_ws_listen_addr}" "${p2p_ws_listen_port}" "${p2p_ws_external_url}" "${disable_p2p_tcp}" "${disable_p2p_ws}" "${bootnodes[@]}"
         ;;
     stop)
         stop_node "${role}"

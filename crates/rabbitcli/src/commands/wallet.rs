@@ -7,6 +7,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use chrono::Utc;
 use ed25519_dalek::{Signer as _, Verifier as _};
 use pbkdf2::pbkdf2_hmac;
+use rabbitcore::crypto::keccak256;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -17,7 +18,6 @@ use std::io::{self, IsTerminal, Write as _};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use rabbitcore::crypto::keccak256;
 
 const PBKDF2_ITERATIONS: u32 = 120_000;
 const KEY_LEN: usize = 32;
@@ -1063,5 +1063,4 @@ mod tests {
         drop(first_lock);
         assert!(!lock_path.exists());
     }
-
 }

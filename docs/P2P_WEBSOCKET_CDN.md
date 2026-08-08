@@ -23,7 +23,7 @@ rabbitchain run \
   --disable-p2p-tcp \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --bootnode wss://boot1.rabbitchain.org/p2p
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p
 
 # TCP and WebSocket together
 rabbitchain run \
@@ -46,7 +46,7 @@ rabbitchain run \
   --p2p-listen-port 30303 \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --p2p-ws-external-url wss://boot1.rabbitchain.org/p2p
+  --p2p-ws-external-url wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 The `mainnet.sh` wrapper exposes the same flags:
@@ -56,7 +56,7 @@ scripts/mainnet.sh start bootnode \
   --p2p-listen-addr 0.0.0.0 \
   --p2p-ws-listen-addr 127.0.0.1 \
   --p2p-ws-listen-port 30304 \
-  --p2p-ws-external-url wss://boot1.rabbitchain.org/p2p
+  --p2p-ws-external-url wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 Use `--disable-p2p-tcp` or `--disable-p2p-ws` with `mainnet.sh` to run only one transport.
@@ -82,7 +82,7 @@ Peers can connect through Cloudflare:
 
 ```bash
 rabbitchain run \
-  --bootnode wss://boot1.rabbitchain.org/p2p \
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p \
   --disable-discovery
 ```
 

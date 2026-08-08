@@ -14,8 +14,11 @@ use crate::{db::KeyValueDB, Result, StorageError};
 const OUTPUT_PREFIX: &[u8] = b"compute:output:";
 const LATEST_PREFIX: &[u8] = b"compute:latest:";
 const TX_RESULT_PREFIX: &[u8] = b"compute:txresult:";
+const REPLAY_PREFIX: &[u8] = b"compute:replay:";
+const CHECKPOINT_PREFIX: &[u8] = b"compute:checkpoint:";
 const OUTPUT_BINARY_MAGIC: &[u8; 4] = b"ZCO1";
 const TX_RESULT_BINARY_MAGIC: &[u8; 4] = b"ZCR1";
+const CHECKPOINT_BINARY_MAGIC: &[u8; 4] = b"ZCC1";
 
 /// Binary envelope for persisted compute transaction results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +82,17 @@ pub struct ComputePruneStats {
     pub deleted_entries: u64,
 }
 
+/// Durable per-block journal entry for H6-B2 reorg rollback (persisted).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DurableComputeCheckpoint {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub recorded_at_unix: u64,
+    pub spent_output_ids: Vec<[u8; 32]>,
+    pub created_outputs: Vec<ObjectOutput>,
+    pub included_tx_ids: Vec<[u8; 32]>,
+}
+
 /// Durable backend for compute object outputs and tx results.
 pub struct ComputeStore {
     db: Arc<dyn KeyValueDB>,
@@ -88,6 +102,62 @@ impl ComputeStore {
     /// Creates a new compute store over key-value DB.
     pub fn new(db: Arc<dyn KeyValueDB>) -> Self {
         Self { db }
+    }
+
+    /// Underlying KV (for diagnostics).
+    pub fn db(&self) -> &Arc<dyn KeyValueDB> {
+        &self.db
+    }
+
+    /// Persist a block-height checkpoint journal entry (H6-B2.1).
+    pub fn put_checkpoint(&self, entry: &DurableComputeCheckpoint) -> Result<()> {
+        let key = checkpoint_key(entry.height);
+        let encoded = bincode::serialize(entry)
+            .map_err(|e| StorageError::Serialization(format!("encode checkpoint: {e}")))?;
+        let mut value = Vec::with_capacity(CHECKPOINT_BINARY_MAGIC.len() + encoded.len());
+        value.extend_from_slice(CHECKPOINT_BINARY_MAGIC);
+        value.extend_from_slice(&encoded);
+        self.db.put(&key, &value)?;
+        Ok(())
+    }
+
+    /// Load a checkpoint by height.
+    pub fn get_checkpoint(&self, height: u64) -> Result<Option<DurableComputeCheckpoint>> {
+        let key = checkpoint_key(height);
+        let Some(bytes) = self.db.get(&key)? else {
+            return Ok(None);
+        };
+        let payload = bytes
+            .strip_prefix(CHECKPOINT_BINARY_MAGIC)
+            .ok_or_else(|| StorageError::Serialization("invalid checkpoint magic".into()))?;
+        let entry = bincode::deserialize(payload)
+            .map_err(|e| StorageError::Serialization(format!("decode checkpoint: {e}")))?;
+        Ok(Some(entry))
+    }
+
+    /// Delete a checkpoint after successful reorg rollback.
+    pub fn delete_checkpoint(&self, height: u64) -> Result<()> {
+        self.db.delete(&checkpoint_key(height))?;
+        Ok(())
+    }
+
+    /// Load all checkpoints ordered by height ascending.
+    pub fn list_checkpoints(&self) -> Result<Vec<DurableComputeCheckpoint>> {
+        let mut out = Vec::new();
+        self.db.for_each_prefix(CHECKPOINT_PREFIX, &mut |key, value| {
+            if !key.starts_with(CHECKPOINT_PREFIX) {
+                return Ok(());
+            }
+            let Some(payload) = value.strip_prefix(CHECKPOINT_BINARY_MAGIC) else {
+                return Ok(());
+            };
+            if let Ok(entry) = bincode::deserialize::<DurableComputeCheckpoint>(payload) {
+                out.push(entry);
+            }
+            Ok(())
+        })?;
+        out.sort_by_key(|e| e.height);
+        Ok(out)
     }
 
     /// Saves execution result JSON by tx id.
@@ -116,6 +186,106 @@ impl ComputeStore {
         };
         decode_tx_result(&bytes).map(Some)
     }
+
+    /// Returns whether a replay key exists (value is the unix timestamp bytes).
+    pub fn has_replay_key(&self, key: &str) -> Result<Option<u64>> {
+        let Some(bytes) = self.db.get(&replay_key(key))? else {
+            return Ok(None);
+        };
+        if bytes.len() != 8 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        Ok(Some(u64::from_be_bytes(arr)))
+    }
+
+    /// Records a replay key used at `now_unix_secs`.
+    pub fn put_replay_key(&self, key: &str, now_unix_secs: u64) -> Result<()> {
+        self.db
+            .put(&replay_key(key), &now_unix_secs.to_be_bytes())
+    }
+
+    /// Deletes replay keys older than the retention window.
+    pub fn prune_replay_keys(&self, now_unix_secs: u64, window_secs: u64) -> Result<u64> {
+        let mut stale = Vec::new();
+        self.db.for_each_prefix(REPLAY_PREFIX, &mut |key, value| {
+            if value.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(value);
+                let ts = u64::from_be_bytes(arr);
+                if now_unix_secs.saturating_sub(ts) > window_secs {
+                    stale.push(key.to_vec());
+                }
+            } else {
+                stale.push(key.to_vec());
+            }
+            Ok(())
+        })?;
+        let count = stale.len() as u64;
+        if !stale.is_empty() {
+            let mut batch = self.db.batch();
+            for key in stale {
+                batch.delete(&key);
+            }
+            self.db.write_batch(batch)?;
+        }
+        Ok(count)
+    }
+}
+
+/// Durable `ReplayNonceRegistry` backed by `ComputeStore`.
+pub struct PersistentReplayNonceRegistry {
+    store: Arc<ComputeStore>,
+    memory: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
+}
+
+impl PersistentReplayNonceRegistry {
+    pub fn new(store: Arc<ComputeStore>) -> Self {
+        Self {
+            store,
+            memory: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl rabbitcore::compute::execution::ReplayNonceRegistry for PersistentReplayNonceRegistry {
+    fn contains(&self, key: &str, now: u64) -> bool {
+        let window = rabbitcore::compute::execution::REPLAY_NONCE_WINDOW_SECS;
+        if let Some(ts) = self.memory.read().get(key).copied() {
+            return now.saturating_sub(ts) <= window;
+        }
+        match self.store.has_replay_key(key) {
+            Ok(Some(ts)) if now.saturating_sub(ts) <= window => {
+                self.memory.write().insert(key.to_string(), ts);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert(&self, key: String, now: u64) {
+        self.memory.write().insert(key.clone(), now);
+        if let Err(err) = self.store.put_replay_key(&key, now) {
+            tracing::error!("failed to persist replay nonce key: {err}");
+        }
+    }
+
+    fn retain_window(&self, now: u64) {
+        let window = rabbitcore::compute::execution::REPLAY_NONCE_WINDOW_SECS;
+        self.memory
+            .write()
+            .retain(|_, ts| now.saturating_sub(*ts) <= window);
+        if let Err(err) = self.store.prune_replay_keys(now, window) {
+            tracing::warn!("failed to prune replay nonce keys: {err}");
+        }
+    }
+}
+
+fn replay_key(key: &str) -> Vec<u8> {
+    let mut out = REPLAY_PREFIX.to_vec();
+    out.extend_from_slice(key.as_bytes());
+    out
 }
 
 impl ObjectStore for ComputeStore {
@@ -178,6 +348,58 @@ impl ObjectStore for ComputeStore {
             .write_batch(batch)
             .map_err(|e| rabbitcore::compute::ComputeError::InvalidOperation(e.to_string()))?;
         Ok(())
+    }
+
+    fn unmark_spent(&self, output_id: OutputId) -> rabbitcore::compute::error::ComputeResult<()> {
+        let Some(mut output) = self.get_output(output_id) else {
+            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(output_id.0));
+        };
+        output.spent = false;
+        let serialized = encode_output(&output)
+            .map_err(|e| rabbitcore::compute::ComputeError::InvalidOperation(e.to_string()))?;
+        let mut batch = self.db.batch();
+        batch.put(&output_key(output_id), &serialized);
+        self.db
+            .write_batch(batch)
+            .map_err(|e| rabbitcore::compute::ComputeError::InvalidOperation(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_output(&self, output_id: OutputId) -> rabbitcore::compute::error::ComputeResult<()> {
+        let Some(existing) = self.get_output(output_id) else {
+            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(output_id.0));
+        };
+        let mut batch = self.db.batch();
+        batch.delete(&output_key(output_id));
+        // If this was the latest pointer for the object, clear it. A full rescan
+        // of all versions is not available via prefix without extra indexes; for
+        // reorg rollback of freshly created outputs this is sufficient.
+        if let Some(latest) = self.get_latest_output_by_object(existing.object_id) {
+            if latest.output_id == output_id {
+                batch.delete(&latest_key(existing.object_id));
+            }
+        }
+        self.db
+            .write_batch(batch)
+            .map_err(|e| rabbitcore::compute::ComputeError::InvalidOperation(e.to_string()))?;
+        Ok(())
+    }
+
+    fn collect_outputs(&self) -> Option<Vec<ObjectOutput>> {
+        let mut outs = Vec::new();
+        let scan = self.db.for_each_prefix(OUTPUT_PREFIX, &mut |key, value| {
+            if !key.starts_with(OUTPUT_PREFIX) {
+                return Ok(());
+            }
+            if let Ok(output) = decode_output(value) {
+                outs.push(output);
+            }
+            Ok(())
+        });
+        if scan.is_err() {
+            return None;
+        }
+        Some(outs)
     }
 }
 
@@ -314,6 +536,120 @@ fn output_key(output_id: OutputId) -> Vec<u8> {
     let mut key = OUTPUT_PREFIX.to_vec();
     key.extend_from_slice(output_id.0.as_bytes());
     key
+}
+
+fn checkpoint_key(height: u64) -> Vec<u8> {
+    let mut key = CHECKPOINT_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+/// Inclusion proof for one unspent output under the unspent MPT root.
+#[derive(Clone, Debug)]
+pub struct UnspentOutputProof {
+    pub root: rabbitcore::crypto::Hash,
+    pub output_id: [u8; 32],
+    pub value: Vec<u8>,
+    /// Encoded trie nodes from root toward the leaf (as produced by MerklePatriciaTrie::get_proof).
+    pub nodes: Vec<Vec<u8>>,
+}
+
+/// Build an in-memory unspent MPT from outputs. Empty live set → `None`.
+fn build_unspent_mpt(
+    outputs: &[ObjectOutput],
+) -> Option<(
+    rabbitcore::crypto::Hash,
+    std::sync::Arc<crate::trie::MerklePatriciaTrie>,
+)> {
+    use crate::trie::{empty_trie_root, MemTrieDB, MerklePatriciaTrie};
+    use rabbitcore::crypto::Hash;
+    use std::sync::Arc;
+
+    let mut live: Vec<&ObjectOutput> = outputs.iter().filter(|o| !o.spent).collect();
+    if live.is_empty() {
+        return None;
+    }
+    live.sort_by(|a, b| a.output_id.0.as_bytes().cmp(b.output_id.0.as_bytes()));
+
+    let db = Arc::new(MemTrieDB::new());
+    let trie = Arc::new(MerklePatriciaTrie::new(db));
+    for out in live {
+        let mut clean = (*out).clone();
+        clean.spent = false;
+        let value = bincode::serialize(&clean).ok()?;
+        let _ = trie.insert(out.output_id.0.as_bytes(), value);
+    }
+    let root = trie.root();
+    if root == empty_trie_root() {
+        return None;
+    }
+    Some((root, trie))
+}
+
+/// H6-B2.1: MPT root over live (unspent) outputs.
+///
+/// Key = `output_id` (32 bytes). Value = bincode of output with `spent=false`.
+/// Empty set returns the zero hash (matches empty-block mining templates).
+pub fn compute_unspent_mpt_root(outputs: &[ObjectOutput]) -> rabbitcore::crypto::Hash {
+    use rabbitcore::crypto::Hash;
+    match build_unspent_mpt(outputs) {
+        Some((root, _)) => root,
+        None => Hash::zero(),
+    }
+}
+
+/// Generate an inclusion proof for `output_id` against the unspent MPT of `outputs`.
+/// Returns `None` if the output is missing or spent.
+pub fn prove_unspent_output(
+    outputs: &[ObjectOutput],
+    output_id: &OutputId,
+) -> Option<UnspentOutputProof> {
+    let out = outputs
+        .iter()
+        .find(|o| o.output_id == *output_id && !o.spent)?;
+    let mut clean = out.clone();
+    clean.spent = false;
+    let value = bincode::serialize(&clean).ok()?;
+    let (root, trie) = build_unspent_mpt(outputs)?;
+    let proof = trie.get_proof(output_id.0.as_bytes()).ok()?;
+    let mut id = [0u8; 32];
+    id.copy_from_slice(output_id.0.as_bytes());
+    Some(UnspentOutputProof {
+        root,
+        output_id: id,
+        value,
+        nodes: proof.nodes().to_vec(),
+    })
+}
+
+/// Build an MPT from outputs using a persistent trie DB backed by `db`.
+/// Nodes are written to the KV store under the `trie:node:` prefix.
+/// Returns `(root, trie)` where the trie can be queried for proofs.
+pub fn build_persistent_unspent_mpt(
+    outputs: &[ObjectOutput],
+    db: Arc<dyn crate::db::KeyValueDB>,
+) -> Option<(rabbitcore::crypto::Hash, std::sync::Arc<crate::trie::MerklePatriciaTrie>)> {
+    use crate::trie::{CachedTrieDB, MerklePatriciaTrie, PersistentTrieDB};
+    use rabbitcore::crypto::Hash;
+    use std::sync::Arc;
+
+    let live: Vec<&ObjectOutput> = outputs.iter().filter(|o| !o.spent).collect();
+    if live.is_empty() {
+        return None;
+    }
+
+    let persistent_db = Arc::new(PersistentTrieDB::new(db));
+    let cached_db = Arc::new(CachedTrieDB::new(persistent_db));
+    let trie = Arc::new(MerklePatriciaTrie::new(cached_db));
+
+    for out in live {
+        let mut clean = (*out).clone();
+        clean.spent = false;
+        let value = bincode::serialize(&clean).ok()?;
+        let _ = trie.insert(out.output_id.0.as_bytes(), value);
+    }
+    let root = trie.root();
+    Some((root, trie))
 }
 
 fn latest_key(object_id: ObjectId) -> Vec<u8> {
@@ -675,5 +1011,29 @@ mod tests {
             assert_eq!(stats.deleted_entries, 0);
             assert!(db.get(&output_key(output.output_id)).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn persistent_replay_registry_survives_new_handle() {
+        use rabbitcore::compute::execution::ReplayNonceRegistry;
+        use super::PersistentReplayNonceRegistry;
+
+        let db = Arc::new(MemDatabase::new());
+        let store = Arc::new(ComputeStore::new(db.clone()));
+        let reg = PersistentReplayNonceRegistry::new(store.clone());
+        let now = 1_700_000_000u64;
+        assert!(!reg.contains("actor|d:0|c:Some(1)|n:Some(1)|x:7", now));
+        reg.insert("actor|d:0|c:Some(1)|n:Some(1)|x:7".into(), now);
+        assert!(reg.contains("actor|d:0|c:Some(1)|n:Some(1)|x:7", now));
+
+        // New registry instance over same DB must still see the key.
+        let reg2 = PersistentReplayNonceRegistry::new(store);
+        assert!(reg2.contains("actor|d:0|c:Some(1)|n:Some(1)|x:7", now + 10));
+        // Outside window it expires after retain.
+        reg2.retain_window(now + rabbitcore::compute::execution::REPLAY_NONCE_WINDOW_SECS + 1);
+        assert!(!reg2.contains(
+            "actor|d:0|c:Some(1)|n:Some(1)|x:7",
+            now + rabbitcore::compute::execution::REPLAY_NONCE_WINDOW_SECS + 1
+        ));
     }
 }

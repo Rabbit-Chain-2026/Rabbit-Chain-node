@@ -38,7 +38,7 @@ where
 
     let mut request = client.post(rpc_url).json(&payload);
     if let Some(token) = rpc_token {
-        request = request.bearer_auth(token);
+        request = request.bearer_auth(token).header("x-rabbit-token", token);
     }
 
     let response = request

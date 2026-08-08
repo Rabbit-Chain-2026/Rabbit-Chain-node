@@ -6,13 +6,13 @@ use discv5::{
     ConfigBuilder, Discv5, Enr, Event, ListenConfig,
 };
 use parking_lot::RwLock;
+use rabbitcore::crypto::{keccak256, Hash};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use rabbitcore::crypto::{keccak256, Hash};
 
 const DISCOVERY_QUERY_INTERVAL_SECS: u64 = 12;
 
@@ -148,11 +148,19 @@ impl Discovery {
             }
         }
 
+        // REDLINE_ALLOW: listen_addr parse failure propagates as error —
+        // silent fallback to 0.0.0.0 would expose the node to all interfaces
+        // without the operator's knowledge.
         let listen_ip = self
             .config
             .listen_addr
             .parse::<IpAddr>()
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            .map_err(|e| {
+                NetworkError::ProtocolError(format!(
+                    "invalid listen_addr '{}': {e}",
+                    self.config.listen_addr
+                ))
+            })?;
         let listen_config = ListenConfig::from_ip(listen_ip, self.config.listen_port);
 
         let enr_key = CombinedKey::generate_secp256k1();
@@ -203,29 +211,29 @@ impl Discovery {
                     }
                     ev = events.recv() => {
                         match ev {
-                            Some(Event::Discovered(enr)) => {
-                                if let Some(node) = node_record_from_enr(&enr, network_id) {
-                                    let _ = insert_node_record(&node_id, &buckets, &nodes, node);
+                            Some(Event::NodeInserted { node_id: event_node_id, replaced: _ }) => {
+                                if let Some(enr) = discv5.find_enr(&event_node_id) {
+                                    if let Some(node) = node_record_from_enr(&enr, network_id) {
+                                        let mut nodes = nodes.write();
+                                        if !nodes.contains_key(&node.peer_id) {
+                                            let node_id_hex = hex::encode(event_node_id.raw());
+                                            let bucket_index = bucket_for_node_id(
+                                                &node_id_hex,
+                                                &node.peer_id,
+                                            );
+                                            if let Some(bucket) = buckets.write().get_mut(bucket_index) {
+                                                if bucket.nodes.len() >= 16 {
+                                                    bucket.nodes.remove(0);
+                                                }
+                                                bucket.nodes.push(node.clone());
+                                                bucket.last_updated = current_timestamp();
+                                            }
+                                            nodes.insert(node.peer_id.clone(), node);
+                                        }
+                                    }
                                 }
                             }
-                            Some(Event::EnrAdded { enr, .. }) => {
-                                if let Some(node) = node_record_from_enr(&enr, network_id) {
-                                    let _ = insert_node_record(&node_id, &buckets, &nodes, node);
-                                }
-                            }
-                            Some(Event::SessionEstablished(enr, _)) => {
-                                if let Some(node) = node_record_from_enr(&enr, network_id) {
-                                    let _ = insert_node_record(&node_id, &buckets, &nodes, node);
-                                }
-                            }
-                            Some(Event::SocketUpdated(addr)) => {
-                                tracing::debug!("discovery socket updated: {}", addr);
-                            }
-                            Some(Event::NodeInserted { .. }) | Some(Event::TalkRequest(_)) => {}
-                            None => {
-                                tracing::warn!("discovery event stream closed");
-                                break;
-                            }
+                            _ => {}
                         }
                     }
                 }
@@ -236,176 +244,143 @@ impl Discovery {
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
+    pub async fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(task) = self.task.write().take() {
             task.abort();
         }
-        tracing::info!("Stopping discovery service");
-        Ok(())
     }
 
-    /// Add node to routing table
-    pub fn add_node(&self, node: NodeRecord) -> bool {
-        insert_node_record(&self.node_id, &self.buckets, &self.nodes, node)
-    }
-
-    /// Get closest nodes to target
-    pub fn get_closest_nodes(&self, target: &str, limit: usize) -> Vec<NodeRecord> {
-        let distance = calculate_distance(&self.node_id, target);
-        let bucket_index = 255 - distance.leading_zeros() as usize;
-
-        let buckets = self.buckets.read();
-        let mut nodes = Vec::new();
-
-        // Collect from closest buckets
-        for i in 0..256 {
-            let idx = bucket_index.abs_diff(i);
-
-            if idx < buckets.len() {
-                for node in &buckets[idx].nodes {
-                    nodes.push(node.clone());
-                    if nodes.len() >= limit {
-                        return nodes;
-                    }
-                }
-            }
+    pub fn get_random_nodes(&self, count: usize) -> Vec<NodeRecord> {
+        let mut all: Vec<NodeRecord> = self.nodes.read().values().cloned().collect();
+        if all.is_empty() || count == 0 {
+            return Vec::new();
         }
-
-        nodes
-    }
-
-    /// Get random nodes
-    pub fn get_random_nodes(&self, limit: usize) -> Vec<NodeRecord> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-
-        let nodes = self.nodes.read();
-        let mut selected = Vec::new();
-
-        for node in nodes.values() {
-            if selected.len() >= limit {
-                break;
-            }
-
-            if rng.gen_bool(0.5) {
-                selected.push(node.clone());
-            }
+        let n = count.min(all.len());
+        // Fisher-Yates partial shuffle
+        for i in 0..n {
+            let j = rng.gen_range(i..all.len());
+            all.swap(i, j);
         }
-
-        selected
+        all.truncate(n);
+        all
     }
 
-    /// Remove node
-    pub fn remove_node(&self, peer_id: &str) {
-        self.nodes.write().remove(peer_id);
+    pub fn known_nodes(&self) -> Vec<NodeRecord> {
+        self.nodes.read().values().cloned().collect()
+    }
 
-        // Would also remove from bucket
+    fn add_node(&self, node: NodeRecord) -> bool {
+        let bucket_index = bucket_for_node_id(&self.node_id, &node.peer_id);
+        let mut buckets = self.buckets.write();
+
+        if let Some(bucket) = buckets.get_mut(bucket_index) {
+            // Check if already exists
+            if bucket.nodes.iter().any(|n| n.peer_id == node.peer_id) {
+                bucket.last_updated = current_timestamp();
+                self.nodes.write().insert(node.peer_id.clone(), node);
+                return false;
+            }
+
+            // Add if bucket not full
+            if bucket.nodes.len() < 20 {
+                bucket.nodes.push(node.clone());
+                bucket.last_updated = current_timestamp();
+                self.nodes.write().insert(node.peer_id.clone(), node);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 
-fn build_local_enr(config: &NetworkConfig, enr_key: &CombinedKey) -> Result<Enr> {
-    let mut builder = enr::Enr::builder();
+fn insert_node_record(
+    node_id: &str,
+    buckets: &Arc<RwLock<Vec<KBucket>>>,
+    nodes: &Arc<RwLock<HashMap<String, NodeRecord>>>,
+    node: NodeRecord,
+) -> bool {
+    let bucket_index = bucket_for_node_id(node_id, &node.peer_id);
+    if let Some(bucket) = &mut buckets.write().get_mut(bucket_index) {
+        if bucket.nodes.iter().any(|n| n.peer_id == node.peer_id) {
+            bucket.last_updated = current_timestamp();
+            nodes.write().insert(node.peer_id.clone(), node);
+            return false;
+        }
 
-    let advertised_ip = config
-        .external_addr
-        .as_ref()
-        .and_then(|raw| parse_maybe_socket_ip(raw))
-        .or_else(|| parse_maybe_socket_ip(&config.listen_addr));
-
-    if let Some(ip) = advertised_ip {
-        match ip {
-            IpAddr::V4(ip4) => {
-                builder.ip4(ip4);
-                builder.tcp4(config.listen_port);
-                builder.udp4(config.listen_port);
-            }
-            IpAddr::V6(ip6) => {
-                builder.ip6(ip6);
-                builder.tcp6(config.listen_port);
-                builder.udp6(config.listen_port);
-            }
+        if bucket.nodes.len() < 20 {
+            bucket.nodes.push(node.clone());
+            bucket.last_updated = current_timestamp();
+            nodes.write().insert(node.peer_id.clone(), node);
+            true
+        } else {
+            false
         }
     } else {
-        // Keep port fields so peers can still connect when IP gets auto-updated.
-        builder.udp4(config.listen_port);
-        builder.tcp4(config.listen_port);
+        false
     }
+}
 
-    builder.build(enr_key).map_err(|err| {
-        NetworkError::ConnectionError(format!("local ENR construction failed: {err}"))
+fn node_record_from_enr(enr: &Enr, network_id: u64) -> Option<NodeRecord> {
+    let peer_id = hex::encode(enr.node_id().raw());
+    let ip = enr.ip4()?;
+    let udp_port = enr.udp4()?;
+    let tcp_port = enr.tcp4().unwrap_or(udp_port);
+
+    Some(NodeRecord {
+        peer_id,
+        ip: ip.to_string(),
+        tcp_port,
+        udp_port,
+        network_id,
     })
 }
 
-fn parse_maybe_socket_ip(raw: &str) -> Option<IpAddr> {
-    raw.parse::<SocketAddr>()
-        .map(|addr| addr.ip())
-        .or_else(|_| raw.parse::<IpAddr>())
-        .ok()
-        .filter(|ip| !ip.is_unspecified())
+fn build_local_enr(config: &NetworkConfig, key: &CombinedKey) -> Result<Enr> {
+    let ip: IpAddr = config.listen_addr.parse().map_err(|e| {
+        NetworkError::ProtocolError(format!(
+            "invalid listen_addr '{}' for ENR: {e}",
+            config.listen_addr
+        ))
+    })?;
+    let mut builder = enr::Enr::builder();
+    match ip {
+        IpAddr::V4(v4) => {
+            builder.ip4(v4);
+        }
+        IpAddr::V6(v6) => {
+            builder.ip6(v6);
+        }
+    }
+    builder.udp4(config.listen_port);
+    builder.tcp4(config.listen_port);
+    builder
+        .build(key)
+        .map_err(|e| NetworkError::ProtocolError(format!("enr build failed: {e}")))
 }
 
 fn parse_bootnode_as_enr(raw: &str) -> Option<Enr> {
     raw.parse::<Enr>().ok()
 }
 
-fn node_record_from_enr(enr: &Enr, network_id: u64) -> Option<NodeRecord> {
-    if let Some(ip4) = enr.ip4() {
-        let tcp_port = enr.tcp4().or_else(|| enr.udp4())?;
-        let udp_port = enr.udp4().unwrap_or(tcp_port);
-        return Some(NodeRecord {
-            peer_id: enr.node_id().to_string(),
-            ip: ip4.to_string(),
-            tcp_port,
-            udp_port,
-            network_id,
-        });
+fn bucket_for_node_id(local_id: &str, remote_id: &str) -> usize {
+    let distance = calculate_distance(local_id, remote_id);
+    let bytes = distance.as_bytes();
+    let mut bucket = 255usize;
+
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte != 0 {
+            bucket = i * 8 + (255 - byte.leading_zeros() as usize);
+            break;
+        }
     }
 
-    if let Some(ip6) = enr.ip6() {
-        let tcp_port = enr.tcp6().or_else(|| enr.udp6())?;
-        let udp_port = enr.udp6().unwrap_or(tcp_port);
-        return Some(NodeRecord {
-            peer_id: enr.node_id().to_string(),
-            ip: ip6.to_string(),
-            tcp_port,
-            udp_port,
-            network_id,
-        });
-    }
-
-    None
-}
-
-fn insert_node_record(
-    local_node_id: &str,
-    buckets: &RwLock<Vec<KBucket>>,
-    nodes: &RwLock<HashMap<String, NodeRecord>>,
-    node: NodeRecord,
-) -> bool {
-    // Calculate distance and bucket index
-    let distance = calculate_distance(local_node_id, &node.peer_id);
-    let bucket_index = 255 - distance.leading_zeros() as usize;
-
-    let mut buckets = buckets.write();
-    let bucket = &mut buckets[bucket_index];
-
-    // Check if already exists
-    if bucket.nodes.iter().any(|n| n.peer_id == node.peer_id) {
-        bucket.last_updated = current_timestamp();
-        nodes.write().insert(node.peer_id.clone(), node);
-        return false;
-    }
-
-    // Add if bucket not full
-    if bucket.nodes.len() < 20 {
-        bucket.nodes.push(node.clone());
-        bucket.last_updated = current_timestamp();
-        nodes.write().insert(node.peer_id.clone(), node);
-        true
-    } else {
-        false
-    }
+    bucket.min(255)
 }
 
 fn generate_node_id() -> String {
@@ -421,7 +396,6 @@ fn generate_node_id() -> String {
 }
 
 fn calculate_distance(id1: &str, id2: &str) -> Hash {
-    // XOR distance
     let bytes1 = normalize_node_id_bytes(id1);
     let bytes2 = normalize_node_id_bytes(id2);
 

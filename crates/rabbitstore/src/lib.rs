@@ -19,10 +19,10 @@ pub use archive::{
     read_archive_segment, ArchiveSegment, ArchiveSegmentWriter, ArchivedBlock,
     ArchivedComputeTxResult,
 };
-pub use compute::ComputeStore;
+pub use compute::{build_persistent_unspent_mpt, compute_unspent_mpt_root, prove_unspent_output, ComputeStore, DurableComputeCheckpoint, PersistentReplayNonceRegistry, UnspentOutputProof};
 pub use db::{KeyValueDB, RedbDatabase, RocksDb, RocksDbCompression};
 pub use index::{BlockIndex, IndexDB, TxIndex};
-pub use trie::{MerklePatriciaTrie, TrieDB, TrieNode, TrieProof};
+pub use trie::{CachedTrieDB, MerklePatriciaTrie, PersistentTrieDB, TrieDB, TrieNode, TrieProof};
 
 /// Storage error types
 #[derive(Debug, thiserror::Error)]

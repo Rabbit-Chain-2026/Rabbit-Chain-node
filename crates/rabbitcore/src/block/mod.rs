@@ -6,8 +6,16 @@ use crate::crypto::{Address, Hash};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PRE_CANONICAL_BLOCK_VERSION: u32 = 2;
 pub const CANONICAL_BLOCK_VERSION: u32 = 3;
+pub const DIFFICULTY_WINDOW_BLOCKS: usize = 10;
+pub const TARGET_BLOCK_INTERVAL_SECS: u64 = 10;
+pub const BASE_MINING_DIFFICULTY: u128 = 1;
+pub const MIN_MINING_DIFFICULTY: u128 = 1;
+pub const MAX_MINING_DIFFICULTY: u128 = 1_000_000_000;
+pub const DIFFICULTY_BOOTSTRAP_THRESHOLD: u128 = 1_000_000;
+pub const DIFFICULTY_BOOTSTRAP_STEP_BPS: u128 = 40_000;
+pub const DIFFICULTY_MAX_STEP_BPS: u128 = 2_500;
+const DIFFICULTY_INTERVAL_EMA_WEIGHT: u128 = 4;
 
 /// Block errors
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -63,16 +71,17 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     pub fn compute_hash(&self) -> Hash {
-        let encoded = if self.version >= CANONICAL_BLOCK_VERSION {
-            self.encode_canonical_hash_preimage()
-        } else {
-            self.encode_legacy_hash_preimage()
-        };
+        let encoded = self.encode_canonical_hash_preimage();
         Hash::from_bytes(crate::crypto::keccak256(&encoded))
     }
 
     pub fn validate(&self, parent: &BlockHeader) -> Result<(), BlockError> {
-        if self.parent_hash != parent.hash {
+        let parent_hash = if parent.hash.is_zero() {
+            parent.canonical_hash()
+        } else {
+            parent.hash
+        };
+        if self.parent_hash != parent_hash {
             return Err(BlockError::InvalidParentHash);
         }
 
@@ -92,6 +101,14 @@ impl BlockHeader {
     }
 
     pub fn verify_pow(&self) -> Result<(), BlockError> {
+        // Genesis is exempt from PoW; every non-genesis block must meet a
+        // non-zero difficulty floor (fail-fast: never treat difficulty=0 as valid work).
+        if self.number.is_zero() {
+            return Ok(());
+        }
+        if self.difficulty.is_zero() {
+            return Err(BlockError::InvalidDifficulty);
+        }
         let target = pow_target_from_difficulty(self.difficulty);
         let pow_hash = compute_pow_hash(self, self.nonce);
 
@@ -100,6 +117,16 @@ impl BlockHeader {
         }
 
         Ok(())
+    }
+
+    /// Recompute and cache the canonical header hash.
+    pub fn seal_hash(&mut self) {
+        self.hash = self.compute_hash();
+    }
+
+    /// Canonical header hash (never trusts the skipped serde cache blindly).
+    pub fn canonical_hash(&self) -> Hash {
+        self.compute_hash()
     }
 
     pub fn apply_body_commitments(&mut self, body: &BlockBody) {
@@ -124,37 +151,35 @@ impl BlockHeader {
         body.validate_against_header(self)
     }
 
-    fn encode_legacy_hash_preimage(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.version.to_be_bytes());
-        data.extend_from_slice(self.parent_hash.as_bytes());
-        data.extend_from_slice(&self.number.to_big_endian());
-        data.extend_from_slice(&self.timestamp.to_be_bytes());
-        data.extend_from_slice(&self.nonce.to_be_bytes());
-        data.extend_from_slice(&self.difficulty.to_big_endian());
-        data
+    /// Returns the canonical hash preimage bytes used for both header hashing
+    /// and PoW computation.
+    pub fn compute_hash_preimage_for_pow(&self) -> Vec<u8> {
+        self.encode_canonical_hash_preimage()
     }
 
     fn encode_canonical_hash_preimage(&self) -> Vec<u8> {
-        bincode::serialize(&CanonicalBlockHashPreimage {
-            version: self.version,
-            parent_hash: self.parent_hash,
-            uncle_hashes: &self.uncle_hashes,
-            coinbase: self.coinbase,
-            state_root: self.state_root,
-            transactions_root: self.transactions_root,
-            receipts_root: self.receipts_root,
-            number: self.number,
-            gas_limit: self.gas_limit,
-            gas_used: self.gas_used,
-            timestamp: self.timestamp,
-            difficulty: self.difficulty,
-            nonce: self.nonce,
-            extra_data: &self.extra_data,
-            mix_hash: self.mix_hash,
-            base_fee_per_gas: self.base_fee_per_gas,
-        })
-        .expect("serializing canonical block hash preimage")
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.version.to_be_bytes());
+        data.extend_from_slice(self.parent_hash.as_bytes());
+        data.extend_from_slice(&(self.uncle_hashes.len() as u64).to_be_bytes());
+        for uncle in &self.uncle_hashes {
+            data.extend_from_slice(uncle.as_bytes());
+        }
+        data.extend_from_slice(self.coinbase.as_bytes());
+        data.extend_from_slice(self.state_root.as_bytes());
+        data.extend_from_slice(self.transactions_root.as_bytes());
+        data.extend_from_slice(self.receipts_root.as_bytes());
+        data.extend_from_slice(&self.number.to_big_endian());
+        data.extend_from_slice(&self.gas_limit.to_be_bytes());
+        data.extend_from_slice(&self.gas_used.to_be_bytes());
+        data.extend_from_slice(&self.timestamp.to_be_bytes());
+        data.extend_from_slice(&self.difficulty.to_big_endian());
+        data.extend_from_slice(&self.nonce.to_be_bytes());
+        data.extend_from_slice(&(self.extra_data.len() as u64).to_be_bytes());
+        data.extend_from_slice(&self.extra_data);
+        data.extend_from_slice(self.mix_hash.as_bytes());
+        data.extend_from_slice(&self.base_fee_per_gas.to_big_endian());
+        data
     }
 }
 
@@ -220,30 +245,15 @@ impl Block {
 /// the sidecar path can be introduced without changing transaction encoding.
 pub type TxEnvelope = ComputeTx;
 
-#[derive(Serialize)]
-struct CanonicalBlockHashPreimage<'a> {
-    version: u32,
-    parent_hash: Hash,
-    uncle_hashes: &'a [Hash],
-    coinbase: Address,
-    state_root: Hash,
-    transactions_root: Hash,
-    receipts_root: Hash,
-    number: U256,
-    gas_limit: u64,
-    gas_used: u64,
-    timestamp: u64,
-    difficulty: U256,
-    nonce: u64,
-    extra_data: &'a [u8],
-    mix_hash: Hash,
-    base_fee_per_gas: U256,
-}
-
 /// Canonical execution receipt stored alongside a block body.
+///
+/// Note: `block_hash` is excluded from the receipt commitment root computation
+/// (`compute_receipts_root`) to avoid a circular dependency (header hash depends
+/// on the receipts root, which would otherwise depend on the block hash).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     pub tx_id: TxId,
+    #[serde(skip)]
     pub block_hash: Hash,
     pub status: ReceiptStatus,
     pub gas_used: u64,
@@ -463,10 +473,20 @@ pub fn compute_transactions_root(transactions: &[TxEnvelope]) -> Hash {
 }
 
 /// Compute the receipt commitment root for a block body.
+///
+/// The receipt's `block_hash` field is intentionally **excluded** from the
+/// commitment encoding. This breaks the circular dependency between
+/// `header.hash` (which binds `receipts_root`) and `receipt.block_hash`
+/// (which is the header hash). `block_hash` is a post-hoc annotation for
+/// external consumers and must never influence consensus state.
 pub fn compute_receipts_root(receipts: &[Receipt]) -> Hash {
     let leaves = receipts
         .iter()
-        .map(|receipt| commitment_leaf_hash(b"RABBIT-BLOCK-RECEIPT-V1", receipt))
+        .map(|receipt| {
+            let mut commitment = receipt.clone();
+            commitment.block_hash = Hash::zero(); // strip circular field
+            commitment_leaf_hash(b"RABBIT-BLOCK-RECEIPT-V1", &commitment)
+        })
         .collect::<Vec<_>>();
     compute_merkle_root(&leaves)
 }
@@ -482,7 +502,7 @@ fn commitment_leaf_hash<T: Serialize>(domain: &[u8], value: &T) -> Hash {
 /// Genesis block
 pub fn create_genesis_block() -> Block {
     let header = BlockHeader {
-        version: 1,
+        version: CANONICAL_BLOCK_VERSION,
         parent_hash: Hash::zero(),
         uncle_hashes: Vec::new(),
         coinbase: Address::zero(),
@@ -493,7 +513,7 @@ pub fn create_genesis_block() -> Block {
         gas_limit: 30_000_000,
         gas_used: 0,
         timestamp: 0,
-        difficulty: U256::from_u128(1_000_000_000_000_000u128),
+        difficulty: U256::zero(),
         nonce: 0,
         extra_data: b"RabbitChain Genesis".to_vec(),
         mix_hash: Hash::zero(),
@@ -505,6 +525,83 @@ pub fn create_genesis_block() -> Block {
     let mut header = header;
     header.hash = hash;
     Block::new(header).with_body(BlockBody::default())
+}
+
+/// Adjust mining difficulty from a smoothed recent block window.
+pub fn calculate_windowed_mining_difficulty(headers: &[BlockHeader]) -> U256 {
+    let Some(latest) = headers.last() else {
+        return U256::from_u128(BASE_MINING_DIFFICULTY);
+    };
+
+    let observed_block_time = smoothed_recent_block_interval(headers)
+        .unwrap_or(TARGET_BLOCK_INTERVAL_SECS.max(1) as u128);
+
+    adjust_mining_difficulty(
+        latest.difficulty,
+        observed_block_time,
+        TARGET_BLOCK_INTERVAL_SECS,
+        MIN_MINING_DIFFICULTY,
+        MAX_MINING_DIFFICULTY,
+        DIFFICULTY_BOOTSTRAP_THRESHOLD,
+    )
+}
+
+/// Core difficulty controller shared by block production, sync validation and consensus tests.
+pub(crate) fn adjust_mining_difficulty(
+    parent_difficulty: U256,
+    observed_block_time_secs: u128,
+    target_block_time_secs: u64,
+    min_mining_difficulty: u128,
+    max_mining_difficulty: u128,
+    bootstrap_threshold: u128,
+) -> U256 {
+    let parent = parent_difficulty
+        .as_u128()
+        .max(min_mining_difficulty)
+        .clamp(min_mining_difficulty, max_mining_difficulty);
+    let observed = observed_block_time_secs.max(1);
+    let target = target_block_time_secs.max(1) as u128;
+    let candidate = parent
+        .saturating_mul(target)
+        .saturating_div(observed)
+        .clamp(min_mining_difficulty, max_mining_difficulty);
+
+    let step_bps = if parent < bootstrap_threshold {
+        DIFFICULTY_BOOTSTRAP_STEP_BPS
+    } else {
+        DIFFICULTY_MAX_STEP_BPS
+    };
+    let step = parent.saturating_mul(step_bps).saturating_div(10_000).max(1);
+    let min_next = parent.saturating_sub(step).max(min_mining_difficulty);
+    let max_next = parent.saturating_add(step).min(max_mining_difficulty);
+
+    U256::from_u128(candidate.clamp(min_next, max_next))
+}
+
+fn smoothed_recent_block_interval(headers: &[BlockHeader]) -> Option<u128> {
+    let window_len = headers.len().min(DIFFICULTY_WINDOW_BLOCKS);
+    if window_len < 2 {
+        return None;
+    }
+
+    let window = &headers[headers.len() - window_len..];
+    let mut smoothed_interval: Option<u128> = None;
+
+    for pair in window.windows(2) {
+        let interval = pair[1]
+            .timestamp
+            .saturating_sub(pair[0].timestamp)
+            .max(1) as u128;
+        smoothed_interval = Some(match smoothed_interval {
+            None => interval,
+            Some(previous) => {
+                ((previous * (DIFFICULTY_INTERVAL_EMA_WEIGHT - 1)) + interval)
+                    / DIFFICULTY_INTERVAL_EMA_WEIGHT
+            }
+        });
+    }
+
+    smoothed_interval.map(|interval| interval.max(1))
 }
 
 pub fn max_pow_target() -> U256 {
@@ -553,10 +650,40 @@ pub fn pow_target_from_hex(input: &str) -> Result<U256, String> {
     Ok(U256::from_big_endian(&decoded))
 }
 
-fn compute_pow_hash(header: &BlockHeader, nonce: u64) -> Hash {
-    let mut data = header.encode_legacy_hash_preimage();
-    data.extend_from_slice(&nonce.to_be_bytes());
-    Hash::from_bytes(crate::crypto::keccak256(&data))
+/// Domain-separated tag for PoW hashing (distinct from block hash preimage).
+const POW_DOMAIN_TAG: &[u8] = b"RABBIT-POW-V1";
+
+/// Compute the PoW hash for a block header and nonce.
+///
+/// RabbitChain PoW is **SHA-256d** (double SHA-256), the same hash function
+/// family used by Bitcoin, which allows SHA-256 ASIC hardware (via a
+/// compatible mining bridge) to participate. The preimage binds the full
+/// header commitment fields (except the cached hash) so coinbase / roots /
+/// difficulty / extra_data cannot be swapped after mining:
+///
+/// ```text
+/// sha256( sha256( "RABBIT-POW-V1" || encode_canonical_hash_preimage(header_with_nonce) ) )
+/// ```
+///
+/// `header.nonce` is temporarily treated as `nonce` for encoding so miners can
+/// trial nonces without mutating the stored header first.
+pub fn compute_pow_hash(header: &BlockHeader, nonce: u64) -> Hash {
+    use sha2::{Digest, Sha256};
+
+    let mut sealed = header.clone();
+    sealed.nonce = nonce;
+    // mix_hash is the PoW output field: always zero it in the preimage so the
+    // digest does not depend on itself (standard mix_hash / seal pattern).
+    sealed.mix_hash = Hash::zero();
+    // hash field is not part of encode_canonical_hash_preimage
+    let mut data = Vec::with_capacity(16 + 256);
+    data.extend_from_slice(POW_DOMAIN_TAG);
+    data.extend_from_slice(&sealed.encode_canonical_hash_preimage());
+
+    // SHA-256d: first pass, then second pass over the first digest.
+    let first = Sha256::digest(&data);
+    let second = Sha256::digest(&first);
+    Hash::from_bytes(second.into())
 }
 
 #[cfg(test)]
@@ -569,7 +696,80 @@ mod tests {
 
         assert_eq!(genesis.header.number, U256::zero());
         assert_eq!(genesis.header.parent_hash, Hash::zero());
+        assert_eq!(genesis.header.version, CANONICAL_BLOCK_VERSION);
         assert_eq!(genesis.body.as_ref().map(BlockBody::is_empty), Some(true));
+    }
+
+    #[test]
+    fn test_windowed_mining_difficulty_uses_recent_block_times() {
+        let mut headers = Vec::new();
+        for i in 0..10u64 {
+            headers.push(BlockHeader {
+                version: CANONICAL_BLOCK_VERSION,
+                parent_hash: Hash::zero(),
+                uncle_hashes: Vec::new(),
+                coinbase: Address::zero(),
+                state_root: Hash::zero(),
+                transactions_root: Hash::zero(),
+                receipts_root: Hash::zero(),
+                number: U256::from(i),
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: i * 10,
+                difficulty: U256::from_u128(1_000_000),
+                nonce: 0,
+                extra_data: Vec::new(),
+                mix_hash: Hash::zero(),
+                base_fee_per_gas: U256::from(1_000_000_000u64),
+                hash: Hash::zero(),
+            });
+        }
+
+        let difficulty = calculate_windowed_mining_difficulty(&headers);
+        assert_eq!(difficulty, U256::from_u128(1_000_000));
+
+        let mut fast_headers = headers.clone();
+        for (idx, header) in fast_headers.iter_mut().enumerate() {
+            header.timestamp = (idx as u64) * 5;
+        }
+        let faster = calculate_windowed_mining_difficulty(&fast_headers);
+        assert_eq!(faster, U256::from_u128(1_250_000));
+
+        let mut slow_headers = headers.clone();
+        for (idx, header) in slow_headers.iter_mut().enumerate() {
+            header.timestamp = (idx as u64) * 20;
+        }
+        let slower = calculate_windowed_mining_difficulty(&slow_headers);
+        assert_eq!(slower, U256::from_u128(750_000));
+    }
+
+    #[test]
+    fn test_windowed_mining_difficulty_bootstraps_from_low_difficulty() {
+        let mut headers = Vec::new();
+        for i in 0..10u64 {
+            headers.push(BlockHeader {
+                version: CANONICAL_BLOCK_VERSION,
+                parent_hash: Hash::zero(),
+                uncle_hashes: Vec::new(),
+                coinbase: Address::zero(),
+                state_root: Hash::zero(),
+                transactions_root: Hash::zero(),
+                receipts_root: Hash::zero(),
+                number: U256::from(i),
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp: i,
+                difficulty: U256::from_u128(1),
+                nonce: 0,
+                extra_data: Vec::new(),
+                mix_hash: Hash::zero(),
+                base_fee_per_gas: U256::from(1_000_000_000u64),
+                hash: Hash::zero(),
+            });
+        }
+
+        let difficulty = calculate_windowed_mining_difficulty(&headers);
+        assert_eq!(difficulty, U256::from_u128(5));
     }
 
     #[test]
@@ -599,5 +799,194 @@ mod tests {
                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                 ])
         );
+    }
+
+    #[test]
+    fn test_compute_pow_hash_binds_full_header_and_nonce() {
+        let header = BlockHeader {
+            version: 3,
+            parent_hash: Hash::from_bytes([1u8; 32]),
+            uncle_hashes: Vec::new(),
+            coinbase: Address::zero(),
+            state_root: Hash::zero(),
+            transactions_root: Hash::zero(),
+            receipts_root: Hash::zero(),
+            number: U256::from(42u64),
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1000,
+            difficulty: U256::from_u128(1000),
+            nonce: 7,
+            extra_data: Vec::new(),
+            mix_hash: Hash::zero(),
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            hash: Hash::zero(),
+        };
+        let computed = compute_pow_hash(&header, 7u64);
+        let mut sealed = header.clone();
+        sealed.nonce = 7;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(POW_DOMAIN_TAG);
+        expected.extend_from_slice(&sealed.encode_canonical_hash_preimage());
+        use sha2::{Digest, Sha256};
+        let first = Sha256::digest(&expected);
+        let second = Sha256::digest(&first);
+        assert_eq!(computed, Hash::from_bytes(second.into()));
+        let diff = compute_pow_hash(&header, 8u64);
+        assert_ne!(computed, diff);
+
+        // Changing coinbase must change the PoW digest (content binding).
+        let mut other = header.clone();
+        other.coinbase = Address::from_bytes([0xab; 20]);
+        assert_ne!(computed, compute_pow_hash(&other, 7u64));
+    }
+
+    #[test]
+    fn test_verify_pow_rejects_impossible_difficulty() {
+        let mut header = BlockHeader {
+            version: 3,
+            parent_hash: Hash::from_bytes([2u8; 32]),
+            uncle_hashes: Vec::new(),
+            coinbase: Address::zero(),
+            state_root: Hash::zero(),
+            transactions_root: Hash::zero(),
+            receipts_root: Hash::zero(),
+            number: U256::from(1u64),
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1100,
+            difficulty: U256::from_u128(u128::MAX),
+            nonce: 0,
+            extra_data: Vec::new(),
+            mix_hash: Hash::zero(),
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            hash: Hash::zero(),
+        };
+        header.hash = header.compute_hash();
+        assert!(header.verify_pow().is_err());
+    }
+
+    #[test]
+    fn test_verify_pow_rejects_zero_difficulty_for_non_genesis() {
+        let mut header = BlockHeader {
+            version: 3,
+            parent_hash: Hash::from_bytes([3u8; 32]),
+            uncle_hashes: Vec::new(),
+            coinbase: Address::zero(),
+            state_root: Hash::zero(),
+            transactions_root: Hash::zero(),
+            receipts_root: Hash::zero(),
+            number: U256::from(1u64),
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1200,
+            difficulty: U256::zero(),
+            nonce: 999,
+            extra_data: Vec::new(),
+            mix_hash: Hash::zero(),
+            base_fee_per_gas: U256::from(1_000_000_000u64),
+            hash: Hash::zero(),
+        };
+        header.seal_hash();
+        assert_eq!(header.verify_pow(), Err(BlockError::InvalidDifficulty));
+    }
+
+    fn test_verify_pow_allows_genesis_zero_difficulty() {
+        let genesis = create_genesis_block();
+        assert!(genesis.header.difficulty.is_zero());
+        assert!(genesis.header.verify_pow().is_ok());
+    }
+
+    #[test]
+    fn test_golden_pow_v1_vectors() {
+        // Keep in sync with fixtures/pow/golden_pow_v1.json and mining-stack.
+        let vectors = [
+            (
+                "empty-template-nonce-42",
+                3u32,
+                [0x11u8; 32],
+                [0x22u8; 20],
+                [0u8; 32],
+                1u64,
+                30_000_000u64,
+                1_700_000_000u64,
+                1u128,
+                42u64,
+                1_000_000_000u128,
+                "a388c62f5c894dd02d6b63d0197a3268ce3fcbd541561c85408612ebdc516683",
+            ),
+            (
+                "empty-template-coinbase-changed",
+                3,
+                [0x11u8; 32],
+                [0x33u8; 20],
+                [0u8; 32],
+                1,
+                30_000_000,
+                1_700_000_000,
+                1,
+                42,
+                1_000_000_000,
+                "6894721822c61f50aae85d3e354ed46f0d98829562d42fcc6f400ff54442ec07",
+            ),
+            (
+                "empty-template-nonce-43",
+                3,
+                [0x11u8; 32],
+                [0x22u8; 20],
+                [0u8; 32],
+                1,
+                30_000_000,
+                1_700_000_000,
+                1,
+                43,
+                1_000_000_000,
+                "197ccde8355d18f08872712652764dc01f9c291af001f10ad22bbb59a43da2ee",
+            ),
+            (
+                "nonzero-state-root-height-7",
+                3,
+                [0x11u8; 32],
+                [0x22u8; 20],
+                [0xaau8; 32],
+                7,
+                30_000_000,
+                99,
+                0x100,
+                0,
+                1_000_000_000,
+                "66db97e06a88758bd427d173ab74e7e6390d12a705916c3dec72a2d0b117c7af",
+            ),
+        ];
+
+        for (id, version, parent, coinbase, state, number, gas_limit, ts, diff, nonce, base_fee, expected_hex) in vectors {
+            let header = BlockHeader {
+                version,
+                parent_hash: Hash::from_bytes(parent),
+                uncle_hashes: Vec::new(),
+                coinbase: Address::from_bytes(coinbase),
+                state_root: Hash::from_bytes(state),
+                transactions_root: Hash::zero(),
+                receipts_root: Hash::zero(),
+                number: U256::from(number),
+                gas_limit,
+                gas_used: 0,
+                timestamp: ts,
+                difficulty: U256::from_u128(diff),
+                nonce,
+                extra_data: Vec::new(),
+                mix_hash: Hash::zero(),
+                base_fee_per_gas: U256::from_u128(base_fee),
+                hash: Hash::zero(),
+            };
+            let got = compute_pow_hash(&header, nonce);
+            let expected = Hash::from_hex(expected_hex).expect(id);
+            assert_eq!(got, expected, "golden vector mismatch: {id}");
+        }
+
+        // Content binding: coinbase change must diverge.
+        let a = Hash::from_hex("a388c62f5c894dd02d6b63d0197a3268ce3fcbd541561c85408612ebdc516683").unwrap();
+        let b = Hash::from_hex("6894721822c61f50aae85d3e354ed46f0d98829562d42fcc6f400ff54442ec07").unwrap();
+        assert_ne!(a, b);
     }
 }

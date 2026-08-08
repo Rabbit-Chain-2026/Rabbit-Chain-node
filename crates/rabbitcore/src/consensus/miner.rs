@@ -8,7 +8,7 @@
 
 use super::{Consensus, ConsensusError, PowAlgorithm, PowConsensus};
 use crate::account::U256;
-use crate::block::{create_genesis_block, Block, BlockHeader};
+use crate::block::{Block, BlockHeader, CANONICAL_BLOCK_VERSION};
 use crate::crypto::{keccak256, Address, Hash};
 use crate::state::StateDb;
 use parking_lot::RwLock;
@@ -290,7 +290,7 @@ impl MiningEngine {
 
         // Build block header
         let header = BlockHeader {
-            version: 1,
+            version: CANONICAL_BLOCK_VERSION,
             parent_hash: parent.hash,
             uncle_hashes: Vec::new(),
             coinbase: self.config.coinbase,

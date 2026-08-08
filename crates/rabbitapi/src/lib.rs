@@ -15,11 +15,13 @@ pub mod subscription;
 pub mod ws;
 
 pub use rest::{RestConfig, RestServer};
-pub use rpc::{RpcApi, RpcConfig, RpcServer};
+pub use rpc::{wire_reorg_notifications, RpcApi, RpcConfig, RpcServer};
 pub use ws::{SubscriptionManager, WsConfig, WsServer};
 
 use std::sync::Arc;
 use thiserror::Error;
+#[cfg(test)]
+use std::time::Duration;
 
 /// API error types
 #[derive(Error, Debug)]
@@ -155,5 +157,35 @@ impl ApiService {
         }
 
         Ok(())
+    }
+
+    /// Underlying JSON-RPC API (for wiring network reorg notifications).
+    pub fn rpc_api(&self) -> Option<Arc<RpcApi>> {
+        self.rpc_server.as_ref().and_then(|rpc| rpc.api())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::ComputeBackend;
+
+    #[tokio::test]
+    async fn api_service_starts_with_mem_compute_backend() {
+        let mut config = RpcConfig::default();
+        config.address = "127.0.0.1".to_string();
+        config.port = 0;
+        config.compute_backend = ComputeBackend::Mem;
+        config.compute_db_path = ":memory:".to_string();
+        config.mining_enabled = false;
+
+        let mut api_cfg = ApiConfig::default();
+        api_cfg.http_rpc = config;
+        api_cfg.ws.port = 0;
+        api_cfg.rest.port = 0;
+
+        let service = ApiService::try_new(api_cfg).expect("api service should build");
+        service.start().await.expect("api service should start");
+        service.stop().await.expect("api service should stop");
     }
 }

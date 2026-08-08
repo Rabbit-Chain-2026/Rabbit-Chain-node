@@ -2,23 +2,31 @@
 
 use crate::Result;
 use anyhow::{anyhow, bail};
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use std::path::PathBuf;
 use rabbitapi::rpc::RpcConfig;
+use rabbitapi::rpc::{set_block_broadcaster, wire_reorg_notifications};
 use rabbitapi::{ApiConfig, ApiService};
 use rabbitcore::account::U256;
 use rabbitcore::block::{
     create_genesis_block, pow_hash_meets_target, pow_target_from_hex, pow_target_to_hex,
 };
-use rabbitcore::crypto::keccak256;
-use rabbitnet::{configure_global_block_persistence, NetworkConfig, NetworkService};
+
+use rabbitnet::{
+    configure_global_block_persistence, global_highest_peer_height, global_latest_block,
+    global_store_block, NetworkConfig, NetworkService,
+};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 const LOCAL_MINER_MAX_HASHES_PER_JOB_ATTEMPT: u64 = 2_000_000;
 const LOCAL_MINER_MAX_JOB_AGE_SECS: u64 = 2;
+const LOCAL_MINER_STARTUP_WAIT_SECS: u64 = 120;
+const LOCAL_MINER_STARTUP_POLL_SECS: u64 = 2;
 
 pub struct RunNodeConfig {
     pub mine: bool,
+    pub enable_mining_rpc: bool,
     pub disable_local_miner: bool,
     pub coinbase: Option<String>,
     pub coinbase_count: usize,
@@ -37,7 +45,6 @@ pub struct RunNodeConfig {
     pub p2p_peer_id: Option<String>,
     pub p2p_peer_id_path: Option<String>,
     pub p2p_sync_blocks_path: Option<String>,
-    pub canonical_block_activation_height: Option<u64>,
     pub max_peers: u32,
     pub enable_discovery: bool,
     pub enable_sync: bool,
@@ -49,9 +56,30 @@ pub struct RunNodeConfig {
     pub p2p_bootnode_retry_interval_secs: u64,
 }
 
+pub async fn run_remote_miner(
+    rpc_url: String,
+    rpc_token: Option<String>,
+    miner_label: String,
+) -> Result<()> {
+    println!("⛏️  Starting remote RPC miner");
+    println!("   RPC URL: {}", rpc_url);
+    println!(
+        "   RPC auth: {}",
+        if rpc_token.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("   Miner label: {}", miner_label);
+    run_rpc_backed_miner(rpc_url, rpc_token, miner_label).await;
+    Ok(())
+}
+
 pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
     let RunNodeConfig {
         mine,
+        enable_mining_rpc,
         disable_local_miner,
         coinbase,
         coinbase_count,
@@ -70,7 +98,6 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         p2p_peer_id,
         p2p_peer_id_path,
         p2p_sync_blocks_path,
-        canonical_block_activation_height,
         max_peers,
         enable_discovery,
         enable_sync,
@@ -86,7 +113,19 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
     println!("   Data directory: {}", data_dir);
     println!("   HTTP RPC port: {}", http_port);
     println!("   WebSocket port: {}", ws_port);
-    println!("   Mining: {}", if mine { "enabled" } else { "disabled" });
+    let mining_rpc_enabled = mine || enable_mining_rpc;
+    println!(
+        "   Mining RPC: {}",
+        if mining_rpc_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "   Local mining worker: {}",
+        if mine { "enabled" } else { "disabled" }
+    );
     if p2p_tcp_enabled {
         println!("   P2P TCP listen: {}:{}", p2p_listen_addr, p2p_listen_port);
     } else {
@@ -150,23 +189,23 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         println!("   P2P peer id path: {}", p2p_peer_id_path);
     }
     println!("   P2P sync block store: {}", p2p_sync_blocks_path);
-    if mine {
+    if mining_rpc_enabled {
         let display_coinbase = coinbase
             .clone()
             .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
-        println!("   🎯 Mining worker coinbase: {}", display_coinbase);
+        println!("   🎯 Mining RPC coinbase: {}", display_coinbase);
         if coinbase_count > 0 {
             println!(
-                "   🎯 Mining worker coinbase rotation: {} addresses",
+                "   🎯 Mining RPC coinbase rotation: {} addresses",
                 coinbase_count
             );
         }
         println!(
             "   Local mining worker: {}",
-            if disable_local_miner {
-                "disabled"
-            } else {
+            if mine && !disable_local_miner {
                 "enabled"
+            } else {
+                "disabled"
             }
         );
     } else if let Some(ref cb) = coinbase {
@@ -187,12 +226,20 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         .as_ref()
         .map(|cfg| cfg.network_id)
         .unwrap_or(10086);
+    let spawn_local_miner = mine && !disable_local_miner;
+    let rpc_token_for_miner = rpc_config
+        .as_ref()
+        .and_then(|cfg| cfg.auth_token.clone());
     configure_global_block_persistence(Some(PathBuf::from(&p2p_sync_blocks_path)))?;
+    if global_latest_block().is_none() {
+        global_store_block(genesis.clone())?;
+        println!("   Genesis block seeded into local chain cache");
+    }
 
-    let _api_service = if let Some(mut cfg) = rpc_config.clone() {
+    let api_service = if let Some(mut cfg) = rpc_config.clone() {
         let rpc_token = cfg.auth_token.clone();
         cfg.port = http_port;
-        cfg.mining_enabled = mine;
+        cfg.mining_enabled = mining_rpc_enabled;
         let mut api_cfg = ApiConfig {
             http_rpc: cfg,
             ..ApiConfig::default()
@@ -205,26 +252,17 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         api.start()
             .await
             .map_err(|e| anyhow::anyhow!("failed to start API service: {e}"))?;
-            println!("   HTTP RPC service started on port {}", http_port);
-
-        if mine && !disable_local_miner {
-            let rpc_url = format!("http://127.0.0.1:{http_port}");
-            println!("   🎯 Starting RPC-backed mining worker at {}", rpc_url);
-            tokio::spawn(async move {
-                run_rpc_backed_miner(rpc_url, rpc_token, "rabbitchain-local".to_string()).await;
-            });
-        } else if mine {
-            println!("   ⛏️  Mining RPC enabled without local mining worker");
-        }
+        println!("   HTTP RPC service started on port {}", http_port);
 
         Some(api)
     } else {
-        if mine {
+        if mining_rpc_enabled {
             println!("   ⚠️ Mining requested but HTTP RPC is disabled; mining worker not started");
         }
         None
     };
 
+    println!("   🧭 Building network service config");
     let network_cfg = NetworkConfig {
         network_id,
         listen_addr: p2p_listen_addr,
@@ -237,7 +275,6 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         local_peer_id: p2p_peer_id,
         peer_id_path: Some(PathBuf::from(p2p_peer_id_path)),
         sync_blocks_path: Some(PathBuf::from(p2p_sync_blocks_path)),
-        canonical_block_activation_height,
         max_peers,
         min_peers: max_peers.min(25),
         bootnodes,
@@ -253,8 +290,48 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         sync_auto_advance_interval_secs: 2,
         ..NetworkConfig::default()
     };
-    let network_service = NetworkService::new(network_cfg)?;
+    println!("   🧭 Creating network service");
+    let network_service = Arc::new(NetworkService::new(network_cfg)?);
+    println!("   🧭 Starting network service");
     network_service.start().await?;
+    set_block_broadcaster(Some(Arc::new({
+        let network_service = network_service.clone();
+        move |block: &rabbitcore::block::Block| {
+            let _ = network_service.broadcast_block(block.clone());
+        }
+    })));
+    // Wire sync/fork-choice tip updates into RPC mining queues (H6 reorg hook).
+    if let Some(api) = api_service.as_ref().and_then(|svc| svc.rpc_api()) {
+        wire_reorg_notifications(&api);
+        println!("   🔗 Canonical tip listener wired to RPC reorg hook");
+    }
+    if spawn_local_miner {
+        wait_for_mining_alignment(network_service.clone()).await?;
+        let rpc_url = format!("http://127.0.0.1:{http_port}");
+        println!(
+            "   🎯 Starting RPC-backed mining worker thread at {}",
+            rpc_url
+        );
+        std::thread::Builder::new()
+            .name("rabbitchain-local-miner".to_string())
+            .spawn({
+                let rpc_token = rpc_token_for_miner.clone();
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build local mining runtime");
+                    runtime.block_on(run_rpc_backed_miner(
+                        rpc_url,
+                        rpc_token,
+                        "rabbitchain-local".to_string(),
+                    ));
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("failed to spawn mining worker thread: {err}"))?;
+    } else if mining_rpc_enabled {
+        println!("   ⛏️  Mining RPC enabled without local mining worker");
+    }
     println!(
         "   P2P service started (tcp={}, websocket={})",
         p2p_tcp_enabled, p2p_ws_enabled
@@ -264,6 +341,39 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
     loop {
         println!("   Peers connected: {}", network_service.peer_count());
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+async fn wait_for_mining_alignment(network_service: Arc<NetworkService>) -> Result<()> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(LOCAL_MINER_STARTUP_WAIT_SECS);
+    loop {
+        let peer_count = network_service.peer_count();
+        let local_head = rabbitnet::global_latest_block()
+            .map(|block| block.header.number.as_u64())
+            .unwrap_or(0);
+        let peer_head = rabbitnet::global_highest_peer_height();
+
+        if peer_count > 0 && peer_head > 0 && local_head >= peer_head.saturating_sub(1) {
+            println!(
+                "   ⛏️  Mining alignment ready: peers={}, local_head={}, peer_head={}",
+                peer_count, local_head, peer_head
+            );
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "   ⚠️ Mining alignment timeout: peers={}, local_head={}, peer_head={}",
+                peer_count, local_head, peer_head
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            LOCAL_MINER_STARTUP_POLL_SECS,
+        ))
+        .await;
     }
 }
 
@@ -287,6 +397,18 @@ struct WorkPayload {
     target: Option<String>,
     #[serde(default)]
     target_leading_rabbit_bytes: Option<usize>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+    #[serde(default)]
+    base_fee_per_gas: Option<String>,
+    #[serde(default)]
+    difficulty: Option<String>,
+    #[serde(default)]
+    coinbase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +444,7 @@ async fn rpc_call<T: DeserializeOwned>(
         "params": params,
     }));
     if let Some(token) = rpc_token {
-        request = request.bearer_auth(token);
+        request = request.bearer_auth(token).header("x-rabbit-token", token);
     }
 
     let response = request.send().await?;
@@ -351,12 +473,88 @@ async fn rpc_call<T: DeserializeOwned>(
         .ok_or_else(|| anyhow!("rpc {} returned empty result", method))
 }
 
-fn compute_pow_hash(prev_hash: &[u8; 32], height: u64, nonce: u64) -> [u8; 32] {
-    let mut data = Vec::with_capacity(32 + 8 + 8);
-    data.extend_from_slice(prev_hash);
-    data.extend_from_slice(&height.to_be_bytes());
-    data.extend_from_slice(&nonce.to_be_bytes());
-    keccak256(&data)
+fn parse_hex_u256(raw: &str) -> anyhow::Result<U256> {
+    let mut trimmed = raw.trim().strip_prefix("0x").unwrap_or(raw.trim()).to_string();
+    if trimmed.is_empty() {
+        return Ok(U256::zero());
+    }
+    // hex::decode 要求偶数位（如 "0x0" 会报 Odd number of digits）
+    if trimmed.len() % 2 == 1 {
+        trimmed.insert(0, '0');
+    }
+    let bytes = hex::decode(&trimmed).map_err(|e| anyhow!("invalid hex u256: {e}"))?;
+    if bytes.len() > 32 {
+        bail!("u256 hex too long");
+    }
+    let mut buf = [0u8; 32];
+    buf[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(U256::from_big_endian(&buf))
+}
+
+fn parse_address20(raw: &str) -> anyhow::Result<[u8; 20]> {
+    let trimmed = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
+    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("invalid address hex: {e}"))?;
+    if bytes.len() != 20 {
+        bail!("address must be 20 bytes");
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn compute_pow_hash_from_work(
+    work: &WorkPayload,
+    prev_hash: &[u8; 32],
+    nonce: u64,
+    miner_label: &str,
+) -> anyhow::Result<[u8; 32]> {
+    use rabbitcore::block::BlockHeader;
+    use rabbitcore::crypto::{Address, Hash};
+
+    let difficulty = work
+        .difficulty
+        .as_deref()
+        .map(parse_hex_u256)
+        .transpose()?
+        .unwrap_or_else(|| U256::from_u128(1));
+    let base_fee = work
+        .base_fee_per_gas
+        .as_deref()
+        .map(parse_hex_u256)
+        .transpose()?
+        .unwrap_or_else(|| U256::from(1_000_000_000u64));
+    let coinbase = work
+        .coinbase
+        .as_deref()
+        .map(parse_address20)
+        .transpose()?
+        .map(Address::from_bytes)
+        .unwrap_or_else(Address::zero);
+
+    let header = BlockHeader {
+        version: work.version.unwrap_or(3),
+        parent_hash: Hash::from_bytes(*prev_hash),
+        uncle_hashes: Vec::new(),
+        coinbase,
+        state_root: Hash::zero(),
+        transactions_root: Hash::zero(),
+        receipts_root: Hash::zero(),
+        number: U256::from(work.height),
+        gas_limit: work.gas_limit.unwrap_or(30_000_000),
+        gas_used: 0,
+        timestamp: work.timestamp.unwrap_or(0),
+        difficulty,
+        nonce,
+        // 与节点 submit_work 的 canonical 校验一致：extra_data = miner label
+        extra_data: miner_label.as_bytes().to_vec(),
+        mix_hash: Hash::zero(),
+        base_fee_per_gas: base_fee,
+        hash: Hash::zero(),
+    };
+    let digest = rabbitcore::block::compute_pow_hash(&header, nonce);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    Ok(out)
 }
 
 fn legacy_target_from_leading_rabbit_bytes(bytes: usize) -> U256 {
@@ -391,6 +589,18 @@ async fn run_rpc_backed_miner(rpc_url: String, rpc_token: Option<String>, miner_
     let mut next_work: Option<WorkPayload> = None;
     let mut cursor: Option<WorkCursor> = None;
     loop {
+        // Before fetching new work, check if the local node is synced with the network.
+        // If the peer has announced a much higher head, the local chain is still catching
+        // up and mining would create a fork that wastes work. Skip this cycle and wait.
+        let local_head = rabbitnet::global_latest_block()
+            .map(|b| b.header.number.as_u64())
+            .unwrap_or(0);
+        let peer_head = rabbitnet::global_highest_peer_height();
+        if peer_head > 0 && local_head + 8 < peer_head {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
         let work = if let Some(work) = next_work.take() {
             work
         } else {
@@ -465,7 +675,13 @@ async fn run_rpc_backed_miner(rpc_url: String, rpc_token: Option<String>, miner_
         );
         let job_started = std::time::Instant::now();
         loop {
-            let hash = compute_pow_hash(&prev_hash, work.height, nonce);
+            let hash = match compute_pow_hash_from_work(&work, &prev_hash, nonce, &miner_label) {
+                Ok(h) => h,
+                Err(err) => {
+                    println!("   ⚠️ Invalid mining work template: {}", err);
+                    break;
+                }
+            };
 
             if pow_hash_meets_target(&hash, target) {
                 let hash_hex = format!("0x{}", hex::encode(hash));

@@ -307,6 +307,9 @@ mod tests {
                 signatures: vec![],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         assert!(scheduler.submit(tx.clone()).is_ok());
@@ -337,6 +340,9 @@ mod tests {
                 signatures: vec![],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         let lane_key = strategy.lane_key(&tx);
@@ -380,6 +386,9 @@ mod tests {
                 signatures: vec![],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         let ticket = scheduler.submit(tx).expect("submit should work");

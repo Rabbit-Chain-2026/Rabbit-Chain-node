@@ -2,8 +2,8 @@
 
 适用范围：
 
-- 远端受控 bootnode
-- 本地 follower / observer
+- 远端受控 `bootnode`（首节点）
+- 本地 `follower`（同步节点）/ `observer`（只读节点）
 - 远端受控启网前预检
 
 ## 1. 先做预检

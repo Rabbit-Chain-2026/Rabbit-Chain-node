@@ -23,7 +23,8 @@ const KNOWN_FLAGS_MASK: u32 = 0x1f;
 const MAX_METADATA_ENTRIES: usize = 64;
 const MAX_METADATA_KEY_BYTES: usize = 128;
 const MAX_METADATA_VALUE_BYTES: usize = 4096;
-const REPLAY_NONCE_WINDOW_SECS: u64 = 60 * 60;
+/// Replay nonce window in seconds.
+pub const REPLAY_NONCE_WINDOW_SECS: u64 = 60 * 60;
 
 /// Object storage abstraction.
 pub trait ObjectStore: Send + Sync {
@@ -35,6 +36,12 @@ pub trait ObjectStore: Send + Sync {
     fn insert_output(&self, output: ObjectOutput) -> ComputeResult<()>;
     /// Marks output as spent.
     fn mark_spent(&self, output_id: OutputId) -> ComputeResult<()>;
+    /// Reverse mark_spent (for reorg rollback).
+    fn unmark_spent(&self, output_id: OutputId) -> ComputeResult<()>;
+    /// Remove an output entirely (for reorg rollback of freshly created outputs).
+    fn remove_output(&self, output_id: OutputId) -> ComputeResult<()>;
+    /// Collect all outputs (for MPT rebuild / state sync).
+    fn collect_outputs(&self) -> Option<Vec<ObjectOutput>>;
 }
 
 /// In-memory object store.
@@ -98,6 +105,35 @@ impl ObjectStore for InMemoryObjectStore {
         existing.spent = true;
         Ok(())
     }
+
+    fn unmark_spent(&self, output_id: OutputId) -> ComputeResult<()> {
+        let mut guard = self.outputs.write();
+        let Some(existing) = guard.get_mut(&output_id) else {
+            return Err(ComputeError::ObjectNotFound(output_id.0));
+        };
+        existing.spent = false;
+        Ok(())
+    }
+
+    fn remove_output(&self, output_id: OutputId) -> ComputeResult<()> {
+        let mut guard = self.outputs.write();
+        let Some(output) = guard.remove(&output_id) else {
+            return Err(ComputeError::ObjectNotFound(output_id.0));
+        };
+        // If this was the latest pointer, clear it
+        let mut latest = self.latest_by_object.write();
+        if let Some(prev) = latest.get(&output.object_id) {
+            if *prev == output_id {
+                latest.remove(&output.object_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_outputs(&self) -> Option<Vec<ObjectOutput>> {
+        let guard = self.outputs.read();
+        Some(guard.values().cloned().collect())
+    }
 }
 
 impl<S: ObjectStore + ?Sized> ObjectStore for Arc<S> {
@@ -115,6 +151,61 @@ impl<S: ObjectStore + ?Sized> ObjectStore for Arc<S> {
 
     fn mark_spent(&self, output_id: OutputId) -> ComputeResult<()> {
         self.as_ref().mark_spent(output_id)
+    }
+
+    fn unmark_spent(&self, output_id: OutputId) -> ComputeResult<()> {
+        self.as_ref().unmark_spent(output_id)
+    }
+
+    fn remove_output(&self, output_id: OutputId) -> ComputeResult<()> {
+        self.as_ref().remove_output(output_id)
+    }
+
+    fn collect_outputs(&self) -> Option<Vec<ObjectOutput>> {
+        self.as_ref().collect_outputs()
+    }
+}
+
+/// Registry for replay nonce tracking and deduplication.
+pub trait ReplayNonceRegistry: Send + Sync {
+    /// Returns true if the key was seen within the replay window.
+    fn contains(&self, key: &str, now: u64) -> bool;
+    /// Record a key at the given timestamp.
+    fn insert(&self, key: String, now: u64);
+    /// Prune entries outside the window.
+    fn retain_window(&self, now: u64);
+}
+
+/// In-memory replay nonce registry for testing / single-node setups.
+pub struct InMemoryReplayNonceRegistry {
+    keys: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
+}
+
+impl InMemoryReplayNonceRegistry {
+    pub fn new() -> Self {
+        Self {
+            keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryReplayNonceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplayNonceRegistry for InMemoryReplayNonceRegistry {
+    fn contains(&self, key: &str, now: u64) -> bool {
+        self.keys.read().get(key).map(|&ts| now.saturating_sub(ts) <= REPLAY_NONCE_WINDOW_SECS).unwrap_or(false)
+    }
+
+    fn insert(&self, key: String, now: u64) {
+        self.keys.write().insert(key, now);
+    }
+
+    fn retain_window(&self, now: u64) {
+        self.keys.write().retain(|_, ts| now.saturating_sub(*ts) <= REPLAY_NONCE_WINDOW_SECS);
     }
 }
 
@@ -679,6 +770,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -700,6 +794,78 @@ mod tests {
         assert!(executor
             .store
             .get_output(OutputId(Hash::from_bytes([10; 32])))
+            .is_some());
+    }
+
+    #[test]
+    fn game_domain_invoke_tx_settles() {
+        // 游戏域（GAME_DOMAIN）Invoke 交易走标准执行路径：消耗输入对象 → 产出新版本对象。
+        // 游戏命令负载（如强化/战斗）经 `payload` 携带，无需新增 Command 变体、不动共识。
+        let store = InMemoryObjectStore::new();
+        let input = build_output(crate::compute::GAME_DOMAIN, 21);
+        store.insert_output(input.clone()).unwrap();
+
+        let domains = InMemoryDomainRegistry::new();
+        domains.upsert_domain(DomainConfig {
+            domain_id: crate::compute::GAME_DOMAIN,
+            name: "jzz".to_string(),
+            vm: "shanhai".to_string(),
+            public: true,
+        });
+
+        let tx = ComputeTx {
+            tx_id: TxId(Hash::from_bytes([22; 32])),
+            domain_id: crate::compute::GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![input.output_id],
+            read_set: vec![],
+            output_proposals: vec![OutputProposal {
+                output_id: OutputId(Hash::from_bytes([23; 32])),
+                object_id: input.object_id,
+                domain_id: crate::compute::GAME_DOMAIN,
+                kind: ObjectKind::State,
+                owner: Ownership::Shared,
+                predecessor: Some(input.output_id),
+                version: Version(2),
+                state: vec![1, 2, 3],
+                state_root: None,
+                resources: vec![],
+                lock: Script::default(),
+                logic: None,
+                created_at: 0,
+                ttl: None,
+                rent_reserve: None,
+                flags: 0,
+                extensions: vec![],
+            }],
+            fee: 0,
+            nonce: Some(21),
+            metadata: vec![],
+            payload: b"enhance".to_vec(), // 游戏命令负载（GameOp 载体）
+            deadline_unix_secs: None,
+            chain_id: None,
+            network_id: None,
+            witness: TxWitness {
+                signatures: vec![test_ed25519_signature()],
+                threshold: None,
+            },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        }
+        .with_expected_tx_id();
+
+        let executor = BasicTxExecutor::new(
+            store,
+            DefaultAuthorizationPolicy,
+            NoopResourcePolicy,
+            domains,
+        );
+        let report = executor.execute(&tx).unwrap();
+        assert_eq!(report.inputs.len(), 1);
+        assert!(executor
+            .store
+            .get_output(OutputId(Hash::from_bytes([23; 32])))
             .is_some());
     }
 
@@ -759,6 +925,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -819,6 +988,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -882,6 +1054,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -971,6 +1146,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         let (sig, _, _) = sign_compute_tx_with_ed25519(&tx, 7);
@@ -1063,6 +1241,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         let (sig, _, _) = sign_compute_tx_with_ed25519(&tx, 8);
@@ -1154,6 +1335,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
 
         let sig = signing_key.sign(&tx.signing_preimage()).to_bytes();
@@ -1223,6 +1407,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -1288,6 +1475,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -1350,6 +1540,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -1416,6 +1609,9 @@ mod tests {
                 signatures: vec![test_ed25519_signature()],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -1485,6 +1681,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
 
@@ -1565,6 +1764,9 @@ mod tests {
                 signatures: vec![TxSignature::ed25519(sig, signer)],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
         executor.execute(&tx1).expect("first tx should pass");
@@ -1605,6 +1807,9 @@ mod tests {
                 signatures: vec![TxSignature::ed25519(sig, signer)],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
         .with_expected_tx_id();
         let err = executor

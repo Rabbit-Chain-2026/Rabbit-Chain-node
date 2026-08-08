@@ -2,9 +2,9 @@
 
 用于本机单机预演以下组件：
 
-- `bootnode`
-- `follower`
-- `observer`
+- `bootnode（首节点）`
+- `follower（同步节点）`
+- `observer（只读节点）`
 - `rabbitchain-mining-stack pool`
 - `rabbitchain-mining-stack miner`
 - `rabbitchain-explorer backend`
@@ -25,7 +25,7 @@ bash scripts/mainnet_local_cycle.sh
 
 默认会：
 
-1. 停掉已有本地 `bootnode/follower/observer`
+1. 停掉已有本地 `bootnode / follower / observer`
 2. 启动 `bootnode`
 3. 启动 `follower`
 4. 启动 `observer`
@@ -62,7 +62,7 @@ curl -fsS http://127.0.0.1:19080/api/overview
 - 本地 miner 使用：
   - `--target-leading-rabbit-bytes 0`
 - `bootnode` 日志会打印 `bootnode enode hint=...`
-- follower / observer 使用该 `enode` 作为 bootnode
+- `follower / observer` 使用该 `enode` 作为 bootnode
 
 ## 停止
 

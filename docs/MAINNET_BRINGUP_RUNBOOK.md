@@ -15,15 +15,15 @@
 
 建议最小拓扑：
 
-1. `bootnode / coordinator`
+1. `bootnode（首节点）`
    - 负责先启动、暴露 RPC、提供 bootnode 入口
    - 可同时承担受控挖矿角色
 
-2. `public follower`
+2. `follower（同步节点）`
    - 仅做节点同步与对外 RPC 观察
    - 初期建议不开挖矿
 
-3. `observer`
+3. `observer（只读节点）`
    - 只读节点
    - 用于同步一致性与 explorer 读取
 
@@ -36,7 +36,7 @@
 至少准备：
 
 1. 一个明确的 `coinbase` 地址
-2. 至少一个 bootnode 地址
+2. 至少一个 bootnode 入口（优先 `wss://.../p2p`，必要时可用 `enode://...`）
 3. 一台可运行 explorer backend 的机器
 4. 一组受控矿池 / 矿工
 5. 命令行钱包可创建并可签名
@@ -88,7 +88,7 @@ scripts/mainnet.sh logs
 ```bash
 curl -sS -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"rabbit_getLatestBlock","params":[],"id":1}' \
-  http://127.0.0.1:8545
+  https://rpc.rabbitchain.wedevs.org
 ```
 
 预期：
@@ -97,33 +97,34 @@ curl -sS -H 'Content-Type: application/json' \
 - RPC 可达
 - 区块高度增长或至少挖矿 work 可获取
 
-### 步骤 3：启动 follower 节点
+### 步骤 3：启动 follower（同步节点）
 
-用首节点作为 bootnode：
+用首节点的公网 P2P 入口作为 `--bootnode`：
 
 ```bash
 scripts/mainnet.sh start follower \
-  --bootnode enode://mainnet-node-1@BOOTNODE_IP:30303
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 说明：
 
 - follower 初期建议不开挖矿
-- 如果有多个 bootnode，可重复传 `--bootnode`
-- 当前 `--bootnode` 请使用 `enode://peer@ip:port`，不要直接把 discovery 日志里的 `ENR` 字符串原样传入
+- 如果需要直连 TCP bootnode，可把 `--bootnode` 改成 `enode://peer@ip:port`
+- 当前公网入口优先使用 `wss://wss.rabbitchain.wedevs.org/p2p`
 
-### 步骤 4：启动 observer
+### 步骤 4：启动 observer（只读节点）
 
 observer 建议与 follower 类似，但不承担外部流量入口：
 
 ```bash
 scripts/mainnet.sh start observer \
-  --bootnode enode://mainnet-node-1@BOOTNODE_IP:30303
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 说明：
 
-- observer 的 `--bootnode` 口径与 follower 相同，可使用 `enode://peer@ip:port` 或 `wss://...`
+- observer 的 `--bootnode` 口径与 follower 相同，优先使用 `wss://wss.rabbitchain.wedevs.org/p2p`
+- 如果需要直连 TCP bootnode，可改成 `enode://peer@ip:port`
 - 如果 bootnode 要放在 Cloudflare CDN 后面，可使用 `wss://...` WebSocket P2P bootnode，并关闭 discovery；见 [P2P 传输](book/40-network/p2p-transport.md)。
 
 ### 步骤 5：启动矿池与矿工
@@ -136,7 +137,7 @@ cargo run --release -- \
   pool \
   --host 0.0.0.0 \
   --port 9332 \
-  --node-rpc http://BOOTNODE_IP:8545
+  --node-rpc https://rpc.rabbitchain.wedevs.org
 ```
 
 矿工：
@@ -166,7 +167,7 @@ scripts/mainnet.sh start bootnode \
 
 ```bash
 cd ../rabbitchain-explorer/backend
-RABBIT_RPC_URL=http://BOOTNODE_IP:8545 cargo run --release
+RABBIT_RPC_URL=https://rpc.rabbitchain.wedevs.org cargo run --release
 ```
 
 ## 4. 核心观察项
@@ -236,9 +237,9 @@ scripts/mainnet.sh logs observer
 
 当前推荐做法不是“全面公开上线”，而是：
 
-1. 先 1 个 bootnode
-2. 再 1 个 follower
-3. 再 1 个 observer
+1. 先 1 个 `bootnode`（首节点）
+2. 再 1 个 `follower`（同步节点）
+3. 再 1 个 `observer`（只读节点）
 4. 再接 1 组白名单 pool/miner
 5. 连续观察同步、出块、shares、钱包创建
 6. 稳定后再逐步扩容

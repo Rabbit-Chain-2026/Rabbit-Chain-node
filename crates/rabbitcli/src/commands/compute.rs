@@ -3,9 +3,9 @@
 use crate::commands::rpc::rpc_call;
 use crate::{ComputeAction, Result};
 use anyhow::Context;
+use rabbitapi::rpc::canonicalize_compute_tx_json;
 use serde_json::json;
 use std::fs;
-use rabbitapi::rpc::canonicalize_compute_tx_json;
 
 pub async fn handle_compute(
     action: ComputeAction,

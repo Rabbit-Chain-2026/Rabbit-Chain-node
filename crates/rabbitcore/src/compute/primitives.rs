@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct DomainId(pub u32);
 
+/// 游戏域（"jzz"）：RabbitChain 原生应用（山海等）专用域。
+/// 游戏对象/交易在此域中与主域隔离；规则参数通过链上 Config 对象治理。
+/// 与 `shanhai-onchain-mmo` 共享约定，见方案-山海原生应用.md §3.1。
+pub const GAME_DOMAIN: DomainId = DomainId(0x6A7A_7A00);
+
 /// Logical object identifier (stable across versions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ObjectId(pub Hash);

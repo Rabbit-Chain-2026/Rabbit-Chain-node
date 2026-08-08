@@ -50,7 +50,7 @@
     }
   },
   "expected": {
-    "canonical_tx_id": "0xcd84f2b40736475994a644f89f4e1a30fdb67d7666d1d6477eeecb18339a45b3",
+    "canonical_tx_id": "0x924add22d99f3c30c2caa4a356153c4011f5256654673799a665b4daaae9433d",
     "owner": {
       "type": "Ed25519",
       "public_key": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"

@@ -138,7 +138,7 @@ pub struct ComputeTx {
     pub read_set: Vec<ObjectReadRef>,
     /// Output proposals to be committed atomically.
     pub output_proposals: Vec<OutputProposal>,
-    /// Fee paid to miners in native token.
+    /// Fee paid to miners in native token (legacy).
     pub fee: u64,
     /// Optional anti-replay nonce.
     pub nonce: Option<u64>,
@@ -154,6 +154,18 @@ pub struct ComputeTx {
     pub network_id: Option<u32>,
     /// Authorization witness.
     pub witness: TxWitness,
+    // ═══════════════════════════════════════════════════════════
+    // EIP-1559 fee market fields (v1.2)
+    // All amounts are denominated in **hopps** (chain base unit,
+    // 1 Rbit = 10¹⁸ hopps). Carrots (10⁹ hopps) are a display unit
+    // used by the RPC layer only.
+    // ═══════════════════════════════════════════════════════════
+    /// Maximum total fee the sender is willing to pay (hopps).
+    pub max_fee: u64,
+    /// Priority fee / tip for the miner, on top of the base fee (hopps).
+    pub priority_fee: u64,
+    /// Gas limit — maximum gas the sender will consume.
+    pub gas_limit: u64,
 }
 
 impl ComputeTx {
@@ -175,6 +187,20 @@ impl ComputeTx {
 
         for proposal in &self.output_proposals {
             if !resource_map_is_canonical(&proposal.resources) {
+                return false;
+            }
+        }
+
+        // Fee field sanity: a fee-paying tx must not declare a zero gas limit,
+        // and a zero gas limit with a non-zero fee is contradictory.
+        let fee_mode = self.max_fee > 0 || self.priority_fee > 0;
+        if fee_mode && self.gas_limit == 0 {
+            return false;
+        }
+        if !fee_mode && self.gas_limit > 0 {
+            // Declaring a gas limit without any fee is allowed (legacy), but
+            // must not be absurdly large.
+            if self.gas_limit > crate::compute::MAX_GAS_LIMIT_PER_TX {
                 return false;
             }
         }
@@ -236,6 +262,12 @@ impl ComputeTx {
         }
 
         out.extend_from_slice(&(self.witness.threshold.unwrap_or(1)).to_be_bytes());
+
+        // EIP-1559 fee fields (v1.2+). Version marker allows backward compat.
+        out.push(1); // 0=legacy, 1=v1.2 with EIP-1559 fields
+        out.extend_from_slice(&self.max_fee.to_be_bytes());
+        out.extend_from_slice(&self.priority_fee.to_be_bytes());
+        out.extend_from_slice(&self.gas_limit.to_be_bytes());
         out
     }
 
@@ -479,6 +511,9 @@ mod tests {
                 signatures: vec![],
                 threshold: Some(1),
             },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
         }
     }
 

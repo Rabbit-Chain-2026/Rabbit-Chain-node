@@ -2,7 +2,7 @@
 
 use super::{Consensus, ConsensusError, PowAlgorithm, PowConsensus};
 use crate::account::U256;
-use crate::block::{Block, BlockHeader};
+use crate::block::{Block, BlockHeader, CANONICAL_BLOCK_VERSION};
 use crate::crypto::{keccak256, Address, Hash};
 use crate::state::StateDb;
 use parking_lot::RwLock;
@@ -413,87 +413,26 @@ impl MiningEngine {
 
     /// Mine nonce range
     fn mine_range(&self, work: &MiningWork, start: u64, end: u64) -> Option<MiningSolution> {
-        match self.config.algorithm {
-            PowAlgorithm::RandomX => {
-                let ctx = self.randomx_context.read();
-                if let Some(randomx) = ctx.as_ref() {
-                    for nonce in start..end {
-                        if self.stop_signal.load(Ordering::Relaxed) {
-                            return None;
-                        }
-
-                        let input = work.header.encode_rlp();
-                        let hash = randomx.hash(&input, nonce);
-
-                        self.stats.hashes_computed.fetch_add(1, Ordering::Relaxed);
-
-                        let hash_value = U256::from_big_endian(hash.as_bytes());
-                        if hash_value <= work.target {
-                            return Some(MiningSolution {
-                                nonce,
-                                mix_hash: hash,
-                                final_hash: hash,
-                                work_id: work.work_id,
-                            });
-                        }
-                    }
-                }
+        // RabbitChain PoW is LightHash (Keccak256 over the domain-separated
+        // canonical preimage). All algorithm variants map to the same consensus
+        // hash so that mined blocks always pass `Consensus::verify_pow`.
+        for nonce in start..end {
+            if self.stop_signal.load(Ordering::Relaxed) {
+                return None;
             }
-            PowAlgorithm::ProgPoW => {
-                let ctx = self.progpow_context.read();
-                if let Some(progpow) = ctx.as_ref() {
-                    for nonce in start..end {
-                        if self.stop_signal.load(Ordering::Relaxed) {
-                            return None;
-                        }
 
-                        let hash = progpow.hash(&work.header, nonce);
+            let hash = crate::block::compute_pow_hash(&work.header, nonce);
 
-                        self.stats.hashes_computed.fetch_add(1, Ordering::Relaxed);
+            self.stats.hashes_computed.fetch_add(1, Ordering::Relaxed);
 
-                        let hash_value = U256::from_big_endian(hash.as_bytes());
-                        if hash_value <= work.target {
-                            return Some(MiningSolution {
-                                nonce,
-                                mix_hash: hash,
-                                final_hash: hash,
-                                work_id: work.work_id,
-                            });
-                        }
-                    }
-                }
-            }
-            PowAlgorithm::LightHash => {
-                // Simplified light hash for testing
-                for nonce in start..end {
-                    if self.stop_signal.load(Ordering::Relaxed) {
-                        return None;
-                    }
-
-                    let hash = compute_light_hash(&work.header, nonce);
-
-                    self.stats.hashes_computed.fetch_add(1, Ordering::Relaxed);
-
-                    let hash_value = U256::from_big_endian(hash.as_bytes());
-                    if hash_value <= work.target {
-                        return Some(MiningSolution {
-                            nonce,
-                            mix_hash: hash,
-                            final_hash: hash,
-                            work_id: work.work_id,
-                        });
-                    }
-
-                    // Early exit for testing (find solution quickly)
-                    if nonce > start + 10000 {
-                        return Some(MiningSolution {
-                            nonce,
-                            mix_hash: hash,
-                            final_hash: hash,
-                            work_id: work.work_id,
-                        });
-                    }
-                }
+            let hash_value = U256::from_big_endian(hash.as_bytes());
+            if hash_value <= work.target {
+                return Some(MiningSolution {
+                    nonce,
+                    mix_hash: hash,
+                    final_hash: hash,
+                    work_id: work.work_id,
+                });
             }
         }
 
@@ -512,7 +451,7 @@ impl MiningEngine {
 
         // Build block header
         let header = BlockHeader {
-            version: 1,
+            version: CANONICAL_BLOCK_VERSION,
             parent_hash: parent.hash,
             uncle_hashes: Vec::new(),
             coinbase: self.config.coinbase,

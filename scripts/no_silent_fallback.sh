@@ -67,7 +67,9 @@ check_pattern() {
     --glob '!**/build/**' \
     --glob '!**/.dart_tool/**' \
     --glob '!**/coverage/**' \
-    --glob '!**/artifacts/**' || true)"
+    --glob '!**/artifacts/**' \
+    --glob '!*.md' \
+    --glob '!**/*.md' || true)"
   popd >/dev/null
 
   # normalize to path relative to workspace root for readable output

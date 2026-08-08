@@ -18,9 +18,12 @@
 
 pub mod account;
 pub mod block;
+pub mod blockchain;
 pub mod compute;
 pub mod consensus;
 pub mod crypto;
+pub mod game;
+pub mod governance;
 pub mod state;
 
 // Re-export commonly used types
@@ -53,9 +56,6 @@ pub const GENESIS_BLOCK_NUMBER: u64 = 0;
 
 /// Initial block reward (in wei, 5 Rbit)
 pub const INITIAL_BLOCK_REWARD: u128 = 5_000_000_000_000_000_000;
-
-/// Minimum block reward (in wei, 2 Rbit)
-pub const MIN_BLOCK_REWARD: u128 = 2_000_000_000_000_000_000;
 
 /// Halving period in blocks (approximately 4 years with 10s blocks)
 pub const HALVING_PERIOD: u64 = 2_100_000;

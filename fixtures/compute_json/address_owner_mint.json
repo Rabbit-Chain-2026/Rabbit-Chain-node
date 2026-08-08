@@ -59,7 +59,7 @@
     }
   },
   "expected": {
-    "canonical_tx_id": "0x317589b60ef5241794453994ca7959fdbc35ced0f48bb091beb5eb17edbba1c9",
+    "canonical_tx_id": "0x8bacbf7ec032a8f6e5407491f1aa36ab870039444ca4f257edb78c65e6ac9323",
     "owner": {
       "type": "Address",
       "address": "0x1111111111111111111111111111111111111111"

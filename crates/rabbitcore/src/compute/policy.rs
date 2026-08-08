@@ -393,13 +393,20 @@ impl ResourcePolicy for NoopResourcePolicy {
             .copied()
             .unwrap_or_default();
         if matches!(tx.command, Command::Mint) {
-            if tx.fee != 0 {
+            // Mint must not carry any fee: it creates value out of thin air.
+            if tx.fee != 0 || tx.max_fee != 0 || tx.priority_fee != 0 {
                 return Err(ComputeError::ResourcePolicyViolation);
             }
         } else {
+            // The sender must actually give up value for the fees they declare.
+            // `tx.fee` (legacy) and `tx.priority_fee` (EIP-1559 tip) are added to
+            // the required native output. In SubmitTime mode the surplus is
+            // burned (no output claims it); a future BlockTime/escrow design can
+            // route it to the miner.
             let required_native = native
                 .output_amount
                 .checked_add(tx.fee as u128)
+                .and_then(|v| v.checked_add(tx.priority_fee as u128))
                 .ok_or(ComputeError::ResourcePolicyViolation)?;
             if native.input_amount < required_native {
                 return Err(ComputeError::ResourcePolicyViolation);

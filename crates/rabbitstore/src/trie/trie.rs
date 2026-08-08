@@ -4,7 +4,7 @@ use super::node::*;
 use super::proof::TrieProof;
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use rabbitcore::crypto::{keccak256, Hash};
 
@@ -49,6 +49,130 @@ impl TrieDB for MemTrieDB {
 
     fn has_node(&self, hash: &NodeHash) -> Result<bool> {
         Ok(self.nodes.read().contains_key(hash))
+    }
+}
+
+/// Persistent TrieDB backed by a KeyValueDB.
+/// Writes nodes to prefix `trie:node:` under the KV namespace.
+pub struct PersistentTrieDB {
+    db: Arc<dyn crate::db::KeyValueDB>,
+}
+
+impl PersistentTrieDB {
+    pub fn new(db: Arc<dyn crate::db::KeyValueDB>) -> Self {
+        Self { db }
+    }
+}
+
+impl TrieDB for PersistentTrieDB {
+    fn get_node(&self, hash: &NodeHash) -> Result<Option<Vec<u8>>> {
+        let mut key = b"trie:node:".to_vec();
+        key.extend_from_slice(hash.as_bytes());
+        self.db.get(&key).map_err(|e| crate::StorageError::Database(e.to_string()))
+    }
+
+    fn put_node(&self, hash: &NodeHash, data: &[u8]) -> Result<()> {
+        let mut key = b"trie:node:".to_vec();
+        key.extend_from_slice(hash.as_bytes());
+        self.db.put(&key, data).map_err(|e| crate::StorageError::Database(e.to_string()))
+    }
+
+    fn has_node(&self, hash: &NodeHash) -> Result<bool> {
+        let mut key = b"trie:node:".to_vec();
+        key.extend_from_slice(hash.as_bytes());
+        self.db.has(&key).map_err(|e| crate::StorageError::Database(e.to_string()))
+    }
+}
+
+/// Maximum entries in CachedTrieDB before watermark eviction kicks in.
+const CACHED_TRIE_MAX_ENTRIES: usize = 16_384;
+/// After eviction, shrink to this many entries (high watermark → low watermark).
+const CACHED_TRIE_WATERMARK_ENTRIES: usize = 12_288;
+
+/// Cached TrieDB that wraps another TrieDB with an watermark-eviction hashmap cache.
+///
+/// Instead of clearing the entire cache when full (which causes a burst of misses),
+/// this implementation uses a high-watermark policy: when `max_entries` is exceeded,
+/// it evicts down to `watermark_entries` by removing the oldest entries (tracked
+/// implicitly via insertion order in an accompanying VecDeque).
+pub struct CachedTrieDB {
+    inner: Arc<dyn TrieDB>,
+    cache: parking_lot::RwLock<HashMap<NodeHash, Vec<u8>>>,
+    /// Insertion order queue for watermark eviction.
+    order: parking_lot::RwLock<VecDeque<NodeHash>>,
+}
+
+impl CachedTrieDB {
+    pub fn new(inner: Arc<dyn TrieDB>) -> Self {
+        Self {
+            inner,
+            cache: parking_lot::RwLock::new(HashMap::with_capacity(
+                CACHED_TRIE_WATERMARK_ENTRIES,
+            )),
+            order: parking_lot::RwLock::new(VecDeque::with_capacity(CACHED_TRIE_MAX_ENTRIES)),
+        }
+    }
+
+    /// Evict down to watermark level. Call after insert when cache is oversized.
+    fn evict_to_watermark(&self) {
+        let mut cache = self.cache.write();
+        if cache.len() <= CACHED_TRIE_MAX_ENTRIES {
+            return;
+        }
+        let mut order = self.order.write();
+        let to_remove = cache.len().saturating_sub(CACHED_TRIE_WATERMARK_ENTRIES);
+        for _ in 0..to_remove {
+            if let Some(oldest) = order.pop_front() {
+                cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Clear the cache entirely (legacy compat).
+    pub fn clear_cache(&self) {
+        self.cache.write().clear();
+        self.order.write().clear();
+    }
+}
+
+impl TrieDB for CachedTrieDB {
+    fn get_node(&self, hash: &NodeHash) -> Result<Option<Vec<u8>>> {
+        // Check cache first
+        if let Some(data) = self.cache.read().get(hash) {
+            return Ok(Some(data.clone()));
+        }
+        // Miss — fetch from inner and cache
+        match self.inner.get_node(hash)? {
+            Some(data) => {
+                {
+                    let mut cache = self.cache.write();
+                    cache.insert(*hash, data.clone());
+                    self.order.write().push_back(*hash);
+                }
+                self.evict_to_watermark();
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn put_node(&self, hash: &NodeHash, data: &[u8]) -> Result<()> {
+        {
+            let mut cache = self.cache.write();
+            cache.insert(*hash, data.to_vec());
+            self.order.write().push_back(*hash);
+        }
+        self.evict_to_watermark();
+        self.inner.put_node(hash, data)
+    }
+
+    fn has_node(&self, hash: &NodeHash) -> Result<bool> {
+        if self.cache.read().contains_key(hash) {
+            return Ok(true);
+        }
+        self.inner.has_node(hash)
     }
 }
 
@@ -522,18 +646,105 @@ impl MerklePatriciaTrie {
         Ok(())
     }
 
-    /// Decode node from RLP
+    /// Decode node from RLP (mirror of `encode_node` in node.rs).
     fn decode_node(&self, data: &[u8]) -> Result<TrieNode> {
-        // Simplified RLP decoding
-        // In production, use full RLP decoder
+        use crate::trie::node::{decode_hex_prefix, BranchNode, ExtensionNode, LeafNode};
+        use rlp::Rlp;
+
         if data.is_empty() || data == [0x80] {
             return Ok(TrieNode::Empty);
         }
 
-        // Placeholder - would implement full RLP decoding
-        Err(StorageError::Serialization(
-            "RLP decoding not fully implemented".into(),
-        ))
+        let rlp = Rlp::new(data);
+        if rlp.is_list() {
+            let item_count = rlp.item_count().map_err(|e| {
+                StorageError::Serialization(format!("invalid trie node RLP list: {e}"))
+            })?;
+
+            match item_count {
+                2 => {
+                    // Leaf or Extension: [hex_prefix, value_or_child]
+                    let prefix_bytes: Vec<u8> = rlp.at(0).map_err(|e| {
+                        StorageError::Serialization(format!("invalid trie node prefix: {e}"))
+                    })?.as_val().map_err(|e| {
+                        StorageError::Serialization(format!("invalid trie node prefix value: {e}"))
+                    })?;
+                    let (nibbles, is_leaf) = decode_hex_prefix(&prefix_bytes).map_err(|e| {
+                        StorageError::Serialization(format!("invalid hex prefix: {e}"))
+                    })?;
+
+                    if is_leaf {
+                        let value: Vec<u8> = rlp.at(1).map_err(|e| {
+                            StorageError::Serialization(format!("invalid leaf value: {e}"))
+                        })?.as_val().map_err(|e| {
+                            StorageError::Serialization(format!("invalid leaf value bytes: {e}"))
+                        })?;
+                        Ok(TrieNode::Leaf(LeafNode::new(nibbles, value)))
+                    } else {
+                        let child: Vec<u8> = rlp.at(1).map_err(|e| {
+                            StorageError::Serialization(format!("invalid extension child: {e}"))
+                        })?.as_val().map_err(|e| {
+                            StorageError::Serialization(format!("invalid extension child bytes: {e}"))
+                        })?;
+                        let child_hash = if child.len() == 32 {
+                            let mut h = [0u8; 32];
+                            h.copy_from_slice(&child);
+                            NodeHash::from_bytes(h)
+                        } else {
+                            // Inline node (small child serialized directly).
+                            let child_node = self.decode_node(&child)?;
+                            let encoded = crate::trie::node::encode_node(&child_node);
+                            NodeHash::from_bytes(rabbitcore::crypto::keccak256(&encoded))
+                        };
+                        Ok(TrieNode::Extension(ExtensionNode::new(nibbles, child_hash)))
+                    }
+                }
+                17 => {
+                    // Branch: 16 children + optional value
+                    let mut branch = BranchNode::new();
+                    for i in 0..16 {
+                        let item = rlp.at(i).map_err(|e| {
+                            StorageError::Serialization(format!("invalid branch child {i}: {e}"))
+                        })?;
+                        if !item.is_empty() {
+                            let child: Vec<u8> = item.as_val().map_err(|e| {
+                                StorageError::Serialization(format!("invalid branch child {i} bytes: {e}"))
+                            })?;
+                            let child_hash = if child.len() == 32 {
+                                let mut h = [0u8; 32];
+                                h.copy_from_slice(&child);
+                                NodeHash::from_bytes(h)
+                            } else {
+                                let child_node = self.decode_node(&child)?;
+                                let encoded = crate::trie::node::encode_node(&child_node);
+                                NodeHash::from_bytes(rabbitcore::crypto::keccak256(&encoded))
+                            };
+                            branch.children[i] = Some(child_hash);
+                        }
+                    }
+                    let value_item = rlp.at(16).map_err(|e| {
+                        StorageError::Serialization(format!("invalid branch value: {e}"))
+                    })?;
+                    if !value_item.is_empty() {
+                        branch.value = Some(
+                            value_item
+                                .as_val()
+                                .map_err(|e| StorageError::Serialization(format!("invalid branch value bytes: {e}")))?,
+                        );
+                    }
+                    Ok(TrieNode::Branch(Box::new(branch)))
+                }
+                other => Err(StorageError::Serialization(format!(
+                    "unexpected trie node list item count: {other}"
+                ))),
+            }
+        } else if rlp.is_empty() {
+            Ok(TrieNode::Empty)
+        } else {
+            Err(StorageError::Serialization(
+                "trie node must be an RLP list".into(),
+            ))
+        }
     }
 
     /// Generate proof for key
@@ -621,6 +832,62 @@ mod tests {
         // Get value
         let retrieved = trie.get(key).unwrap();
         assert_eq!(retrieved, Some(value));
+    }
+
+    #[test]
+    fn test_decode_node_roundtrips_leaf_extension_branch() {
+        let db = Arc::new(MemTrieDB::new());
+        let trie = MerklePatriciaTrie::new(db);
+
+        // Leaf round-trip
+        let leaf = TrieNode::Leaf(LeafNode::new(vec![1, 2, 3], b"leaf-value".to_vec()));
+        let encoded = crate::trie::node::encode_node(&leaf);
+        let decoded = trie.decode_node(&encoded).expect("leaf should decode");
+        assert_eq!(decoded, leaf);
+
+        // Extension round-trip
+        let ext = TrieNode::Extension(ExtensionNode::new(
+            vec![4, 5],
+            NodeHash::from_bytes([0xAB; 32]),
+        ));
+        let encoded = crate::trie::node::encode_node(&ext);
+        let decoded = trie.decode_node(&encoded).expect("extension should decode");
+        assert_eq!(decoded, ext);
+
+        // Branch round-trip (children + value)
+        let mut branch = BranchNode::new();
+        branch.children[3] = Some(NodeHash::from_bytes([0x11; 32]));
+        branch.children[15] = Some(NodeHash::from_bytes([0x22; 32]));
+        branch.value = Some(b"branch-value".to_vec());
+        let encoded = crate::trie::node::encode_node(&TrieNode::Branch(Box::new(branch.clone())));
+        let decoded = trie.decode_node(&encoded).expect("branch should decode");
+        assert_eq!(decoded, TrieNode::Branch(Box::new(branch)));
+
+        // Empty round-trip
+        let decoded = trie.decode_node(&[0x80]).expect("empty should decode");
+        assert_eq!(decoded, TrieNode::Empty);
+    }
+
+    #[test]
+    fn test_trie_survives_persistent_db_reload() {
+        // Insert into a persistent DB, then re-open a fresh trie from the root
+        // and verify the values are readable (decode_node path).
+        use crate::trie::PersistentTrieDB;
+        use crate::db::MemDatabase;
+
+        let db = Arc::new(MemDatabase::new());
+        let persistent = Arc::new(PersistentTrieDB::new(db.clone()));
+        let trie = MerklePatriciaTrie::new(persistent.clone());
+        trie.insert(b"alpha", b"one".to_vec()).unwrap();
+        trie.insert(b"beta", b"two".to_vec()).unwrap();
+        let root = trie.root();
+        assert!(!root.is_zero());
+        trie.flush().expect("flush should persist nodes");
+
+        // Fresh trie instance from the same DB (persisted node reads).
+        let reloaded = MerklePatriciaTrie::from_root(root, persistent);
+        assert_eq!(reloaded.get(b"alpha").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reloaded.get(b"beta").unwrap(), Some(b"two".to_vec()));
     }
 
     #[test]

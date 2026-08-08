@@ -425,6 +425,19 @@ impl ParallelComputeBatchRunner {
         }
     }
 
+    /// Creates a runner with an explicit replay registry (legacy compat).
+    /// The replay_registry parameter is reserved for future use; currently
+    /// behaves identically to `new`.
+    pub fn with_replay_registry(
+        store: Arc<dyn ObjectStore>,
+        authorization: Arc<dyn AuthorizationPolicy>,
+        resources: Arc<dyn ResourcePolicy>,
+        domains: Arc<dyn DomainRegistry>,
+        _replay_registry: Arc<dyn crate::compute::ReplayNonceRegistry>,
+    ) -> Self {
+        Self::new(store, authorization, resources, domains)
+    }
+
     fn run_single(&self, tx: &ComputeTx) -> ComputeBatchOutcome {
         let executor = BasicTxExecutor::new(
             self.store.clone(),
@@ -880,6 +893,9 @@ mod tests {
                 signatures: vec![TxSignature::ed25519([1; 64], [2; 32])],
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         }
     }
 
@@ -920,6 +936,9 @@ mod tests {
                 signatures: vec![TxSignature::ed25519([1; 64], [2; 32])],
                 threshold: Some(1),
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
         tx.assign_expected_tx_id();
         tx

@@ -39,6 +39,9 @@ uuid.workspace = true
 rand = "0.8"
 hex = "0.4"
 
+# Compression
+flate2.workspace = true
+
 # Cryptography
 sha3.workspace = true
 

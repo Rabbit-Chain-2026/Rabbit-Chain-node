@@ -1,10 +1,10 @@
 //! Init command - Placeholder
 
 use crate::Result;
-use std::fs;
-use std::path::Path;
 use rabbitapi::rpc::ComputeBackend;
 use rabbitapi::ApiConfig;
+use std::fs;
+use std::path::Path;
 
 pub fn init_data_dir(data_dir: &str) -> Result<()> {
     fs::create_dir_all(data_dir)

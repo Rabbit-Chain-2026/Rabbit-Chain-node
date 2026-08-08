@@ -6,13 +6,13 @@
 
 | 角色 | 职责 | 默认 HTTP RPC | 默认 WS | 默认 P2P | 是否挖矿 | 是否开放 work RPC | 是否对外提供读 RPC |
 |---|---|---:|---:|---:|---|---|---|
-| `bootnode` | 主协调节点、首个引导节点 | `8545` | `8546` | `30303` | 是 | 是 | 可选 |
-| `follower` | 公网 follower / 同步验证节点 | `29645` | `29646` | `31303` | 否 | 否 | 是 |
-| `observer` | 只读观测节点 | `39745` | `39746` | `32303` | 否 | 否 | 是 |
+| `bootnode` | 首节点 | `https://rpc.rabbitchain.wedevs.org` | `wss://wss.rabbitchain.wedevs.org/p2p` | `30303` | 是 | 是 | 可选 |
+| `follower` | 同步节点 / 公网 RPC 候选 | `29645` | `29646` | `31303` | 否 | 否 | 是 |
+| `observer` | 只读节点 / explorer 数据源 | `39745` | `39746` | `32303` | 否 | 否 | 是 |
 
 ## 推荐配置
 
-### 1. bootnode
+### 1. bootnode（首节点）
 
 适用：
 
@@ -35,7 +35,7 @@ scripts/mainnet.sh start bootnode \
 - `--disable-local-miner`：外部矿工模式推荐打开
 - `--rpc-rate-limit-per-minute 0`：只建议 bring-up 阶段使用
 
-### 2. follower
+### 2. follower（同步节点）
 
 适用：
 
@@ -46,16 +46,17 @@ scripts/mainnet.sh start bootnode \
 
 ```bash
 scripts/mainnet.sh start follower \
-  --bootnode enode://bootnode-1@BOOTNODE_IP:30303
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 说明：
 
 - 初期不开挖矿
 - 初期不开放 `rabbit_getWork` / `rabbit_submitWork`
-- `--bootnode` 当前优先使用 `enode://peer@ip:port`
+- `--bootnode` 当前优先使用 `wss://wss.rabbitchain.wedevs.org/p2p`
+- 如果需要直连 TCP bootnode，可改成 `enode://peer@ip:port`
 
-### 3. observer
+### 3. observer（只读节点）
 
 适用：
 
@@ -67,14 +68,15 @@ scripts/mainnet.sh start follower \
 
 ```bash
 scripts/mainnet.sh start observer \
-  --bootnode enode://bootnode-1@BOOTNODE_IP:30303
+  --bootnode wss://wss.rabbitchain.wedevs.org/p2p
 ```
 
 说明：
 
 - 不承担挖矿
 - 不承担 pool 入口
-- `--bootnode` 当前优先使用 `enode://peer@ip:port`
+- `--bootnode` 当前优先使用 `wss://wss.rabbitchain.wedevs.org/p2p`
+- 如果需要直连 TCP bootnode，可改成 `enode://peer@ip:port`
 
 ## 挖矿执行面矩阵
 
@@ -91,7 +93,7 @@ cargo run --release -- \
   pool \
   --host 0.0.0.0 \
   --port 9332 \
-  --node-rpc http://BOOTNODE_IP:8545
+  --node-rpc https://rpc.rabbitchain.wedevs.org
 ```
 
 矿工：

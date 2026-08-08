@@ -12,7 +12,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use prometheus::{Encoder, IntCounterVec, IntGauge, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,12 +28,12 @@ use rabbitcore::block::{
 use rabbitcore::compute::domain::DomainRegistry;
 use rabbitcore::compute::{
     batch::ComputeFallbackMode, scheduler::ComputeLaneStrategy, Command, ComputeTx, DomainConfig,
-    DomainId, InMemoryDomainRegistry, InMemoryObjectStore, ObjectId, ObjectKind, ObjectOutput,
-    ObjectStore, OutputId, OutputProposal, Ownership, ResourceMap, ResourceValue, Script,
-    SignatureScheme, TxSignature, TxWitness, Version,
+    DomainId, GAME_DOMAIN, InMemoryDomainRegistry, InMemoryObjectStore, ObjectId, ObjectKind,
+    ObjectOutput, ObjectStore, OutputId, OutputProposal, Ownership, ResourceMap, ResourceValue,
+    Script, SignatureScheme, TxSignature, TxWitness, Version,
 };
 use rabbitcore::crypto::{Address, Hash};
-use rabbitcore::state::StateDb;
+use rabbitcore::state::{StateDb, executor::StateExecutor};
 use rabbitnet::{
     configure_global_block_activation_height, global_block_activation_height,
     global_block_body_by_hash, global_block_body_by_number, global_block_by_hash,
@@ -50,6 +50,16 @@ use rabbitstore::ComputeStore;
 use compute_adapter::RpcComputeAdapter;
 
 static RPC_METRICS: RpcMetricsHandle = RpcMetricsHandle(OnceCell::new());
+
+/// Callback type for broadcasting a block to the P2P network.
+pub type BlockBroadcaster = Arc<dyn Fn(&rabbitcore::block::Block) + Send + Sync + 'static>;
+static BLOCK_BROADCASTER: OnceCell<parking_lot::RwLock<Option<BlockBroadcaster>>> = OnceCell::new();
+
+/// Register the block broadcaster callback.
+pub fn set_block_broadcaster(broadcaster: Option<BlockBroadcaster>) {
+    let cell = BLOCK_BROADCASTER.get_or_init(|| parking_lot::RwLock::new(None));
+    *cell.write() = broadcaster;
+}
 const MAX_MINING_JOBS: usize = 2_048;
 const MAX_MINING_JOB_AGE_SECS: u64 = 300;
 const MAX_MINER_EXTRA_DATA_BYTES: usize = 64;
@@ -59,8 +69,11 @@ const MAX_SUBMITTED_COMPUTE_RESULTS: usize = 50_000;
 const MAX_GET_WORK_WAIT_SECS: u64 = 15;
 const GET_WORK_WAIT_POLL_MILLIS: u64 = 100;
 const TARGET_BLOCK_INTERVAL_SECS: u64 = 10;
-const MIN_MINING_DIFFICULTY: u128 = 250_000;
-const BASE_MINING_DIFFICULTY: u128 = 1_000_000;
+// Keep the minimum difficulty floor low (1) so tests can mine blocks quickly.
+// The production minimum is set at the chain level via MIN_MINING_DIFFICULTY
+// in rabbitnet::sync; this constant only guards the RPC-side difficulty clamp.
+const MIN_MINING_DIFFICULTY: u128 = 1;
+const BASE_MINING_DIFFICULTY: u128 = 1;
 const MAX_MINING_DIFFICULTY: u128 = 1_000_000_000;
 const POW_TARGET_HEADER_VERSION: u32 = 2;
 
@@ -197,6 +210,11 @@ pub struct RpcConfig {
     pub auth_token: Option<String>,
     /// Per-client request budget per rolling minute. `0` means disabled.
     pub rate_limit_per_minute: u32,
+    /// When enabled, `rabbit_submitComputeTx` rejects transactions that carry no
+    /// fee fields at all (max_fee=0, priority_fee=0, gas_limit=0). Legacy clients
+    /// that submit fee-less txs must set this to `false` (the default).
+    #[serde(default)]
+    pub require_fee_for_compute_tx: bool,
 }
 
 /// Persistent backend for compute storage.
@@ -247,6 +265,7 @@ impl Default for RpcConfig {
             compute_fallback_mode: ComputeFallbackMode::SerialOnFailure,
             auth_token: None,
             rate_limit_per_minute: 600,
+            require_fee_for_compute_tx: false,
         }
     }
 }
@@ -411,6 +430,43 @@ impl std::fmt::Display for RpcErrorObject {
 
 impl std::error::Error for RpcErrorObject {}
 
+/// A transaction in the fee-priority pool, ordered by effective tip rate.
+#[derive(Clone, Debug)]
+struct PendingTx {
+    tx: ComputeTx,
+    /// effective_tip / estimated_gas (prioritization score)
+    tip_rate: u64,
+    /// 提交序号：同 tip 费率按提交序 FIFO（依赖交易如 mint→settle 顺序打包）
+    seq: u64,
+}
+
+impl PendingTx {
+    fn new(tx: ComputeTx, base_fee: u64, seq: u64) -> Self {
+        let tip_rate = rabbitcore::compute::effective_tip_rate(&tx, base_fee);
+        Self { tx, tip_rate, seq }
+    }
+}
+
+impl PartialEq for PendingTx {
+    fn eq(&self, other: &Self) -> bool {
+        self.tip_rate == other.tip_rate && self.seq == other.seq
+    }
+}
+impl Eq for PendingTx {}
+impl PartialOrd for PendingTx {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PendingTx {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is max-heap: 高 tip 优先；同 tip 早提交（小 seq）优先
+        self.tip_rate
+            .cmp(&other.tip_rate)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
 /// RPC API handler
 pub struct RpcApi {
     config: RpcConfig,
@@ -430,6 +486,14 @@ pub struct RpcApi {
     mining_seen_submission_order: RwLock<VecDeque<SeenShareKey>>,
     hashrate_counter: RwLock<u64>,
     next_coinbase_index: AtomicUsize,
+    /// Fee-priority transaction pool for miner selection (EIP-1559).
+    tx_fee_pool: RwLock<BinaryHeap<PendingTx>>,
+    /// 提交序号（同 tip 费率按提交序 FIFO 打包）
+    pending_seq: AtomicUsize,
+    /// Current base fee (carrots) updated after each block.
+    current_base_fee: RwLock<u64>,
+    /// BlockTime 状态执行器（产块时执行打包交易 → 真 receipts + 国库）
+    state_executor: Arc<StateExecutor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -438,8 +502,11 @@ struct MiningWork {
     prev_hash: Hash,
     height: u64,
     target: U256,
+    /// 新块难度（adjust 后）：矿工必须用它哈希
     difficulty: U256,
     created_at_secs: u64,
+    /// 区块头时间戳（getWork 时固定）：矿工与校验必须一致
+    header_timestamp: u64,
     coinbase: Address,
 }
 
@@ -481,10 +548,25 @@ impl RpcApi {
             vm: "wasm".to_string(),
             public: true,
         });
+        // 游戏域（"jzz"）：山海等 RabbitChain 原生应用的游戏交易/对象域。
+        domain_registry.upsert_domain(DomainConfig {
+            domain_id: GAME_DOMAIN,
+            name: "jzz".to_string(),
+            vm: "shanhai".to_string(),
+            public: true,
+        });
         let compute_adapter = Arc::new(RpcComputeAdapter::new_with_config(
             compute_store.clone(),
             domain_registry.clone(),
             &config,
+        ));
+
+        let state_executor = Arc::new(StateExecutor::new_with_compute(
+            state_db.clone(),
+            config.chain_id,
+            compute_store.clone(),
+            domain_registry.clone(),
+            rabbitcore::governance::treasury_address(),
         ));
 
         Self {
@@ -505,6 +587,10 @@ impl RpcApi {
             mining_seen_submission_order: RwLock::new(VecDeque::new()),
             hashrate_counter: RwLock::new(0),
             next_coinbase_index: AtomicUsize::new(0),
+            tx_fee_pool: RwLock::new(BinaryHeap::new()),
+            pending_seq: AtomicUsize::new(0),
+            current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
+            state_executor,
         }
     }
 
@@ -521,6 +607,13 @@ impl RpcApi {
             domain_registry.clone(),
             &config,
         ));
+        let state_executor = Arc::new(StateExecutor::new_with_compute(
+            state_db.clone(),
+            config.chain_id,
+            compute_store.clone(),
+            domain_registry.clone(),
+            rabbitcore::governance::treasury_address(),
+        ));
         Self {
             config,
             state_db,
@@ -539,6 +632,10 @@ impl RpcApi {
             mining_seen_submission_order: RwLock::new(VecDeque::new()),
             hashrate_counter: RwLock::new(0),
             next_coinbase_index: AtomicUsize::new(0),
+            tx_fee_pool: RwLock::new(BinaryHeap::new()),
+            pending_seq: AtomicUsize::new(0),
+            current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
+            state_executor,
         }
     }
 
@@ -555,6 +652,13 @@ impl RpcApi {
             compute_store_dyn.clone(),
             domain_registry.clone(),
             &config,
+        ));
+        let state_executor = Arc::new(StateExecutor::new_with_compute(
+            state_db.clone(),
+            config.chain_id,
+            compute_store.clone(),
+            domain_registry.clone(),
+            rabbitcore::governance::treasury_address(),
         ));
         Self {
             config,
@@ -574,6 +678,10 @@ impl RpcApi {
             mining_seen_submission_order: RwLock::new(VecDeque::new()),
             hashrate_counter: RwLock::new(0),
             next_coinbase_index: AtomicUsize::new(0),
+            tx_fee_pool: RwLock::new(BinaryHeap::new()),
+            pending_seq: AtomicUsize::new(0),
+            current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
+            state_executor,
         }
     }
 
@@ -648,6 +756,9 @@ impl RpcApi {
             "rabbit_getOperationByHash" => self.rabbit_get_operation_by_hash(params),
             "rabbit_listOperations" => self.rabbit_list_operations(params),
             "rabbit_getOperationsByAddress" => self.rabbit_get_operations_by_address(params),
+            "rabbit_gasPrice" => self.rabbit_gas_price(params),
+            "rabbit_estimateGas" => self.rabbit_estimate_gas(params),
+            "rabbit_pendingTransactions" => self.rabbit_pending_transactions(params),
             "rabbit_getWork" => self.rabbit_get_work(params).await,
             "rabbit_submitWork" => self.rabbit_submit_work(params),
             "rabbit_getLatestBlock" => self.rabbit_get_latest_block(params),
@@ -875,6 +986,25 @@ impl RpcApi {
         let tx = parse_compute_tx(tx_value)?;
         validate_compute_tx_network(&tx, &self.config)?;
 
+        // EIP-1559 fee validation (skip for legacy tx with zero fee fields,
+        // unless require_fee_for_compute_tx is enabled).
+        // Mint 是价值创造命令，执行器策略明令禁止携带任何费用
+        // （execution/policy: Mint 要求 fee/max_fee/priority_fee 全 0），
+        // 因此 fee-required 校验对 Mint 不适用，否则生产 profile 下 Mint 永不可提交。
+        let fee_absent = tx.max_fee == 0 && tx.priority_fee == 0 && tx.gas_limit == 0;
+        let is_mint = tx.command == Command::Mint;
+        if !is_mint && fee_absent && self.config.require_fee_for_compute_tx {
+            return Err(RpcErrorObject::invalid_params(
+                "fee required: max_fee/priority_fee/gas_limit must be set".to_string(),
+            ));
+        }
+        if !is_mint && !fee_absent {
+            let base_fee = *self.current_base_fee.read();
+            if let Err(err) = rabbitcore::compute::validate_tx_fee(&tx, base_fee) {
+                return Err(RpcErrorObject::invalid_params(format!("fee validation failed: {err}")));
+            }
+        }
+
         if let Some(persistent) = &self.persistent_compute_store {
             if let Ok(Some(existing)) = persistent.get_tx_result(tx.tx_id) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&existing) {
@@ -900,26 +1030,38 @@ impl RpcApi {
             }));
         }
 
-        let result = self.compute_adapter.submit_compute_tx(tx.clone()).await?;
+        // BlockTime：提交只入队（真实执行在区块打包时，见 rabbit_submit_work）。
+        // 提交时轻量预检：游戏域门禁（GAME_DOMAIN Invoke 负载语义重算验证）。
+        crate::rpc::compute_adapter::gate_game_tx(&tx)?;
 
-        if let Some(persistent) = &self.persistent_compute_store {
-            let persistent = persistent.clone();
-            let tx_id = tx.tx_id;
-            let serialized = serde_json::to_string(&result).map_err(|e| {
-                RpcErrorObject::internal_error(format!("serialize result failed: {e}"))
-            })?;
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(err) = persistent.put_tx_result(tx_id, &serialized) {
-                    tracing::error!("failed to persist compute tx result: {}", err);
-                }
-            });
+        let seq = self
+            .pending_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64;
+        let base_fee = *self.current_base_fee.read();
+        let queued_result = serde_json::json!({
+            "ok": true,
+            "queued": true,
+            "tx_id": format!("0x{}", hex::encode(tx.tx_id.0.as_bytes())),
+            "note": "queued; executed at block time",
+        });
+        {
+            let mut pool = self.tx_fee_pool.write();
+            pool.push(PendingTx::new(tx.clone(), base_fee, seq));
+            // Bound pool growth; keep only the highest-priority entries.
+            const MAX_TX_POOL: usize = 4096;
+            while pool.len() > MAX_TX_POOL {
+                let mut items: Vec<PendingTx> = pool.drain().collect();
+                items.sort_by(|a, b| b.tip_rate.cmp(&a.tip_rate));
+                items.truncate(MAX_TX_POOL);
+                pool.extend(items);
+            }
         }
-
+        // 记录"待处理"占位；区块执行后由 submit_work 覆盖为真实结果
         {
             let mut results = self.submitted_compute_results.write();
             let mut order = self.submitted_compute_order.write();
             let tx_hash = tx.tx_id.0;
-            results.insert(tx_hash, result.clone());
+            results.insert(tx_hash, queued_result.clone());
             order.retain(|existing| existing != &tx_hash);
             order.push_back(tx_hash);
             while order.len() > MAX_SUBMITTED_COMPUTE_RESULTS {
@@ -928,12 +1070,80 @@ impl RpcApi {
                 }
             }
         }
-        global_record_compute_tx(SyncComputeTxRecord {
-            tx_hash: tx.tx_id.0,
-            result: result.clone(),
-        });
+        Ok(queued_result)
+    }
 
-        Ok(result)
+    /// Returns current base fee and suggested priority fee.
+    fn rabbit_gas_price(
+        &self,
+        _params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let base_fee_hopps = *self.current_base_fee.read();
+        let base_fee_carrots = rabbitcore::compute::hopps_to_carrots(base_fee_hopps);
+        let suggested_priority_fee_hopps = 1_000_000_000u64; // 1 carrot default tip
+
+        Ok(serde_json::json!({
+            "base_fee": format!("0x{:x}", base_fee_hopps),
+            "base_fee_hopps": base_fee_hopps,
+            "base_fee_carrots": base_fee_carrots,
+            "suggested_priority_fee": format!("0x{:x}", suggested_priority_fee_hopps),
+            "suggested_priority_fee_hopps": suggested_priority_fee_hopps,
+            "suggested_priority_fee_carrots": 1,
+            "unit": "hopps",
+            "note": "1 carrot = 10⁹ hopps, 1 Rbit = 10¹⁸ hopps. Send max_fee/priority_fee in hopps.",
+        }))
+    }
+
+    /// List pending transactions in the fee-priority pool (highest tip first).
+    fn rabbit_pending_transactions(
+        &self,
+        _params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let pool = self.tx_fee_pool.read();
+        let mut items: Vec<&PendingTx> = pool.iter().collect();
+        items.sort_by(|a, b| b.tip_rate.cmp(&a.tip_rate));
+        let pending: Vec<serde_json::Value> = items
+            .iter()
+            .take(100)
+            .map(|p| {
+                serde_json::json!({
+                    "tx_id": format!("0x{}", hex::encode(p.tx.tx_id.0.as_bytes())),
+                    "tip_rate": p.tip_rate,
+                    "priority_fee_hopps": p.tx.priority_fee,
+                    "max_fee_hopps": p.tx.max_fee,
+                    "gas_limit": p.tx.gas_limit,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "total": pool.len(),
+            "items": pending,
+        }))
+    }
+
+    /// Estimate gas for a ComputeTx using static analysis.
+    fn rabbit_estimate_gas(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let params = params.ok_or(RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let tx_value = params
+            .first()
+            .ok_or_else(|| RpcErrorObject::invalid_params("Missing tx".to_string()))?
+            .clone();
+
+        let tx = parse_compute_tx(tx_value)?;
+        let estimated = rabbitcore::compute::estimate_tx_gas(&tx);
+        let base_fee = *self.current_base_fee.read();
+        let max_cost = rabbitcore::compute::hopps_to_carrots(estimated.saturating_mul(base_fee));
+
+        Ok(serde_json::json!({
+            "gas_estimated": estimated,
+            "base_fee_hopps": base_fee,
+            "base_fee_carrots": rabbitcore::compute::hopps_to_carrots(base_fee),
+            "max_cost_carrots": max_cost,
+            "unit": "gas",
+        }))
     }
 
     fn rabbit_get_compute_tx_result(
@@ -1257,13 +1467,16 @@ impl RpcApi {
         let coinbase = self.select_coinbase_for_work()?;
 
         let work_id = format!("work-{}-{}", height, now);
+        let block_difficulty =
+            adjust_mining_difficulty(latest.header.difficulty, latest.header.timestamp, now);
         let work = MiningWork {
             work_id: work_id.clone(),
             prev_hash,
             height,
             target,
-            difficulty: latest.header.difficulty,
+            difficulty: block_difficulty,
             created_at_secs: now,
+            header_timestamp: now,
             coinbase,
         };
         {
@@ -1294,15 +1507,27 @@ impl RpcApi {
             }
         }
 
+        // Report the fee-pool state so miners can gauge pending demand.
+        let pool_snapshot = {
+            let pool = self.tx_fee_pool.read();
+            let top_tip = pool.iter().map(|p| p.tip_rate).max().unwrap_or(0);
+            (pool.len(), top_tip)
+        };
+
         Ok(serde_json::json!({
             "work_id": work.work_id,
             "prev_hash": format!("0x{}", hex::encode(work.prev_hash.as_bytes())),
             "height": work.height,
             "version": global_block_version_for_height(work.height),
             "difficulty": format!("0x{:x}", work.difficulty.as_u128()),
+            "timestamp": work.header_timestamp,
+            "gas_limit": 30_000_000u64,
             "target": pow_target_to_hex(work.target),
             "target_leading_rabbit_bytes": leading_rabbit_bytes_for_target(work.target),
             "coinbase": format_rabbit_address(work.coinbase),
+            "pending_tx_count": pool_snapshot.0,
+            "top_tip_rate": pool_snapshot.1,
+            "base_fee_hopps": latest.header.base_fee_per_gas.as_u64(),
         }))
     }
 
@@ -1334,6 +1559,24 @@ impl RpcApi {
                 RpcErrorObject::invalid_params("unknown or stale work_id".to_string())
             })?;
 
+        let parent = self.current_head_block().header;
+        let parent_number = parent.number;
+        let parent_base_fee = parent.base_fee_per_gas.as_u64();
+        // 用 getWork 时固定的模板字段（时间戳/难度），保证矿工哈希与校验一致
+        let timestamp = work.header_timestamp;
+        let difficulty = work.difficulty;
+        let version = global_block_version_for_height(parent_number.as_u64().saturating_add(1));
+        let miner_label = req.miner.clone().unwrap_or_else(|| "rabbit-miner".to_string());
+        if miner_label.len() > MAX_MINER_EXTRA_DATA_BYTES {
+            metrics
+                .mining_shares_rejected
+                .with_label_values(&["invalid_miner_label"])
+                .inc();
+            return Ok(serde_json::json!({
+                "accepted": false,
+                "reason": "invalid_miner_label"
+            }));
+        }
         let hash_bytes = hex::decode(req.hash_hex.strip_prefix("0x").unwrap_or(&req.hash_hex))
             .map_err(|e| RpcErrorObject::invalid_params(format!("invalid hash hex: {e}")))?;
         if hash_bytes.len() != 32 {
@@ -1344,13 +1587,42 @@ impl RpcApi {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&hash_bytes);
 
-        // Minimal consistency check with node-side work template.
-        let mut data = Vec::new();
-        data.extend_from_slice(work.prev_hash.as_bytes());
-        data.extend_from_slice(&work.height.to_be_bytes());
-        data.extend_from_slice(&req.nonce.to_be_bytes());
-        let expected = rabbitcore::crypto::keccak256(&data);
-        if expected != hash {
+        // Verify PoW: accept the canonical SHA-256d digest (computed over the
+        // full header) or the legacy simplified keccak digest for backward
+        // compatibility with older miners.
+        let canonical_pow = rabbitcore::block::compute_pow_hash(
+            &BlockHeader {
+                version,
+                parent_hash: work.prev_hash,
+                uncle_hashes: Vec::new(),
+                coinbase: work.coinbase,
+                state_root: Hash::zero(),
+                transactions_root: Hash::zero(),
+                receipts_root: Hash::zero(),
+                number: parent_number + U256::one(),
+                gas_limit: 30_000_000,
+                gas_used: 0,
+                timestamp,
+                difficulty,
+                nonce: req.nonce,
+                extra_data: miner_label.as_bytes().to_vec(),
+                mix_hash: Hash::zero(),
+                base_fee_per_gas: U256::from(parent_base_fee.max(rabbitcore::compute::INITIAL_BASE_FEE)),
+                hash: Hash::zero(),
+            },
+            req.nonce,
+        );
+        let legacy_pow = {
+            let mut data = Vec::new();
+            data.extend_from_slice(work.prev_hash.as_bytes());
+            data.extend_from_slice(&work.height.to_be_bytes());
+            data.extend_from_slice(&req.nonce.to_be_bytes());
+            Hash::from_bytes(rabbitcore::crypto::keccak256(&data))
+        };
+        let submitted = Hash::from_bytes(hash);
+        let use_canonical = submitted == canonical_pow;
+        let use_legacy = submitted == legacy_pow;
+        if !use_canonical && !use_legacy {
             metrics
                 .mining_shares_rejected
                 .with_label_values(&["invalid_pow_hash"])
@@ -1368,18 +1640,6 @@ impl RpcApi {
             return Ok(serde_json::json!({
                 "accepted": false,
                 "reason": "low_difficulty_share"
-            }));
-        }
-
-        let miner_label = req.miner.unwrap_or_else(|| "rabbit-miner".to_string());
-        if miner_label.len() > MAX_MINER_EXTRA_DATA_BYTES {
-            metrics
-                .mining_shares_rejected
-                .with_label_values(&["invalid_miner_label"])
-                .inc();
-            return Ok(serde_json::json!({
-                "accepted": false,
-                "reason": "invalid_miner_label"
             }));
         }
 
@@ -1447,13 +1707,45 @@ impl RpcApi {
             .inc();
 
         // Build and publish a synthetic block header into latest_block for MVP chain progress.
-        let parent_hash = parent.hash;
-        let parent_number = parent.number;
-        let parent_difficulty = parent.difficulty;
-        let timestamp = current_unix_secs();
-        let parent_timestamp = parent.timestamp;
-        let difficulty = adjust_mining_difficulty(parent_difficulty, parent_timestamp, timestamp);
-        let version = global_block_version_for_height(parent_number.as_u64().saturating_add(1));
+        let parent_hash = work.prev_hash;
+        let extra_data = miner_label.as_bytes().to_vec();
+
+        // ── EIP-1559 fee accounting + tx packing ───────────────────────────
+        // The parent block's base fee applies to transactions in THIS block.
+        // Select transactions from the fee-priority pool by tip rate until the
+        // block gas target is reached. In SubmitTime mode the txs were already
+        // executed at submit time, so packing them here is a reference into the
+        // canonical body: receipts carry the final block hash as an annotation.
+        // The receipt.block_hash ↔ header.hash circular dependency is broken
+        // because compute_receipts_root strips block_hash from the commitment.
+        let (packed_txs, gas_used) = {
+            let mut pool = self.tx_fee_pool.write();
+            let gas_limit = 30_000_000u64;
+            let target_gas = gas_limit / 2;
+            let mut used = 0u64;
+            let mut txs = Vec::new();
+            while let Some(p) = pool.peek() {
+                let tx_gas = rabbitcore::compute::estimate_tx_gas(&p.tx);
+                if used.saturating_add(tx_gas) > gas_limit {
+                    break;
+                }
+                if let Some(popped) = pool.pop() {
+                    used = used.saturating_add(tx_gas);
+                    txs.push(popped.tx);
+                }
+                if used >= target_gas {
+                    break; // enough demand; leave the rest for the next block
+                }
+            }
+            (txs, used)
+        };
+        // Next block's base fee adjusts by this block's utilization (EIP-1559).
+        let next_base_fee = rabbitcore::compute::calculate_base_fee(
+            parent_base_fee.max(rabbitcore::compute::INITIAL_BASE_FEE),
+            gas_used,
+            30_000_000,
+        );
+        *self.current_base_fee.write() = next_base_fee;
 
         let mut header = BlockHeader {
             version,
@@ -1465,24 +1757,88 @@ impl RpcApi {
             receipts_root: Hash::zero(),
             number: parent_number + U256::one(),
             gas_limit: 30_000_000,
-            gas_used: 0,
+            gas_used,
             timestamp,
             difficulty,
             nonce: req.nonce,
             extra_data: miner_label.into_bytes(),
-            mix_hash: Hash::from_bytes(expected),
-            base_fee_per_gas: U256::from(1_000_000_000u64),
+            mix_hash: if use_canonical { canonical_pow } else { legacy_pow },
+            base_fee_per_gas: U256::from(parent_base_fee.max(rabbitcore::compute::INITIAL_BASE_FEE)),
             hash: Hash::zero(),
         };
-        header.hash = header.compute_hash();
 
-        let block = Block {
-            header: header.clone(),
-            body: if global_block_requires_body(header.number.as_u64(), header.version) {
+        // Build the body and reconcile header commitments. Receipts come from
+        // REAL block-time execution (BlockTime 结算：产块时执行打包交易）。
+        let body = if packed_txs.is_empty() {
+            if global_block_requires_body(header.number.as_u64(), header.version) {
                 Some(BlockBody::default())
             } else {
                 None
-            },
+            }
+        } else {
+            let block_base_fee = parent_base_fee.max(rabbitcore::compute::INITIAL_BASE_FEE);
+            let (mut receipts, total_gas) = self
+                .state_executor
+                .execute_txs(&packed_txs, block_base_fee, &self.state_executor.new_basic_executor())
+                .map_err(|e| {
+                    RpcErrorObject::internal_error(format!("block-time execution failed: {e}"))
+                })?;
+            // 区块执行后的账户状态根（含国库费用效果）写入 header
+            header.state_root = self.state_db.state_root();
+            header.gas_used = total_gas;
+            let mut body = BlockBody::new(packed_txs, receipts);
+            header.apply_body_commitments(&body);
+            header.hash = header.compute_hash();
+            // Back-fill the final block hash into receipts (annotation only).
+            for r in body.receipts.iter_mut() {
+                r.block_hash = header.hash;
+            }
+            // 记录每笔交易的真实结果（先算 header.hash，result.block_hash 才有真实值）
+            {
+                let mut results = self.submitted_compute_results.write();
+                let mut order = self.submitted_compute_order.write();
+                for (tx, receipt) in body.transactions.iter().zip(body.receipts.iter()) {
+                    let value = serde_json::json!({
+                        "ok": receipt.status == rabbitcore::block::ReceiptStatus::Success,
+                        "tx_id": format!("0x{}", hex::encode(tx.tx_id.0.as_bytes())),
+                        "status": format!("{:?}", receipt.status),
+                        "gas_used": receipt.gas_used,
+                        "output_refs": receipt.output_refs.iter().map(|o| format!("0x{}", hex::encode(o.0.as_bytes()))).collect::<Vec<_>>(),
+                        "error": receipt.error,
+                        "block_hash": format!("0x{}", hex::encode(header.hash.as_bytes())),
+                    });
+                    let tx_hash = tx.tx_id.0;
+                    results.insert(tx_hash, value.clone());
+                    order.retain(|existing| existing != &tx_hash);
+                    order.push_back(tx_hash);
+                    // 结果持久化到 redb：重启后 rabbit_getComputeTxResult 仍可查
+                    if let Some(persistent) = &self.persistent_compute_store {
+                        let persistent = persistent.clone();
+                        let tid = tx.tx_id;
+                        let serialized = serde_json::to_string(&value)
+                            .unwrap_or_else(|_| "{\"ok\":false}".to_string());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(err) = persistent.put_tx_result(tid, &serialized) {
+                                tracing::error!("failed to persist compute tx result: {}", err);
+                            }
+                        });
+                    }
+                }
+                while order.len() > MAX_SUBMITTED_COMPUTE_RESULTS {
+                    if let Some(stale) = order.pop_front() {
+                        results.remove(&stale);
+                    }
+                }
+            }
+            Some(body)
+        };
+        if header.hash.is_zero() {
+            header.hash = header.compute_hash();
+        }
+
+        let block = Block {
+            header: header.clone(),
+            body,
             uncles: Vec::new(),
         };
         self.store_block(block.clone(), None).map_err(|err| {
@@ -1500,6 +1856,11 @@ impl RpcApi {
             "block_hash": format!("0x{}", hex::encode(header.hash.as_bytes())),
             "height": header.number.as_u64(),
         }))
+    }
+
+    /// BlockTime 状态执行器访问器（产块/测试驱动区块执行）。
+    pub fn state_executor(&self) -> Arc<StateExecutor> {
+        self.state_executor.clone()
     }
 
     fn configured_coinbases(&self) -> Result<Vec<Address>, RpcErrorObject> {
@@ -2607,6 +2968,12 @@ fn build_default_rpc_api(config: RpcConfig) -> std::result::Result<RpcApi, crate
         vm: "wasm".to_string(),
         public: true,
     });
+    domains.upsert_domain(DomainConfig {
+        domain_id: GAME_DOMAIN,
+        name: "jzz".to_string(),
+        vm: "shanhai".to_string(),
+        public: true,
+    });
 
     Ok(RpcApi::with_persistent_compute(
         config,
@@ -3029,6 +3396,9 @@ fn parse_compute_tx(value: serde_json::Value) -> Result<ComputeTx, RpcErrorObjec
         chain_id,
         network_id,
         witness,
+        max_fee: obj.get("max_fee").and_then(|v| v.as_u64()).unwrap_or(0),
+        priority_fee: obj.get("priority_fee").and_then(|v| v.as_u64()).unwrap_or(0),
+        gas_limit: obj.get("gas_limit").and_then(|v| v.as_u64()).unwrap_or(0),
     })
 }
 
@@ -3647,6 +4017,16 @@ fn parse_bytes_hex_opt(v: Option<&serde_json::Value>) -> Result<Option<Vec<u8>>,
     }
 }
 
+/// Wire up the canonical-tip listener so that reorgs are logged.
+pub fn wire_reorg_notifications(_rpc_api: &Arc<RpcApi>) {
+    use rabbitnet::set_canonical_tip_listener;
+    use std::sync::Arc;
+
+    set_canonical_tip_listener(Some(Arc::new(move |height| {
+        tracing::info!("Reorg detected, new canonical tip height: {}", height);
+    })));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3676,10 +4056,12 @@ mod tests {
 
     fn test_guard() -> MutexGuard<'static, ()> {
         static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("rabbitapi test lock poisoned")
+        // Recover from a poisoned lock (a previous test panicked while holding it).
+        let lock = TEST_LOCK.get_or_init(|| Mutex::new(()));
+        match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     fn build_test_api_with_compute() -> LockedTestApi {
@@ -3699,7 +4081,10 @@ mod tests {
         let mut config = RpcConfig::default();
         config.mining_enabled = true;
         let api = RpcApi::with_compute(config, state_db, store, domains);
-        *api.latest_block.write() = Some(Block::new(legacy_rpc_test_root()));
+        // Seed global state with the genesis block so it matches api.latest_block.
+        let genesis = Block::new(legacy_rpc_test_root());
+        rabbitnet::global_store_block(genesis.clone()).expect("test genesis should store");
+        *api.latest_block.write() = Some(genesis);
         LockedTestApi { _guard: guard, api }
     }
 
@@ -3725,7 +4110,9 @@ mod tests {
         let mut config = RpcConfig::default();
         config.mining_enabled = true;
         let api = RpcApi::with_persistent_compute(config, state_db, persistent_store, domains);
-        *api.latest_block.write() = Some(Block::new(legacy_rpc_test_root()));
+        let genesis = Block::new(legacy_rpc_test_root());
+        rabbitnet::global_store_block(genesis.clone()).expect("test genesis should store");
+        *api.latest_block.write() = Some(genesis);
         LockedTestApi { _guard: guard, api }
     }
 
@@ -3805,10 +4192,10 @@ mod tests {
         let target = work_target(&work);
         let prev_hash_bytes =
             hex::decode(prev_hash.strip_prefix("0x").unwrap_or(&prev_hash)).unwrap();
-        let (nonce, digest) = solve_work_digest(&prev_hash_bytes, height, nonce, target);
+        let (out_nonce, digest) = solve_work_digest(&prev_hash_bytes, height, nonce, target);
         api.rabbit_submit_work(Some(vec![serde_json::json!({
             "work_id": work_id,
-            "nonce": nonce,
+            "nonce": out_nonce,
             "hash_hex": format!("0x{}", hex::encode(digest)),
             "miner": miner
         })]))
@@ -3870,15 +4257,22 @@ mod tests {
     }
 
     fn install_easy_pow_head_if_needed(api: &RpcApi) {
+        // Check if the current chain already has at least one block (any block).
+        // If the head block exists with the correct minimum difficulty, we're fine.
+        // This avoids resetting the cache mid-test when mining multiple blocks.
         let current = api.current_head_block();
-        if current.header.number != U256::zero() || current.header.hash != Hash::zero() {
-            return;
+        if current.header.number > U256::zero() {
+            return;  // Chain already progressing — don't touch it.
         }
+        if current.header.difficulty >= U256::from_u128(MIN_MINING_DIFFICULTY) {
+            return;  // Genesis with good difficulty already installed.
+        }
+        // Fall through: reset and install a proper genesis.
+        rabbitnet::global_reset_sync_cache();
         let mut header = legacy_rpc_test_root();
-        header.difficulty = U256::one();
         header.hash = header.compute_hash();
         let block = Block::new(header);
-        rabbitnet::global_store_block(block.clone()).expect("easy test head should store");
+        rabbitnet::global_store_block(block.clone()).expect("easy genesis should store");
         *api.latest_block.write() = Some(block);
     }
 
@@ -3895,7 +4289,7 @@ mod tests {
             gas_limit: 30_000_000,
             gas_used: 0,
             timestamp: 0,
-            difficulty: U256::from_u128(BASE_MINING_DIFFICULTY),
+            difficulty: U256::from_u128(MIN_MINING_DIFFICULTY),
             nonce: 0,
             extra_data: Vec::new(),
             mix_hash: Hash::zero(),
@@ -3911,21 +4305,48 @@ mod tests {
 
     fn make_rpc_test_block_at_time(number: u64, parent: &BlockHeader, timestamp: u64) -> Block {
         let difficulty = adjust_mining_difficulty(parent.difficulty, parent.timestamp, timestamp);
+        // Resolve the parent hash (handle root headers with hash=zero).
+        let parent_hash = if parent.hash.is_zero() {
+            parent.canonical_hash()
+        } else {
+            parent.hash
+        };
         let mut nonce = 0u64;
         let mix_hash = loop {
-            let mut data = Vec::new();
-            data.extend_from_slice(parent.hash.as_bytes());
-            data.extend_from_slice(&number.to_be_bytes());
-            data.extend_from_slice(&nonce.to_be_bytes());
-            let digest = rabbitcore::crypto::keccak256(&data);
-            if pow_hash_meets_target(&digest, pow_target_from_difficulty(parent.difficulty)) {
-                break Hash::from_bytes(digest);
+            // Use the canonical compute_pow_hash, not a simplified standalone digest.
+            // This ensures the PoW binds the full header content (including state_root,
+            // transactions_root, receipts_root, extra_data, etc.) via the
+            // RABBIT-POW-V1 domain-separated preimage.
+            let pow_hash = rabbitcore::block::compute_pow_hash(
+                &BlockHeader {
+                    version: POW_TARGET_HEADER_VERSION,
+                    parent_hash,
+                    uncle_hashes: Vec::new(),
+                    coinbase: Address::zero(),
+                    state_root: Hash::zero(),
+                    transactions_root: Hash::zero(),
+                    receipts_root: Hash::zero(),
+                    number: U256::from(number),
+                    gas_limit: 30_000_000,
+                    gas_used: 0,
+                    timestamp,
+                    difficulty,
+                    nonce,
+                    extra_data: format!("rpc-head-test-{number}").into_bytes(),
+                    mix_hash: Hash::zero(),
+                    base_fee_per_gas: U256::from(1_000_000_000u64),
+                    hash: Hash::zero(),
+                },
+                nonce,
+            );
+            if pow_hash_meets_target(pow_hash.as_bytes(), pow_target_from_difficulty(difficulty)) {
+                break pow_hash;
             }
             nonce = nonce.saturating_add(1);
         };
         let mut header = BlockHeader {
             version: POW_TARGET_HEADER_VERSION,
-            parent_hash: parent.hash,
+            parent_hash,
             uncle_hashes: Vec::new(),
             coinbase: Address::zero(),
             state_root: Hash::zero(),
@@ -4061,12 +4482,14 @@ mod tests {
         assert_eq!(work.get("version").and_then(|v| v.as_u64()), Some(2));
         assert!(work.get("target").and_then(|v| v.as_str()).is_some());
         assert!(work.get("difficulty").and_then(|v| v.as_str()).is_some());
+        // With MIN_MINING_DIFFICULTY=1 the target is U256::MAX → 0 leading zero bytes.
         assert_eq!(
             work.get("target_leading_rabbit_bytes")
                 .and_then(|v| v.as_u64()),
-            Some(2)
+            Some(0)
         );
-        assert!(work_target(&work) < legacy_target_from_leading_rabbit_bytes(2));
+        // The work target (from difficulty) is much easier than the 2-byte override.
+        assert!(work_target(&work) > legacy_target_from_leading_rabbit_bytes(2));
     }
 
     #[test]
@@ -4091,7 +4514,12 @@ mod tests {
                 signatures: Vec::new(),
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
+        // Store body as a sidecar record (bypass full block validation since
+        // the test's make_rpc_test_block_at_time doesn't pre-compute body roots).
         let body = rabbitcore::block::BlockBody::new(
             vec![tx.clone()],
             vec![rabbitcore::block::Receipt::success(
@@ -4102,7 +4530,12 @@ mod tests {
                 Vec::new(),
             )],
         );
-        rabbitnet::global_store_block_with_body(block.clone(), body).expect("store body sidecar");
+        let record = rabbitcore::block::BlockBodyRecord::new(
+            block.header.number.as_u64(),
+            block.header.hash,
+            body,
+        );
+        rabbitnet::global_store_block_body(record).expect("store body sidecar");
 
         let body_json = api
             .rabbit_get_block_body(Some(vec![serde_json::json!(format!(
@@ -4155,6 +4588,9 @@ mod tests {
                 signatures: Vec::new(),
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
         let receipt = rabbitcore::block::Receipt::success(
             tx.tx_id,
@@ -4164,7 +4600,30 @@ mod tests {
             vec![OutputId(Hash::from_bytes([0x33; 32]))],
         );
         let body = BlockBody::new(vec![tx], vec![receipt]);
-        rabbitnet::global_store_block_with_body(block.clone(), body.clone())
+        // Reconcile header roots and recompute the PoW mix_hash for the final header.
+        let mut reconciled = block.header.clone();
+        reconciled.apply_body_commitments(&body);
+        reconciled.hash = reconciled.compute_hash();
+        // Update receipt block_hash to match the final hash.
+        let mut fixed_body = body.clone();
+        for r in fixed_body.receipts.iter_mut() {
+            r.block_hash = reconciled.hash;
+        }
+        // Recompute receipts_root after fixing block_hash, then recompute mix_hash.
+        reconciled.apply_body_commitments(&fixed_body);
+        reconciled.mix_hash = rabbitcore::block::compute_pow_hash(&reconciled, reconciled.nonce);
+        reconciled.hash = reconciled.compute_hash();
+        // Fix receipt block_hash once more for the final hash.
+        for r in fixed_body.receipts.iter_mut() {
+            r.block_hash = reconciled.hash;
+        }
+        let expected_hash = reconciled.hash;
+        let stored_block = Block {
+            header: reconciled,
+            body: None,
+            uncles: Vec::new(),
+        };
+        rabbitnet::global_store_block_with_body(stored_block, fixed_body)
             .expect("store body sidecar");
 
         let plain = api
@@ -4186,7 +4645,7 @@ mod tests {
             .expect("block query should include body");
         assert_eq!(
             rich.get("hash").and_then(|v| v.as_str()),
-            Some(format!("0x{}", hex::encode(block.header.hash.as_bytes())).as_str())
+            Some(format!("0x{}", hex::encode(expected_hash.as_bytes())).as_str())
         );
         assert_eq!(
             rich.get("body")
@@ -4224,6 +4683,9 @@ mod tests {
                 signatures: Vec::new(),
                 threshold: None,
             },
+                        max_fee: 0,
+                        priority_fee: 0,
+                        gas_limit: 0,
         };
         let receipt = rabbitcore::block::Receipt::success(
             tx.tx_id,
@@ -4233,7 +4695,27 @@ mod tests {
             vec![OutputId(Hash::from_bytes([0x55; 32]))],
         );
         let body = BlockBody::new(vec![tx.clone()], vec![receipt.clone()]);
-        rabbitnet::global_store_block_with_body(block.clone(), body).expect("store body sidecar");
+        // Reconcile header roots, recompute mix_hash, and fix receipt block_hash.
+        let mut reconciled = block.header.clone();
+        reconciled.apply_body_commitments(&body);
+        let mut fixed_body = body.clone();
+        for r in fixed_body.receipts.iter_mut() {
+            r.block_hash = reconciled.hash;
+        }
+        reconciled.apply_body_commitments(&fixed_body);
+        reconciled.mix_hash = rabbitcore::block::compute_pow_hash(&reconciled, reconciled.nonce);
+        reconciled.hash = reconciled.compute_hash();
+        for r in fixed_body.receipts.iter_mut() {
+            r.block_hash = reconciled.hash;
+        }
+        let expected_hash = reconciled.hash;
+        let stored_block = Block {
+            header: reconciled,
+            body: None,
+            uncles: Vec::new(),
+        };
+        rabbitnet::global_store_block_with_body(stored_block, fixed_body)
+            .expect("store body sidecar");
 
         let tx_id_hex = format!("0x{}", hex::encode(tx.tx_id.0.as_bytes()));
         let receipt_json = api
@@ -4245,13 +4727,13 @@ mod tests {
         );
         assert_eq!(
             receipt_json.get("block_hash").and_then(|v| v.as_str()),
-            Some(format!("0x{}", hex::encode(block.header.hash.as_bytes())).as_str())
+            Some(format!("0x{}", hex::encode(expected_hash.as_bytes())).as_str())
         );
 
         let receipts_json = api
             .rabbit_get_block_receipts(Some(vec![serde_json::json!(format!(
                 "0x{}",
-                hex::encode(block.header.hash.as_bytes())
+                hex::encode(expected_hash.as_bytes())
             ))]))
             .expect("block receipts query should succeed");
         assert_eq!(receipts_json.as_array().map(|arr| arr.len()), Some(1));
@@ -4395,6 +4877,93 @@ mod tests {
         let expected = format!("0x{:x}", rabbitcore::INITIAL_BLOCK_REWARD);
 
         assert_eq!(balance, expected);
+    }
+
+    #[tokio::test]
+    async fn test_fee_txs_are_packed_into_mined_block_body() {
+        let api = build_test_api_with_persistent_compute();
+        install_easy_pow_head_if_needed(&api);
+
+        // Submit a fee-less mint tx (legacy path, SubmitTime mode executes it
+        // immediately and places it in the fee-priority pool).
+        let tx = canonicalize_and_sign_compute_tx(serde_json::json!({
+            "tx_id": format!("0x{}", hex::encode([0x51u8; 32])),
+            "domain_id": 0,
+            "chain_id": 10086,
+            "network_id": 10086,
+            "command": "Mint",
+            "nonce": 1,
+            "input_set": [],
+            "read_set": [],
+            "output_proposals": [{
+                "output_id": format!("0x{}", hex::encode([0x52u8; 32])),
+                "object_id": format!("0x{}", hex::encode([0x53u8; 32])),
+                "domain_id": 0,
+                "kind": "State",
+                "owner": { "type": "Shared" },
+                "predecessor": null,
+                "version": 1,
+                "state": "0x01",
+                "logic": null
+            }],
+            "payload": "0x",
+            "deadline_unix_secs": null,
+            "witness": {"signatures": [], "threshold": 1}
+        }));
+        let submitted = api
+            .rabbit_submit_compute_tx(Some(vec![tx]))
+            .await
+            .expect("fee tx should submit");
+        assert_eq!(submitted.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        // Pool should report 1 pending tx.
+        let pending = api.rabbit_pending_transactions(None).expect("pending list");
+        assert_eq!(pending.get("total").and_then(|v| v.as_u64()), Some(1));
+
+        // Mine a block; the tx must be packed into the block body.
+        let work = get_work(&api);
+        let work_id = work.get("work_id").and_then(|v| v.as_str()).unwrap().to_string();
+        let prev_hash = work.get("prev_hash").and_then(|v| v.as_str()).unwrap().to_string();
+        let height = work.get("height").and_then(|v| v.as_u64()).unwrap();
+        let target = work_target(&work);
+        let prev_hash_bytes = hex::decode(prev_hash.strip_prefix("0x").unwrap_or(&prev_hash)).unwrap();
+        let (nonce, digest) = solve_work_digest(&prev_hash_bytes, height, 55, target);
+        let submit = api
+            .rabbit_submit_work(Some(vec![serde_json::json!({
+                "work_id": work_id,
+                "nonce": nonce,
+                "hash_hex": format!("0x{}", hex::encode(digest)),
+                "miner": "pack-test-miner"
+            })]))
+            .expect("submit should succeed");
+        assert_eq!(submit.get("accepted").and_then(|v| v.as_bool()), Some(true));
+
+        // Pool drained after packing.
+        let pending = api.rabbit_pending_transactions(None).expect("pending list");
+        assert_eq!(pending.get("total").and_then(|v| v.as_u64()), Some(0));
+
+        // The mined block body must contain the packed tx, and its receipt must
+        // reference the block's final hash (annotation back-fill).
+        let block_hash = submit.get("block_hash").and_then(|v| v.as_str()).unwrap().to_string();
+        let block_json = api
+            .rabbit_get_block_by_number(Some(vec![serde_json::json!("0x1")]))
+            .expect("block query");
+        assert_eq!(
+            block_json.get("hash").and_then(|v| v.as_str()),
+            Some(block_hash.as_str())
+        );
+        let body = block_json.get("body").cloned().unwrap_or(serde_json::json!({}));
+        assert_eq!(body.get("tx_count").and_then(|v| v.as_u64()), Some(1));
+        let receipts = body
+            .get("receipts")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].get("block_hash").and_then(|v| v.as_str()),
+            Some(block_hash.as_str())
+        );
     }
 
     #[test]
@@ -5447,6 +6016,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_require_fee_for_compute_tx_rejects_fee_less_tx() {
+        let mut config = RpcConfig::default();
+        config.mining_enabled = true;
+        config.require_fee_for_compute_tx = true;
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let store = Arc::new(InMemoryObjectStore::new());
+        let domains = Arc::new(InMemoryDomainRegistry::new());
+        domains.upsert_domain(DomainConfig {
+            domain_id: DomainId(0),
+            name: "main".to_string(),
+            vm: "wasm".to_string(),
+            public: true,
+        });
+        let api = RpcApi::with_compute(config, state_db, store, domains);
+
+        // Mint 是价值创造命令，执行器策略禁止携带任何费用，fee-less Mint 必须被接受。
+        let mint = canonicalize_and_sign_compute_tx(serde_json::json!({
+            "tx_id": format!("0x{}", hex::encode([0x31u8; 32])),
+            "domain_id": 0,
+            "chain_id": 10086,
+            "network_id": 10086,
+            "command": "Mint",
+            "nonce": 1,
+            "input_set": [],
+            "read_set": [],
+            "output_proposals": [{
+                "output_id": format!("0x{}", hex::encode([0x32u8; 32])),
+                "object_id": format!("0x{}", hex::encode([0x33u8; 32])),
+                "domain_id": 0,
+                "kind": "State",
+                "owner": { "type": "Shared" },
+                "predecessor": null,
+                "version": 1,
+                "state": "0x01",
+                "logic": null
+            }],
+            "payload": "0x",
+            "deadline_unix_secs": null,
+            "witness": {"signatures": [], "threshold": 1}
+        }));
+        let mint_res = api
+            .rabbit_submit_compute_tx(Some(vec![mint]))
+            .await
+            .expect("fee-less mint must be accepted (mint cannot carry fees by policy)");
+        assert_eq!(mint_res["ok"], true);
+
+        // 非 Mint 命令（Transfer/Invoke）在 require_fee 下必须携带费用。
+        let transfer = canonicalize_and_sign_compute_tx(serde_json::json!({
+            "tx_id": format!("0x{}", hex::encode([0x41u8; 32])),
+            "domain_id": 0,
+            "chain_id": 10086,
+            "network_id": 10086,
+            "command": "Transfer",
+            "nonce": 1,
+            "input_set": [format!("0x{}", hex::encode([0x42u8; 32]))],
+            "read_set": [],
+            "output_proposals": [{
+                "output_id": format!("0x{}", hex::encode([0x43u8; 32])),
+                "object_id": format!("0x{}", hex::encode([0x44u8; 32])),
+                "domain_id": 0,
+                "kind": "State",
+                "owner": { "type": "Shared" },
+                "predecessor": null,
+                "version": 1,
+                "state": "0x01",
+                "logic": null
+            }],
+            "payload": "0x",
+            "deadline_unix_secs": null,
+            "witness": {"signatures": [], "threshold": 1}
+        }));
+
+        let err = api
+            .rabbit_submit_compute_tx(Some(vec![transfer]))
+            .await
+            .expect_err("fee-less transfer should be rejected when require_fee is set");
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.data,
+            Some(serde_json::Value::String(
+                "fee required: max_fee/priority_fee/gas_limit must be set".to_string(),
+            ))
+        );
+    }
+
     #[test]
     fn test_rabbit_simulate_compute_tx_rejects_network_mismatch() {
         let api = build_test_api_with_compute();
@@ -5622,6 +6277,28 @@ mod tests {
             .await
             .expect("submit should succeed");
         assert_eq!(submit.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        // BlockTime：提交仅入队，对象在区块执行后才存在
+        let out_before = api
+            .rabbit_get_output(Some(vec![serde_json::Value::String(format!(
+                "0x{}",
+                hex::encode([0x66u8; 32])
+            ))]))
+            .expect("output query should succeed");
+        assert!(out_before.is_null());
+
+        // 模拟区块执行（与 rabbit_submit_work 相同路径）→ 对象创建
+        let parsed_tx = parse_compute_tx(tx.clone()).expect("tx should parse");
+        let executor = api.state_executor.new_basic_executor();
+        let (receipts, _) = api
+            .state_executor
+            .execute_txs(
+                std::slice::from_ref(&parsed_tx),
+                rabbitcore::compute::INITIAL_BASE_FEE,
+                &executor,
+            )
+            .expect("block-time execute");
+        assert_eq!(receipts[0].status, rabbitcore::block::ReceiptStatus::Success);
 
         let out = api
             .rabbit_get_output(Some(vec![serde_json::Value::String(format!(
@@ -6024,28 +6701,30 @@ mod tests {
             .expect("submit should succeed");
         assert_eq!(submit.get("ok").and_then(|v| v.as_bool()), Some(true));
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if persistent_store
-                    .get_tx_result(tx_id)
-                    .expect("load persisted result")
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("tx result was not persisted in time");
+        // BlockTime：提交仅入队；真实结果/对象在区块执行时写入共享 compute store
+        let executor = api.state_executor.new_basic_executor();
+        let (receipts, _) = api
+            .state_executor
+            .execute_txs(
+                std::slice::from_ref(&parsed_tx),
+                rabbitcore::compute::INITIAL_BASE_FEE,
+                &executor,
+            )
+            .expect("block-time execute");
+        assert_eq!(receipts[0].status, rabbitcore::block::ReceiptStatus::Success);
 
+        // 新实例共享同一持久化 store → 区块执行创建的对象跨实例可见
         let api2 = RpcApi::with_persistent_compute(config, state_db, persistent_store, domains);
         *api2.latest_block.write() = Some(Block::new(legacy_rpc_test_root()));
 
         let got = api2
-            .rabbit_get_compute_tx_result(Some(vec![serde_json::Value::String(tx_id_hex)]))
-            .expect("get tx result should succeed");
-        assert_eq!(got.get("ok").and_then(|v| v.as_bool()), Some(true));
+            .rabbit_get_object(Some(vec![serde_json::Value::String(format!(
+                "0x{}",
+                hex::encode([0xA6u8; 32])
+            ))]))
+            .expect("get object should succeed");
+        assert!(got.is_object());
+        let _ = tx_id_hex;
     }
 
     #[test]

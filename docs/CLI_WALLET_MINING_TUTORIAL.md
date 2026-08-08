@@ -252,7 +252,7 @@ curl -fsS http://127.0.0.1:8545 \
 "$MINING_STACK_BIN" pool \
   --host 127.0.0.1 \
   --port 9332 \
-  --node-rpc http://127.0.0.1:8545 \
+  --node-rpc https://rpc.rabbitchain.wedevs.org \
   --node-rpc-token "$RPC_TOKEN"
 ```
 
