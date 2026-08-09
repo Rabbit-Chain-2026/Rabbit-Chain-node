@@ -86,8 +86,27 @@ impl GameOp {
     }
 }
 
-/// 重算验证游戏结算，返回权威结果。
+pub use shanhai_core::enhancement::{EnhanceConfig, roll_with_config};
+
+/// 强化规则配置对象逻辑 id（与 shanhai-server `config_object_id` 同源）。
+pub fn enhance_config_object_id() -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        b"jzz/config/enhance",
+    )))
+}
+
+/// 重算验证游戏结算，返回权威结果（强化按默认配置 = 当前常量表）。
 pub fn verify(op: &GameOp) -> Result<serde_json::Value, GameError> {
+    let default_cfg = shanhai_core::enhancement::EnhanceConfig::default();
+    verify_with_config(op, Some(&default_cfg))
+}
+
+/// 重算验证游戏结算（链上 Config 对象驱动）：强化按给定配置重算，
+/// 未提供时回退默认常量表。战斗/治理与配置无关。
+pub fn verify_with_config(
+    op: &GameOp,
+    config: Option<&shanhai_core::enhancement::EnhanceConfig>,
+) -> Result<serde_json::Value, GameError> {
     match op {
         GameOp::BattleSettle {
             teams,
@@ -121,7 +140,15 @@ pub fn verify(op: &GameOp) -> Result<serde_json::Value, GameError> {
             claimed_pity,
             ..
         } => {
-            let r = shanhai_core::enhancement::roll(*current_level, *current_pity, *seed, *star_stones);
+            let default_cfg = shanhai_core::enhancement::EnhanceConfig::default();
+            let cfg = config.unwrap_or(&default_cfg);
+            let r = shanhai_core::enhancement::roll_with_config(
+                *current_level,
+                *current_pity,
+                *seed,
+                *star_stones,
+                cfg,
+            );
             if r.success != *claimed_success {
                 return Err(GameError::EnhanceSuccessMismatch {
                     claimed: *claimed_success,
@@ -333,5 +360,57 @@ mod tests {
             }),
             Err(GameError::InvalidPayload(_))
         ));
+    }
+
+    #[test]
+    fn enhance_verifies_against_provided_config() {
+        use crate::game::EnhanceConfig;
+        let seed = 7;
+        // 默认配置：+0 成功率 90%
+        let default = EnhanceConfig::default();
+        let r_default = roll_with_config(0, 0, seed, 0, &default);
+        let ok_default = GameOp::Enhance {
+            object_id: "0x01".into(),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            seed,
+            claimed_success: r_default.success,
+            claimed_new_level: r_default.new_level,
+            claimed_pity: r_default.pity,
+            rules_version: 1,
+        };
+        assert!(verify_with_config(&ok_default, Some(&default)).is_ok());
+
+        // 改规则：+0 成功率 90% → 0%（保证与默认配置结果相反）
+        let mut v2 = default.clone();
+        v2.version = 2;
+        v2.success_permille[0] = 0;
+        let r_v2 = roll_with_config(0, 0, seed, 0, &v2);
+        let ok_v2 = GameOp::Enhance {
+            object_id: "0x01".into(),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            seed,
+            claimed_success: r_v2.success,
+            claimed_new_level: r_v2.new_level,
+            claimed_pity: r_v2.pity,
+            rules_version: 2,
+        };
+        assert!(verify_with_config(&ok_v2, Some(&v2)).is_ok());
+        // 用新配置校验"按旧配置声称"的结果 → 结果不一致拒绝（v2 必失败，声称成功即拒）
+        let stale_claim = GameOp::Enhance {
+            object_id: "0x01".into(),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            seed,
+            claimed_success: !r_v2.success,
+            claimed_new_level: r_v2.new_level,
+            claimed_pity: r_v2.pity,
+            rules_version: 2,
+        };
+        assert!(verify_with_config(&stale_claim, Some(&v2)).is_err());
     }
 }

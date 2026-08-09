@@ -34,6 +34,20 @@ pub(crate) fn gate_game_tx(
             match &op {
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
+                GameOp::Enhance { rules_version, .. } => {
+                    // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
+                    // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
+                    let cfg = load_enhance_config(store)?;
+                    if *rules_version != cfg.version {
+                        return Err(RpcErrorObject::invalid_params(format!(
+                            "stale enhance rules version: payload {rules_version}, on-chain config {}",
+                            cfg.version
+                        )));
+                    }
+                    rabbitcore::game::verify_with_config(&op, Some(&cfg)).map_err(|e| {
+                        RpcErrorObject::invalid_params(format!("game settlement rejected: {e}"))
+                    })?;
+                }
                 _ => {
                     rabbitcore::game::verify(&op).map_err(|e| {
                         RpcErrorObject::invalid_params(format!("game settlement rejected: {e}"))
@@ -44,6 +58,19 @@ pub(crate) fn gate_game_tx(
         _ => {}
     }
     Ok(())
+}
+
+/// 读取链上 EnhanceConfig 对象（权威强化规则）。
+fn load_enhance_config(
+    store: &dyn ObjectStore,
+) -> Result<rabbitcore::game::EnhanceConfig, RpcErrorObject> {
+    let config_id = rabbitcore::game::enhance_config_object_id();
+    let obj = store.get_latest_output_by_object(config_id).ok_or_else(|| {
+        RpcErrorObject::invalid_params("enhance config object not found on chain".into())
+    })?;
+    serde_json::from_slice(&obj.state).map_err(|e| {
+        RpcErrorObject::invalid_params(format!("invalid enhance config object state: {e}"))
+    })
 }
 
 /// 解析对象 state 为治理提案对象。
@@ -218,6 +245,51 @@ fn gate_execute(
             "execute output must be Executed".into(),
         ));
     }
+    // UpdateConfig 生效：交易必须同时产出新版本配置对象，且与提案 params 一致。
+    if let rabbitcore::governance::ProposalKind::UpdateConfig {
+        config_object,
+        params,
+    } = &input_p.kind
+    {
+        let expected_id = rabbitcore::game::enhance_config_object_id();
+        let expected_hex = format!("0x{}", hex::encode(expected_id.0.as_bytes()));
+        if config_object.trim().to_lowercase() != expected_hex {
+            return Err(RpcErrorObject::invalid_params(format!(
+                "UpdateConfig: unsupported config object {config_object} (only enhance config)"
+            )));
+        }
+        let cur_version = load_enhance_config(store)?.version;
+        let out_cfg = tx
+            .output_proposals
+            .iter()
+            .find(|o| o.object_id == expected_id)
+            .ok_or_else(|| {
+                RpcErrorObject::invalid_params(
+                    "UpdateConfig: execute must output the new config object".into(),
+                )
+            })?;
+        let parsed: rabbitcore::game::EnhanceConfig =
+            serde_json::from_slice(&out_cfg.state).map_err(|e| {
+                RpcErrorObject::invalid_params(format!("invalid new config object state: {e}"))
+            })?;
+        if parsed.version != cur_version.saturating_add(1) {
+            return Err(RpcErrorObject::invalid_params(format!(
+                "UpdateConfig: config version must advance {cur_version} -> {}",
+                cur_version.saturating_add(1)
+            )));
+        }
+        let expected_cfg: rabbitcore::game::EnhanceConfig =
+            serde_json::from_value(params.clone()).map_err(|e| {
+                RpcErrorObject::invalid_params(format!(
+                    "UpdateConfig: proposal params not a valid enhance config: {e}"
+                ))
+            })?;
+        if expected_cfg != parsed {
+            return Err(RpcErrorObject::invalid_params(
+                "UpdateConfig: output config object does not match proposal params".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -383,8 +455,8 @@ impl RpcComputeAdapter {
 mod tests {
     use super::*;
     use rabbitcore::compute::{
-        InMemoryObjectStore, ObjectId, ObjectKind, ObjectOutput, OutputId, OutputProposal, Ownership,
-        Script, TxId, TxWitness, Version,
+        InMemoryObjectStore, ObjectId, ObjectKind, ObjectOutput, OutputId, OutputProposal,
+        Ownership, Script, TxId, TxWitness, Version,
     };
     use rabbitcore::crypto::{Address, Hash, keccak256};
     use rabbitcore::governance::{Proposal, ProposalKind, ProposalStatus, VOTE_WINDOW_SECS};
@@ -396,7 +468,7 @@ mod tests {
         OutputId(Hash::from_bytes(keccak256(&data)))
     }
 
-    fn proposal_object_id(id: &str) -> ObjectId {
+    pub(super) fn proposal_object_id(id: &str) -> ObjectId {
         ObjectId(Hash::from_bytes(keccak256(
             format!("jzz/proposal/{id}").as_bytes(),
         )))
@@ -406,7 +478,7 @@ mod tests {
         serde_json::to_vec(p).unwrap()
     }
 
-    fn insert_proposal(
+    pub(super) fn insert_proposal(
         store: &InMemoryObjectStore,
         p: &Proposal,
         version: u64,
@@ -438,7 +510,11 @@ mod tests {
         output_id
     }
 
-    fn output_proposal(p: &Proposal, version: u64, predecessor: Option<OutputId>) -> OutputProposal {
+    pub(super) fn output_proposal(
+        p: &Proposal,
+        version: u64,
+        predecessor: Option<OutputId>,
+    ) -> OutputProposal {
         let object_id = proposal_object_id(&p.proposal_id);
         OutputProposal {
             output_id: output_id_for(&object_id, version),
@@ -461,7 +537,7 @@ mod tests {
         }
     }
 
-    fn tx(
+    pub(super) fn tx(
         command: Command,
         input_set: Vec<OutputId>,
         payload: Vec<u8>,
@@ -491,7 +567,7 @@ mod tests {
         }
     }
 
-    fn active_proposal(id: &str, created: u64) -> Proposal {
+    pub(super) fn active_proposal(id: &str, created: u64) -> Proposal {
         rabbitcore::governance::create_proposal(
             id,
             ProposalKind::FundActivity {
@@ -710,5 +786,277 @@ mod tests {
         let t = tx(Command::Invoke, vec![], payload, output_proposal(&executed, 2, None));
         let err = gate_game_tx(&t, &store, VOTE_WINDOW_SECS + 1).unwrap_err();
         assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("missing input"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod config_gate_tests {
+    use super::tests::{insert_proposal, output_proposal, proposal_object_id, tx};
+    use rabbitcore::compute::InMemoryObjectStore;
+    use super::*;
+    use rabbitcore::compute::{
+        ObjectId, ObjectKind, ObjectOutput, OutputId, OutputProposal, TxId, TxWitness, Version,
+    };
+    use rabbitcore::compute::{Ownership, Script};
+    use rabbitcore::crypto::{Address, Hash, keccak256};
+    use rabbitcore::game::EnhanceConfig;
+    use rabbitcore::governance::{ProposalStatus, VOTE_WINDOW_SECS};
+
+    fn config_state(cfg: &EnhanceConfig) -> Vec<u8> {
+        serde_json::to_vec(cfg).unwrap()
+    }
+
+    fn insert_config(store: &InMemoryObjectStore, cfg: &EnhanceConfig, version: u64) -> OutputId {
+        let object_id = rabbitcore::game::enhance_config_object_id();
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(object_id.0.as_bytes());
+        data.extend_from_slice(&version.to_be_bytes());
+        let output_id = OutputId(Hash::from_bytes(keccak256(&data)));
+        let out = ObjectOutput {
+            output_id,
+            object_id,
+            version: Version(version),
+            domain_id: GAME_DOMAIN,
+            kind: ObjectKind::State,
+            owner: Ownership::Address(Address::zero()),
+            predecessor: None,
+            state: config_state(cfg),
+            state_root: None,
+            resources: Default::default(),
+            lock: Script::default(),
+            logic: None,
+            created_at: 0,
+            ttl: None,
+            rent_reserve: None,
+            flags: 0,
+            extensions: vec![],
+            spent: false,
+        };
+        store.insert_output(out).unwrap();
+        output_id
+    }
+
+    fn enhance_tx(cfg: &EnhanceConfig, seed: u64, forged: bool) -> ComputeTx {
+        let r = rabbitcore::game::verify_with_config(
+            &GameOp::Enhance {
+                object_id: "0x01".into(),
+                current_level: 0,
+                current_pity: 0,
+                star_stones: 0,
+                seed,
+                claimed_success: true,
+                claimed_new_level: 1,
+                claimed_pity: 0,
+                rules_version: cfg.version,
+            },
+            Some(cfg),
+        );
+        // 用真实 roll 结果构造合法负载
+        let rr = rabbitcore::game::roll_with_config(0, 0, seed, 0, cfg);
+        let _ = r;
+        let op = GameOp::Enhance {
+            object_id: "0x01".into(),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            seed,
+            claimed_success: if forged { !rr.success } else { rr.success },
+            claimed_new_level: rr.new_level,
+            claimed_pity: rr.pity,
+            rules_version: cfg.version,
+        };
+        tx(Command::Invoke, vec![], serde_json::to_vec(&op).unwrap(), {
+            // dummy output（gate 不校验对象流）
+            let mut p = super::tests::active_proposal("dummy", 0);
+            output_proposal(&p, 1, None)
+        })
+    }
+
+    #[test]
+    fn enhance_matching_config_accepted() {
+        let store = InMemoryObjectStore::new();
+        let cfg = EnhanceConfig::default();
+        insert_config(&store, &cfg, 1);
+        let t = enhance_tx(&cfg, 42, false);
+        gate_game_tx(&t, &store, 100).expect("matching config accepted");
+    }
+
+    #[test]
+    fn enhance_stale_rules_version_rejected() {
+        let store = InMemoryObjectStore::new();
+        let cfg = EnhanceConfig::default(); // v1
+        insert_config(&store, &cfg, 1);
+        let mut t = enhance_tx(&cfg, 42, false);
+        // 声称 v2，链上仍 v1
+        let mut op: GameOp =
+            serde_json::from_slice(&t.payload).expect("op");
+        match &mut op {
+            GameOp::Enhance { rules_version, .. } => *rules_version = 2,
+            _ => unreachable!(),
+        }
+        t.payload = serde_json::to_vec(&op).unwrap();
+        let err = gate_game_tx(&t, &store, 100).unwrap_err();
+        assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("stale"), "{err:?}");
+    }
+
+    #[test]
+    fn enhance_without_config_rejected() {
+        let store = InMemoryObjectStore::new();
+        let cfg = EnhanceConfig::default();
+        let t = enhance_tx(&cfg, 42, false);
+        let err = gate_game_tx(&t, &store, 100).unwrap_err();
+        assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("config object not found"), "{err:?}");
+    }
+
+    fn passed_update_config_proposal(id: &str, v2: &EnhanceConfig) -> rabbitcore::governance::Proposal {
+        use rabbitcore::governance::{cast_vote, create_proposal, ProposalKind, ProposalStatus, tally};
+        let mut p = create_proposal(
+            id,
+            ProposalKind::UpdateConfig {
+                config_object: format!("0x{}", hex::encode(rabbitcore::game::enhance_config_object_id().0.as_bytes())),
+                params: serde_json::to_value(v2.clone()).unwrap(),
+            },
+            "0xaaa",
+            1000,
+            0,
+        )
+        .unwrap();
+        cast_vote(&mut p, 500, true, 100).unwrap();
+        assert_eq!(tally(&mut p, VOTE_WINDOW_SECS + 1), ProposalStatus::Passed);
+        p
+    }
+
+    #[test]
+    fn execute_update_config_advances_config() {
+        let store = InMemoryObjectStore::new();
+        let mut v2 = EnhanceConfig::default();
+        v2.version = 2;
+        v2.success_permille[0] = 500; // 改规则：+0 成功率 90% → 50%
+        let p = passed_update_config_proposal("uc1", &v2);
+        let input_id = insert_proposal(&store, &p, 1, None);
+        let cfg_v1 = EnhanceConfig::default();
+        insert_config(&store, &cfg_v1, 1);
+
+        // execute 交易：输入提案 v1，输出 Executed 提案 v2 + 新配置对象 v2
+        let mut executed = p.clone();
+        executed.status = ProposalStatus::Executed;
+        let exec_out = output_proposal(&executed, 2, Some(input_id));
+        let config_id = rabbitcore::game::enhance_config_object_id();
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(config_id.0.as_bytes());
+        data.extend_from_slice(&2u64.to_be_bytes());
+        let cfg_out_id = OutputId(Hash::from_bytes(keccak256(&data)));
+        let cfg_out = OutputProposal {
+            output_id: cfg_out_id,
+            object_id: config_id,
+            domain_id: GAME_DOMAIN,
+            kind: ObjectKind::State,
+            owner: Ownership::Address(Address::zero()),
+            predecessor: None,
+            version: Version(2),
+            state: config_state(&v2),
+            state_root: None,
+            resources: Default::default(),
+            lock: Script::default(),
+            logic: None,
+            created_at: 0,
+            ttl: None,
+            rent_reserve: None,
+            flags: 0,
+            extensions: vec![],
+        };
+        let payload = serde_json::to_vec(&GameOp::Execute {
+            proposal_id: "uc1".into(),
+        })
+        .unwrap();
+        let t = ComputeTx {
+            tx_id: TxId(Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![input_id],
+            read_set: vec![],
+            output_proposals: vec![exec_out, cfg_out],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload,
+            deadline_unix_secs: None,
+            chain_id: None,
+            network_id: None,
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        // 门禁接受 UpdateConfig 生效（新配置对象落库由执行器在区块执行时完成，见 e2e）
+        gate_game_tx(&t, &store, VOTE_WINDOW_SECS + 1).expect("UpdateConfig execute accepted");
+    }
+
+    #[test]
+    fn execute_update_config_mismatched_output_rejected() {
+        let store = InMemoryObjectStore::new();
+        let mut v2 = EnhanceConfig::default();
+        v2.version = 2;
+        v2.success_permille[0] = 500;
+        let p = passed_update_config_proposal("uc2", &v2);
+        let input_id = insert_proposal(&store, &p, 1, None);
+        let cfg_v1 = EnhanceConfig::default();
+        insert_config(&store, &cfg_v1, 1);
+
+        let mut executed = p.clone();
+        executed.status = ProposalStatus::Executed;
+        let exec_out = output_proposal(&executed, 2, Some(input_id));
+        let config_id = rabbitcore::game::enhance_config_object_id();
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(config_id.0.as_bytes());
+        data.extend_from_slice(&2u64.to_be_bytes());
+        let cfg_out_id = OutputId(Hash::from_bytes(keccak256(&data)));
+        // 伪造：成功概率与提案不一致
+        let mut wrong = v2.clone();
+        wrong.success_permille[0] = 800;
+        let cfg_out = OutputProposal {
+            output_id: cfg_out_id,
+            object_id: config_id,
+            domain_id: GAME_DOMAIN,
+            kind: ObjectKind::State,
+            owner: Ownership::Address(Address::zero()),
+            predecessor: None,
+            version: Version(2),
+            state: config_state(&wrong),
+            state_root: None,
+            resources: Default::default(),
+            lock: Script::default(),
+            logic: None,
+            created_at: 0,
+            ttl: None,
+            rent_reserve: None,
+            flags: 0,
+            extensions: vec![],
+        };
+        let payload = serde_json::to_vec(&GameOp::Execute {
+            proposal_id: "uc2".into(),
+        })
+        .unwrap();
+        let t = ComputeTx {
+            tx_id: TxId(Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![input_id],
+            read_set: vec![],
+            output_proposals: vec![exec_out, cfg_out],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload,
+            deadline_unix_secs: None,
+            chain_id: None,
+            network_id: None,
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let err = gate_game_tx(&t, &store, VOTE_WINDOW_SECS + 1).unwrap_err();
+        assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("does not match"), "{err:?}");
     }
 }
