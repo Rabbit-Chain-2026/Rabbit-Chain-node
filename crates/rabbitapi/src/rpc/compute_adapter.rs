@@ -34,6 +34,7 @@ pub(crate) fn gate_game_tx(
             match &op {
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
+                GameOp::ActionSettle { .. } => gate_action_settle(tx, store, &op)?,
                 GameOp::Enhance { rules_version, .. } | GameOp::ZkEnhance { rules_version, .. } => {
                     // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
                     // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
@@ -321,6 +322,98 @@ fn gate_execute(
                 "UpdateConfig: output config object does not match proposal params".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// 解析 32 字节 hex 哈希。
+fn parse_hash_hex(s: &str) -> Result<rabbitcore::crypto::Hash, RpcErrorObject> {
+    let raw = hex::decode(s.trim().strip_prefix("0x").unwrap_or(s.trim()))
+        .map_err(|e| RpcErrorObject::invalid_params(format!("invalid hash hex: {e}")))?;
+    if raw.len() != 32 {
+        return Err(RpcErrorObject::invalid_params("hash must be 32 bytes".into()));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&raw);
+    Ok(rabbitcore::crypto::Hash::from_bytes(buf))
+}
+
+/// 统一玩法动作结算门禁（先承诺后揭晓，防作弊协议）：
+/// 1) 输入[0] 是 ActionSession（未结算）
+/// 2) 随机揭晓：random_block_hash 是真实链块且时间 >= session 创建（提交前不可知），
+///    seed = keccak(block_hash ‖ session_id)
+/// 3) 确定性重算 execute_action → 声称结果 + 掉落一致
+/// 4) 输出：session v2（settled + result）+ 掉落对象
+fn gate_action_settle(
+    tx: &ComputeTx,
+    store: &dyn ObjectStore,
+    op: &GameOp,
+) -> Result<(), RpcErrorObject> {
+    let GameOp::ActionSettle {
+        session_id,
+        seed,
+        random_block_hash,
+        claimed,
+        drops,
+    } = op
+    else {
+        unreachable!("gate_action_settle called with non-settle op")
+    };
+    // 1) session 输入
+    let input = tx.input_set.first().ok_or_else(|| {
+        RpcErrorObject::invalid_params("action settle missing input session".into())
+    })?;
+    let input_obj = store.get_output(*input).ok_or_else(|| {
+        RpcErrorObject::invalid_params("action settle input session not found on chain".into())
+    })?;
+    let session: rabbitcore::game::ActionSession = serde_json::from_slice(&input_obj.state)
+        .map_err(|e| RpcErrorObject::invalid_params(format!("invalid action session state: {e}")))?;
+    if session.session_id != *session_id {
+        return Err(RpcErrorObject::invalid_params("settle session_id mismatch".into()));
+    }
+    if session.settled {
+        return Err(RpcErrorObject::invalid_params("session already settled".into()));
+    }
+    // 2) 随机揭晓：真实链块 + 时间 >= session 创建 + seed 推导
+    let block_hash = parse_hash_hex(random_block_hash)?;
+    let block = rabbitnet::global_block_by_hash(&block_hash).ok_or_else(|| {
+        RpcErrorObject::invalid_params("random block hash not found on chain".into())
+    })?;
+    if block.header.timestamp < session.created_at_unix {
+        return Err(RpcErrorObject::invalid_params(
+            "random block predates session commitment (seed shopping)".into(),
+        ));
+    }
+    let expected_seed = rabbitcore::game::derive_action_seed(&block_hash, &session.session_id);
+    if expected_seed != *seed {
+        return Err(RpcErrorObject::invalid_params("seed mismatch with random block".into()));
+    }
+    // 3) 确定性重算
+    let cfg = match &session.action_type {
+        rabbitcore::game::ActionKind::Enhance => load_enhance_config(store)?,
+        _ => rabbitcore::game::EnhanceConfig::default(),
+    };
+    let outcome = rabbitcore::game::execute_action(&session.action_type, &session.inputs, *seed, &cfg)
+        .map_err(|e| RpcErrorObject::invalid_params(format!("action rejected: {e}")))?;
+    if &outcome.result != claimed {
+        return Err(RpcErrorObject::invalid_params("claimed result mismatch".into()));
+    }
+    if &outcome.drops != drops {
+        return Err(RpcErrorObject::invalid_params("claimed drops mismatch".into()));
+    }
+    // 4) 输出校验：session v2（settled）+ 掉落对象（数量匹配）
+    let out = tx.output_proposals.first().ok_or_else(|| {
+        RpcErrorObject::invalid_params("action settle missing output record".into())
+    })?;
+    let out_session: rabbitcore::game::ActionSession = serde_json::from_slice(&out.state)
+        .map_err(|e| RpcErrorObject::invalid_params(format!("invalid settle output: {e}")))?;
+    if out_session.session_id != *session_id || !out_session.settled {
+        return Err(RpcErrorObject::invalid_params(
+            "settle output must be a settled session".into(),
+        ));
+    }
+    if tx.output_proposals.len() - 1 != drops.len() {
+        return Err(RpcErrorObject::invalid_params("drop object count mismatch".into()));
     }
     Ok(())
 }

@@ -214,6 +214,20 @@ impl StateExecutor {
                 });
                 continue;
             }
+            // 统一玩法动作预检（确定性）：ActionSettle 重算校验声称结果与掉落。
+            if let Err(e) = self.apply_action_effects(tx) {
+                receipts.push(Receipt {
+                    tx_id: tx.tx_id,
+                    block_hash: Hash::zero(),
+                    status: ReceiptStatus::Failed,
+                    gas_used: 0,
+                    compute_units: 0,
+                    output_refs: vec![],
+                    logs: vec![],
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
             // 山海币经济效果预检（确定性）：转账余额 / 强化扣费余额。
             if let Err(e) = self.apply_economy_effects(tx, base_fee) {
                 receipts.push(Receipt {
@@ -413,6 +427,64 @@ impl StateExecutor {
                 (computed.status, computed.gas_used, computed.output_refs.len(), computed.error.clone()),
                 (declared.status, declared.gas_used, declared.output_refs.len(), declared.error.clone())
             )));
+        }
+        Ok(())
+    }
+
+    /// 统一玩法动作预检（确定性，跨节点一致）：`ActionSettle` 重算
+    /// `execute_action`（打怪/强化统一规则），校验声称结果与掉落。
+    /// （seed 的"先承诺后揭晓"块校验由 RPC gate 把关——gate 有块存储；
+    ///   执行器保证结果确定性：伪造结果/掉落在此拒绝。）
+    fn apply_action_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::ActionSettle { session_id, seed, claimed, drops, .. } = op else {
+            return Ok(());
+        };
+        let input = tx.input_set.first().ok_or_else(|| {
+            ExecutionError::Block("action settle missing input session".to_string())
+        })?;
+        let obj = self.compute_store.get_output(*input).ok_or_else(|| {
+            ExecutionError::Block("action settle input session not found".to_string())
+        })?;
+        let session: crate::game::ActionSession = serde_json::from_slice(&obj.state)
+            .map_err(|e| ExecutionError::Block(format!("invalid action session state: {e}")))?;
+        if session.session_id != session_id {
+            return Err(ExecutionError::Block("action settle session_id mismatch".to_string()));
+        }
+        if session.settled {
+            return Err(ExecutionError::Block("action session already settled".to_string()));
+        }
+        let cfg = match &session.action_type {
+            crate::game::ActionKind::Enhance => {
+                let config_id = crate::game::enhance_config_object_id();
+                let cfg_obj = self
+                    .compute_store
+                    .get_latest_output_by_object(config_id)
+                    .ok_or_else(|| {
+                        ExecutionError::Block("enhance config object not found".to_string())
+                    })?;
+                serde_json::from_slice(&cfg_obj.state).map_err(|e| {
+                    ExecutionError::Block(format!("invalid enhance config state: {e}"))
+                })?
+            }
+            _ => crate::game::EnhanceConfig::default(),
+        };
+        let outcome = crate::game::execute_action(&session.action_type, &session.inputs, seed, &cfg)
+            .map_err(|e| ExecutionError::Block(format!("action rejected: {e}")))?;
+        if outcome.result != claimed {
+            return Err(ExecutionError::Block(
+                "action claimed result mismatch".to_string(),
+            ));
+        }
+        if outcome.drops != drops {
+            return Err(ExecutionError::Block(
+                "action claimed drops mismatch".to_string(),
+            ));
         }
         Ok(())
     }

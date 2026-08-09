@@ -75,6 +75,25 @@ pub enum GameOp {
         /// ZK 证明：hex 编码的 bincode（`zk::enhance::EnhanceProof`）。
         proof_hex: String,
     },
+    /// 统一玩法动作：发起（Mint session 对象，输入承诺绑定）。
+    ActionStart {
+        session_id: String,
+        action_type: ActionKind,
+        inputs: ActionInput,
+        rules_version: u64,
+        creator: String,
+        created_at_unix: u64,
+    },
+    /// 统一玩法动作：结算（Invoke 消费 session；随机揭晓 + 声称结果 + 掉落）。
+    ActionSettle {
+        session_id: String,
+        /// 随机揭晓：seed = keccak(random_block_hash ‖ session_id)（先承诺后揭晓）。
+        seed: u64,
+        /// 随机源块哈希（必须是 session 提交之后的真实链块）。
+        random_block_hash: String,
+        claimed: serde_json::Value,
+        drops: Vec<ActionDrop>,
+    },
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
@@ -274,6 +293,44 @@ pub fn verify_with_config(
             }
             Ok(serde_json::json!({ "success": success, "new_level": new_level, "pity": new_pity }))
         }
+        GameOp::ActionStart {
+            session_id,
+            creator,
+            action_type,
+            inputs,
+            rules_version,
+            created_at_unix,
+        } => {
+            if session_id.trim().is_empty() {
+                return Err(GameError::InvalidPayload("session_id must not be empty".into()));
+            }
+            if creator.trim().is_empty() {
+                return Err(GameError::InvalidPayload("creator must not be empty".into()));
+            }
+            let _ = (action_type, inputs, rules_version, created_at_unix);
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "action_type": action_type,
+                "creator": creator,
+            }))
+        }
+        GameOp::ActionSettle {
+            session_id, seed, random_block_hash, claimed, drops, ..
+        } => {
+            if session_id.trim().is_empty() || random_block_hash.trim().is_empty() {
+                return Err(GameError::InvalidPayload(
+                    "settle requires session_id and random_block_hash".into(),
+                ));
+            }
+            // 语义验证（session 生命周期/seed 块校验/结果与掉落重算）在
+            // gate_game_tx 与执行器结合链上对象执行（见 compute_adapter/executor）。
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "seed": seed,
+                "claimed": claimed,
+                "drops": drops,
+            }))
+        }
         GameOp::Propose {
             proposal_id,
             kind,
@@ -335,6 +392,168 @@ pub fn verify_with_config(
             }
             Ok(serde_json::json!({ "proposal_id": proposal_id }))
         }
+    }
+}
+
+// ── 统一玩法动作引擎（§6.8：动作 = 确定性状态转移）─────────────────
+
+/// 统一动作类型。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// 打怪/打boss：队伍 vs 怪物，确定性战斗 + 掉落表。
+    Battle,
+    /// 强化：装备 + seed → 新等级。
+    Enhance,
+}
+
+/// 队伍单位（玩家侧简化属性，确定性聚合）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamUnit {
+    pub atk: u64,
+    pub def: u64,
+    pub hp: u64,
+}
+
+/// 统一动作输入（序列化进 session 对象与 settle 交易）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionInput {
+    Battle { monster_id: String, team: Vec<TeamUnit> },
+    Enhance { object_id: String, current_level: u8, current_pity: u8, star_stones: u16 },
+}
+
+/// 掉落（settle 时由链 Mint 为唯一资产对象）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionDrop {
+    pub item_id: String,
+    pub count: u64,
+}
+
+/// 统一输出：结果 + 掉落。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionOutcome {
+    pub result: serde_json::Value,
+    pub drops: Vec<ActionDrop>,
+}
+
+/// 动作 session 对象 state（输入承诺，之后不可改）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionSession {
+    pub session_id: String,
+    pub action_type: ActionKind,
+    pub inputs: ActionInput,
+    pub rules_version: u64,
+    pub creator: String,
+    pub created_at_unix: u64,
+    /// 是否已结算（session 一次性：结算后置 true）。
+    pub settled: bool,
+    /// 结算结果（settle 输出 v2 回填）。
+    pub result: Option<serde_json::Value>,
+}
+
+/// 动作 session 对象逻辑 id。
+pub fn action_session_object_id(session_id: &str) -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        format!("shanhai/action/{session_id}").as_bytes(),
+    )))
+}
+
+/// seed = keccak(random_block_hash ‖ session_id) 低 64 位（先承诺后揭晓的随机源）。
+pub fn derive_action_seed(block_hash: &crate::crypto::Hash, session_id: &str) -> u64 {
+    let mut buf = Vec::with_capacity(32 + session_id.len());
+    buf.extend_from_slice(block_hash.as_bytes());
+    buf.extend_from_slice(session_id.as_bytes());
+    let h = crate::crypto::keccak256(&buf);
+    u64::from_be_bytes(h[..8].try_into().expect("hash"))
+}
+
+/// 怪物规格（确定性内嵌表：打怪/打boss 的统一掉落源）。
+#[derive(Debug, Clone)]
+pub struct MonsterSpec {
+    pub hp: u64,
+    pub atk: u64,
+    pub def: u64,
+    /// (物品, 掉率千分位, 数量)
+    pub drops: Vec<(String, u16, u64)>,
+}
+
+/// 内嵌怪物表（演示；生产可改为链上配置对象）。
+pub fn monster_spec(id: &str) -> Option<MonsterSpec> {
+    match id {
+        "slime" => Some(MonsterSpec { hp: 50, atk: 8, def: 2, drops: vec![("slime_core".into(), 500, 1)] }),
+        "wolf" => Some(MonsterSpec { hp: 120, atk: 15, def: 5, drops: vec![("wolf_fang".into(), 400, 1), ("wolf_pelt".into(), 300, 1)] }),
+        "boss_dragon" => Some(MonsterSpec { hp: 2000, atk: 60, def: 20, drops: vec![("dragon_scale".into(), 800, 2), ("dragon_heart".into(), 100, 1)] }),
+        _ => None,
+    }
+}
+
+/// 统一规则执行（确定性，零浮点）：动作 → 结果 + 掉落。
+pub fn execute_action(
+    kind: &ActionKind,
+    input: &ActionInput,
+    seed: u64,
+    cfg: &shanhai_core::enhancement::EnhanceConfig,
+) -> Result<ActionOutcome, GameError> {
+    match (kind, input) {
+        (ActionKind::Battle, ActionInput::Battle { monster_id, team }) => {
+            let spec = monster_spec(monster_id).ok_or_else(|| {
+                GameError::InvalidPayload(format!("unknown monster {monster_id}"))
+            })?;
+            // 队伍聚合（确定性）
+            let mut p_atk = 0u64;
+            let mut p_def = 0u64;
+            let mut p_hp = 0u64;
+            for u in team {
+                p_atk = p_atk.saturating_add(u.atk);
+                p_def = p_def.saturating_add(u.def);
+                p_hp = p_hp.saturating_add(u.hp);
+            }
+            // 回合制：攻方伤害 = max(1, atk − def) + 0..2 抖动（seed 驱动）
+            let mut rng = shanhai_core::battle::Prng::new(seed);
+            let mut m_hp = spec.hp;
+            let mut hp = p_hp;
+            let mut rounds = 0u64;
+            let mut player_win = false;
+            const MAX_ROUNDS: u64 = 500;
+            while hp > 0 && m_hp > 0 && rounds < MAX_ROUNDS {
+                // 玩家回合
+                let base = p_atk.saturating_sub(spec.def).max(1);
+                let dmg = base.saturating_add(rng.below(3));
+                m_hp = m_hp.saturating_sub(dmg);
+                // 怪物回合
+                if m_hp > 0 {
+                    let base = spec.atk.saturating_sub(p_def).max(1);
+                    let dmg = base.saturating_add(rng.below(3));
+                    hp = hp.saturating_sub(dmg);
+                }
+                rounds += 1;
+            }
+            player_win = hp > 0;
+            // 掉落：玩家胜利时按怪物掉落表确定性 roll
+            let mut drops = vec![];
+            if player_win {
+                for (item, permille, count) in &spec.drops {
+                    if rng.chance(*permille) {
+                        drops.push(ActionDrop { item_id: item.clone(), count: *count });
+                    }
+                }
+            }
+            Ok(ActionOutcome {
+                result: serde_json::json!({ "winner": if player_win { "player" } else { "monster" }, "rounds": rounds }),
+                drops,
+            })
+        }
+        (ActionKind::Enhance, ActionInput::Enhance { current_level, current_pity, star_stones, .. }) => {
+            let r = shanhai_core::enhancement::roll_with_config(
+                *current_level, *current_pity, seed, *star_stones, cfg,
+            );
+            Ok(ActionOutcome {
+                result: serde_json::json!({ "success": r.success, "new_level": r.new_level, "new_pity": r.pity }),
+                drops: vec![],
+            })
+        }
+        _ => Err(GameError::InvalidPayload("action kind/input mismatch".into())),
     }
 }
 
@@ -609,5 +828,73 @@ mod tests {
             *proof_hex = hex::encode(b);
         }
         assert!(verify(&forged_proof).is_err(), "tampered proof rejected");
+    }
+
+    #[test]
+    fn unified_action_engine_is_deterministic_and_covers_gameplay() {
+        use crate::game::{execute_action, ActionInput, ActionKind, ActionOutcome, MonsterSpec};
+        use crate::game::EnhanceConfig;
+        let cfg = EnhanceConfig::default();
+        let team = vec![TeamUnit { atk: 30, def: 10, hp: 200 }, TeamUnit { atk: 20, def: 5, hp: 150 }];
+        // 打怪（battle）：同一 seed 结果与掉落完全一致
+        let a = execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "wolf".into(), team: team.clone() },
+            42,
+            &cfg,
+        ).expect("battle action");
+        let b = execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "wolf".into(), team: team.clone() },
+            42,
+            &cfg,
+        ).expect("battle action");
+        assert_eq!(a, b, "deterministic outcome");
+        // 怪物存在且掉落表确定
+        assert!(monster_spec("slime").is_some());
+        assert!(monster_spec("boss_dragon").is_some());
+        assert!(monster_spec("nope").is_none());
+        // 不同 seed → 可能不同结果（战斗是 seed 驱动的）
+        let c = execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "wolf".into(), team },
+            43,
+            &cfg,
+        ).expect("battle action 2");
+        let _ = c;
+        // 强化（enhance）统一入口与 roll_with_config 一致
+        let r = roll_with_config(0, 0, 7, 0, &cfg);
+        let o = execute_action(
+            &ActionKind::Enhance,
+            &ActionInput::Enhance { object_id: "0x01".into(), current_level: 0, current_pity: 0, star_stones: 0 },
+            7,
+            &cfg,
+        ).expect("enhance action");
+        assert_eq!(o.result, serde_json::json!({ "success": r.success, "new_level": r.new_level, "new_pity": r.pity }));
+        assert!(o.drops.is_empty(), "enhance has no drops");
+        // 未知怪物 → 拒
+        assert!(execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "nope".into(), team: vec![] },
+            1, &cfg,
+        ).is_err());
+        // 类型/输入不匹配 → 拒
+        assert!(execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Enhance { object_id: "0x01".into(), current_level: 0, current_pity: 0, star_stones: 0 },
+            1, &cfg,
+        ).is_err());
+    }
+
+    #[test]
+    fn action_seed_derives_from_block_and_session() {
+        use crate::game::derive_action_seed;
+        let h = crate::crypto::Hash::from_bytes([0xAB; 32]);
+        let s1 = derive_action_seed(&h, "sess-1");
+        let s2 = derive_action_seed(&h, "sess-2");
+        assert_eq!(s1, derive_action_seed(&h, "sess-1"), "deterministic");
+        assert_ne!(s1, s2, "session-scoped");
+        let h2 = crate::crypto::Hash::from_bytes([0xCD; 32]);
+        assert_ne!(s1, derive_action_seed(&h2, "sess-1"), "block-scoped");
     }
 }
