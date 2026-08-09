@@ -455,7 +455,7 @@ impl StateExecutor {
                 }
                 Ok(())
             }
-            GameOp::Enhance { current_level, .. } => {
+            GameOp::Enhance { current_level, .. } | GameOp::ZkEnhance { current_level, .. } => {
                 let cost = self.enhance_cost(current_level)?;
                 let gas = self.tx_gas_fee(tx, base_fee);
                 let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
@@ -500,7 +500,7 @@ impl StateExecutor {
                 self.credit_account(target, amount);
                 Ok(())
             }
-            GameOp::Enhance { current_level, .. } => {
+            GameOp::Enhance { current_level, .. } | GameOp::ZkEnhance { current_level, .. } => {
                 let cost = self.enhance_cost(current_level)?;
                 let gas = self.tx_gas_fee(tx, base_fee);
                 let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {

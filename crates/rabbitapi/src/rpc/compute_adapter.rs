@@ -34,9 +34,10 @@ pub(crate) fn gate_game_tx(
             match &op {
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
-                GameOp::Enhance { rules_version, .. } => {
+                GameOp::Enhance { rules_version, .. } | GameOp::ZkEnhance { rules_version, .. } => {
                     // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
                     // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
+                    // ZkEnhance 额外在验证中执行 zk 证明的原生验证（seed 不上链）。
                     let cfg = load_enhance_config(store)?;
                     if *rules_version != cfg.version {
                         return Err(RpcErrorObject::invalid_params(format!(

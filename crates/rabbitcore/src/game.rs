@@ -59,6 +59,22 @@ pub enum GameOp {
         to: String,
         amount: u64,
     },
+    /// ZK 强化：客户端证明"存在秘密 seed 使 xorshift64³(seed) mod 1000 = roll_claim"，
+    /// 链上原生验证证明后按公开 roll_claim 派生强化结果（seed 永不上链）。
+    ZkEnhance {
+        object_id: String,
+        current_level: u8,
+        current_pity: u8,
+        star_stones: u16,
+        /// 声称的 roll（证明的公开输出）。
+        roll_claim: u64,
+        claimed_success: bool,
+        claimed_new_level: u8,
+        claimed_pity: u8,
+        rules_version: u64,
+        /// ZK 证明（`zk::enhance::EnhanceProof` 序列化）。
+        proof: serde_json::Value,
+    },
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
@@ -217,6 +233,47 @@ pub fn verify_with_config(
             }
             Ok(serde_json::json!({ "success": r.success, "new_level": r.new_level, "pity": r.pity }))
         }
+        GameOp::ZkEnhance {
+            current_level,
+            current_pity,
+            star_stones,
+            roll_claim,
+            claimed_success,
+            claimed_new_level,
+            claimed_pity,
+            proof,
+            ..
+        } => {
+            let default_cfg = shanhai_core::enhancement::EnhanceConfig::default();
+            let cfg = config.unwrap_or(&default_cfg);
+            let (success, new_level, new_pity) = verify_zk_enhance(
+                *current_level,
+                *current_pity,
+                *star_stones,
+                *roll_claim,
+                proof,
+                cfg,
+            )?;
+            if success != *claimed_success {
+                return Err(GameError::EnhanceSuccessMismatch {
+                    claimed: *claimed_success,
+                    computed: success,
+                });
+            }
+            if new_level != *claimed_new_level {
+                return Err(GameError::EnhanceLevelMismatch {
+                    claimed: *claimed_new_level,
+                    computed: new_level,
+                });
+            }
+            if new_pity != *claimed_pity {
+                return Err(GameError::EnhancePityMismatch {
+                    claimed: *claimed_pity,
+                    computed: new_pity,
+                });
+            }
+            Ok(serde_json::json!({ "success": success, "new_level": new_level, "pity": new_pity }))
+        }
         GameOp::Propose {
             proposal_id,
             kind,
@@ -279,6 +336,38 @@ pub fn verify_with_config(
             Ok(serde_json::json!({ "proposal_id": proposal_id }))
         }
     }
+}
+
+/// ZK 强化验证（纯函数，链上原生执行）：
+/// 1) 验证证明：存在秘密 seed 使 xorshift64³(seed) mod 1000 = roll_claim（zk crate）
+/// 2) 用公开 roll_claim 按配置派生结果（success/new_level/new_pity）——与
+///    `roll_with_config` 的公开部分一致，seed 永不上链。
+pub fn verify_zk_enhance(
+    current_level: u8,
+    current_pity: u8,
+    star_stones: u16,
+    roll_claim: u64,
+    proof: &serde_json::Value,
+    cfg: &shanhai_core::enhancement::EnhanceConfig,
+) -> Result<(bool, u8, u8), GameError> {
+    if roll_claim >= 1000 {
+        return Err(GameError::InvalidPayload("roll claim out of range".into()));
+    }
+    let proof: zk::enhance::EnhanceProof = serde_json::from_value(proof.clone())
+        .map_err(|e| GameError::InvalidPayload(format!("invalid zk proof: {e}")))?;
+    zk::enhance::verify_enhance(&proof, roll_claim, zk::enhance::ZK_ENHANCE_QUERIES)
+        .map_err(|e| GameError::InvalidPayload(format!("zk proof rejected: {e}")))?;
+    let base = cfg.success_permille[current_level.min(11) as usize];
+    let bonus = ((star_stones as u16) * cfg.star_stone_bonus).min(cfg.star_stone_cap);
+    let threshold = (base + bonus).min(950);
+    let pity_guarantee = current_pity >= cfg.pity;
+    let success = pity_guarantee || roll_claim < threshold as u64;
+    let (new_level, new_pity) = if success {
+        ((current_level + 1).min(12), 0)
+    } else {
+        (current_level, current_pity + 1)
+    };
+    Ok((success, new_level, new_pity))
 }
 
 #[cfg(test)]
@@ -469,5 +558,52 @@ mod tests {
             rules_version: 2,
         };
         assert!(verify_with_config(&stale_claim, Some(&v2)).is_err());
+    }
+
+    #[test]
+    fn zk_enhance_verifies_proof_and_rejects_forgery() {
+        use zk::enhance::{enhance_roll, prove_enhance, ZK_ENHANCE_QUERIES};
+        // 客户端用秘密 seed 生成证明（seed 不上链），公开 roll_claim
+        let seed = 424242u64;
+        let roll = enhance_roll(seed).1;
+        let proof = prove_enhance(seed, roll, ZK_ENHANCE_QUERIES);
+        let proof_json = serde_json::to_value(&proof).expect("proof json");
+        let cfg = crate::game::EnhanceConfig::default();
+        // 结果派生（与 roll_with_config 公开部分一致；同时覆盖 helper）
+        let (success, new_level, new_pity) =
+            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_json, &cfg).expect("valid");
+        let op = GameOp::ZkEnhance {
+            object_id: "0xzk".into(),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            roll_claim: roll,
+            claimed_success: success,
+            claimed_new_level: new_level,
+            claimed_pity: new_pity,
+            rules_version: 1,
+            proof: proof_json.clone(),
+        };
+        assert!(verify(&op).is_ok(), "valid zk proof accepted");
+        // 伪造：roll_claim 与证明不符 → 拒
+        let mut forged_roll = op.clone();
+        if let GameOp::ZkEnhance { roll_claim, .. } = &mut forged_roll {
+            *roll_claim = (roll + 1) % 1000;
+        }
+        assert!(verify(&forged_roll).is_err(), "forged roll rejected");
+        // 伪造：声称结果与派生不符 → 拒
+        let mut forged_res = op.clone();
+        if let GameOp::ZkEnhance { claimed_success, .. } = &mut forged_res {
+            *claimed_success = !success;
+        }
+        assert!(verify(&forged_res).is_err(), "forged result rejected");
+        // 伪造：证明内容被篡改 → 拒
+        let mut forged_proof = op.clone();
+        if let GameOp::ZkEnhance { proof, .. } = &mut forged_proof {
+            if let serde_json::Value::Object(m) = proof {
+                m.insert("challenge".into(), serde_json::json!("0xdead"));
+            }
+        }
+        assert!(verify(&forged_proof).is_err(), "tampered proof rejected");
     }
 }

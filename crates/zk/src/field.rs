@@ -15,7 +15,7 @@ pub const MODULUS: u64 = 0xFFFF_FFFF_0000_0001;
 const TWO32_MINUS_1: u128 = (1u128 << 32) - 1;
 
 /// 域元素（正规表示 0..p）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Fp(pub u64);
 
 impl Fp {

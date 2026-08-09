@@ -69,7 +69,7 @@ fn bits_of(v: u64) -> [u8; 64] {
 }
 
 /// 增强 STARK 证明。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EnhanceProof {
     pub tau_fri: FriProof,
     pub quotient_fri: FriProof,
@@ -81,7 +81,9 @@ pub struct EnhanceProof {
 }
 
 pub const N_LOG2: u32 = 4; // 16 行迹
-pub const FRI_K: u32 = 5; // FRI 域 32 点（覆盖商 deg < 32）（覆盖商 deg < 16）
+pub const FRI_K: u32 = 5; // FRI 域 32 点（覆盖商 deg < 32）
+/// 共识固定的 FRI 查询数（证明方与链上验证方必须一致）。
+pub const ZK_ENHANCE_QUERIES: usize = 8;
 
 /// 由承诺（τ/Q 根 + 系数）推导挑战 χ。
 fn derive_challenge(tau_root: &[u8; 32], q_root: &[u8; 32], q_coeffs: &[Fp]) -> Fp {

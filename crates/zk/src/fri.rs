@@ -69,7 +69,7 @@ fn even_odd_split(f: &Poly) -> (Poly, Poly) {
 }
 
 /// 单点打开：值 + Merkle 认证路径。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OpenVal {
     pub index: usize,
     pub value: Fp,
@@ -77,7 +77,7 @@ pub struct OpenVal {
 }
 
 /// FRI 证明。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FriProof {
     /// 层 0..folds−1 的承诺根（末层以系数发送）。
     pub roots: Vec<[u8; 32]>,
