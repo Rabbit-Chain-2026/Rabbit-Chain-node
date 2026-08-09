@@ -89,6 +89,12 @@ pub enum GovernanceError {
     Expired,
     #[error("vote stake must be positive")]
     ZeroStake,
+    #[error("proposal is not passed (status={0:?}); only passed proposals execute")]
+    NotPassed(ProposalStatus),
+    #[error("insufficient treasury balance: {balance}, needed {needed}")]
+    InsufficientTreasury { balance: u128, needed: u128 },
+    #[error("proposal status must transition Active -> Passed/Rejected -> Executed")]
+    InvalidStatusTransition(ProposalStatus),
 }
 
 /// 创建提案（纯函数）：校验押金，计算投票截止。
@@ -156,6 +162,138 @@ pub fn tally(p: &mut Proposal, now_unix: u64) -> ProposalStatus {
     status
 }
 
+/// 国库账本事件（确定性、可审计）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LedgerEvent {
+    /// 收入：区块执行收取的非 Mint 交易 gas 费（source 区分来源，如 `block_gas_fee`）。
+    Income { source: String, amount: u64 },
+    /// 支出：提案生效后的拨款/退款（destination 为目标账户/对象）。
+    Expense { destination: String, amount: u64, memo: String },
+}
+
+/// 国库账本（纯函数）：余额 + 确定性事件流。余额与链上国库账户
+/// （`treasury_address` 的 StateDb balance）保持一致；本结构为审计视图。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TreasuryLedger {
+    balance: u128,
+    events: Vec<LedgerEvent>,
+}
+
+impl TreasuryLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn balance(&self) -> u128 {
+        self.balance
+    }
+
+    pub fn events(&self) -> &[LedgerEvent] {
+        &self.events
+    }
+
+    pub fn record_income(&mut self, source: impl Into<String>, amount: u64) {
+        self.balance = self.balance.saturating_add(amount as u128);
+        self.events.push(LedgerEvent::Income {
+            source: source.into(),
+            amount,
+        });
+    }
+
+    /// 支出：余额不足返回 Err（余额与事件流均不变）。
+    pub fn record_expense(
+        &mut self,
+        destination: impl Into<String>,
+        amount: u64,
+        memo: impl Into<String>,
+    ) -> Result<(), GovernanceError> {
+        if (amount as u128) > self.balance {
+            return Err(GovernanceError::InsufficientTreasury {
+                balance: self.balance,
+                needed: amount as u128,
+            });
+        }
+        self.balance -= amount as u128;
+        self.events.push(LedgerEvent::Expense {
+            destination: destination.into(),
+            amount,
+            memo: memo.into(),
+        });
+        Ok(())
+    }
+}
+
+/// 提案生效执行的产物（治理生效的可验证结果）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProposalOutcome {
+    ConfigUpdated {
+        object: String,
+        params: serde_json::Value,
+    },
+    ActivityFunded {
+        amount: u64,
+        destination: String,
+        memo: String,
+    },
+    ObjectFrozen {
+        object_id: String,
+        reason: String,
+    },
+    GameOpApproved {
+        op_name: String,
+        description: String,
+    },
+}
+
+/// 提案生效执行（纯函数）：仅 `Passed` 可执行；`FundActivity` 从国库扣款。
+/// 成功则把提案状态置为 `Executed` 并返回产物；失败（余额不足等）不改动任何状态。
+pub fn execute_proposal(
+    p: &mut Proposal,
+    ledger: &mut TreasuryLedger,
+) -> Result<ProposalOutcome, GovernanceError> {
+    if p.status != ProposalStatus::Passed {
+        return Err(GovernanceError::NotPassed(p.status));
+    }
+    let outcome = match &p.kind {
+        ProposalKind::FundActivity { amount, memo } => {
+            let destination = "activity".to_string();
+            ledger
+                .record_expense(destination.clone(), *amount, memo.clone())
+                .map_err(|_| GovernanceError::InsufficientTreasury {
+                    balance: ledger.balance(),
+                    needed: *amount as u128,
+                })?;
+            ProposalOutcome::ActivityFunded {
+                amount: *amount,
+                destination,
+                memo: memo.clone(),
+            }
+        }
+        ProposalKind::UpdateConfig {
+            config_object,
+            params,
+        } => ProposalOutcome::ConfigUpdated {
+            object: config_object.clone(),
+            params: params.clone(),
+        },
+        ProposalKind::Freeze { object_id, reason } => ProposalOutcome::ObjectFrozen {
+            object_id: object_id.clone(),
+            reason: reason.clone(),
+        },
+        ProposalKind::AddGameOp {
+            op_name,
+            description,
+        } => ProposalOutcome::GameOpApproved {
+            op_name: op_name.clone(),
+            description: description.clone(),
+        },
+    };
+    p.status = ProposalStatus::Executed;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +352,139 @@ mod tests {
             cast_vote(&mut q, 100, true, 10),
             Err(GovernanceError::NotActive(ProposalStatus::Passed))
         ));
+    }
+
+    fn passed_proposal(id: &str) -> Proposal {
+        let mut p = create_proposal(id, update_config_proposal(), "0xaaa", 1000, 0).unwrap();
+        cast_vote(&mut p, 500, true, 100).unwrap();
+        tally(&mut p, VOTE_WINDOW_SECS + 1);
+        assert_eq!(p.status, ProposalStatus::Passed);
+        p
+    }
+
+    #[test]
+    fn treasury_ledger_income_expense_and_insufficient() {
+        let mut l = TreasuryLedger::new();
+        l.record_income("block_gas_fee", 100);
+        l.record_income("block_gas_fee", 50);
+        assert_eq!(l.balance(), 150);
+        assert_eq!(l.events().len(), 2);
+
+        l.record_expense("activity", 60, "funding").unwrap();
+        assert_eq!(l.balance(), 90);
+        assert_eq!(l.events().len(), 3);
+
+        // 余额不足：Err 且余额/事件流不变
+        let err = l.record_expense("activity", 91, "too-much").unwrap_err();
+        assert_eq!(
+            err,
+            GovernanceError::InsufficientTreasury {
+                balance: 90,
+                needed: 91
+            }
+        );
+        assert_eq!(l.balance(), 90);
+        assert_eq!(l.events().len(), 3);
+    }
+
+    #[test]
+    fn execute_requires_passed() {
+        let mut ledger = TreasuryLedger::new();
+        ledger.record_income("block_gas_fee", 10_000);
+        let mut active = create_proposal("p1", update_config_proposal(), "0xaaa", 1000, 0).unwrap();
+        assert!(matches!(
+            execute_proposal(&mut active, &mut ledger),
+            Err(GovernanceError::NotPassed(ProposalStatus::Active))
+        ));
+        assert_eq!(active.status, ProposalStatus::Active);
+        // Rejected 同样不可执行
+        let mut rejected = create_proposal("p2", update_config_proposal(), "0xbbb", 1000, 0).unwrap();
+        rejected.status = ProposalStatus::Rejected;
+        assert!(matches!(
+            execute_proposal(&mut rejected, &mut ledger),
+            Err(GovernanceError::NotPassed(ProposalStatus::Rejected))
+        ));
+    }
+
+    #[test]
+    fn execute_fund_activity_debits_treasury() {
+        let mut ledger = TreasuryLedger::new();
+        ledger.record_income("block_gas_fee", 5_000);
+        let mut p = passed_proposal("fund-1");
+        p.kind = ProposalKind::FundActivity {
+            amount: 800,
+            memo: "season prize pool".into(),
+        };
+        let outcome = execute_proposal(&mut p, &mut ledger).unwrap();
+        assert_eq!(
+            outcome,
+            ProposalOutcome::ActivityFunded {
+                amount: 800,
+                destination: "activity".into(),
+                memo: "season prize pool".into(),
+            }
+        );
+        assert_eq!(p.status, ProposalStatus::Executed);
+        assert_eq!(ledger.balance(), 4_200);
+    }
+
+    #[test]
+    fn execute_fund_activity_insufficient_leaves_state_unchanged() {
+        let mut ledger = TreasuryLedger::new();
+        ledger.record_income("block_gas_fee", 100);
+        let mut p = passed_proposal("fund-2");
+        p.kind = ProposalKind::FundActivity {
+            amount: 10_000,
+            memo: "over budget".into(),
+        };
+        let err = execute_proposal(&mut p, &mut ledger).unwrap_err();
+        assert_eq!(
+            err,
+            GovernanceError::InsufficientTreasury {
+                balance: 100,
+                needed: 10_000
+            }
+        );
+        // 失败不改状态、不动账本
+        assert_eq!(p.status, ProposalStatus::Passed);
+        assert_eq!(ledger.balance(), 100);
+        assert_eq!(ledger.events().len(), 1);
+    }
+
+    #[test]
+    fn execute_update_config_freezes_and_approves_ops() {
+        let mut ledger = TreasuryLedger::new();
+
+        let mut cfg = passed_proposal("cfg");
+        cfg.kind = ProposalKind::UpdateConfig {
+            config_object: "0xenhance".into(),
+            params: serde_json::json!({ "success_permille": [900, 850] }),
+        };
+        assert!(matches!(
+            execute_proposal(&mut cfg, &mut ledger).unwrap(),
+            ProposalOutcome::ConfigUpdated { object, .. } if object == "0xenhance"
+        ));
+        assert_eq!(cfg.status, ProposalStatus::Executed);
+
+        let mut frz = passed_proposal("frz");
+        frz.kind = ProposalKind::Freeze {
+            object_id: "0xbad".into(),
+            reason: "exploit".into(),
+        };
+        assert!(matches!(
+            execute_proposal(&mut frz, &mut ledger).unwrap(),
+            ProposalOutcome::ObjectFrozen { object_id, .. } if object_id == "0xbad"
+        ));
+
+        let mut op = passed_proposal("op");
+        op.kind = ProposalKind::AddGameOp {
+            op_name: "claim".into(),
+            description: "activity claim".into(),
+        };
+        assert!(matches!(
+            execute_proposal(&mut op, &mut ledger).unwrap(),
+            ProposalOutcome::GameOpApproved { op_name, .. } if op_name == "claim"
+        ));
+        assert_eq!(op.status, ProposalStatus::Executed);
     }
 }

@@ -50,6 +50,10 @@ pub enum GameOp {
         stake: u64,
         approve: bool,
     },
+    /// 治理：生效执行（消费 Passed 提案对象；FundActivity 由执行器在区块执行时确定性扣国库）。
+    Execute {
+        proposal_id: String,
+    },
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
@@ -182,6 +186,14 @@ pub fn verify(op: &GameOp) -> Result<serde_json::Value, GameError> {
                 "stake": stake,
             }))
         }
+        GameOp::Execute { proposal_id } => {
+            // 结构化校验：语义（tally=Passed、窗口到期、提案对象一致性）由
+            // gate_game_tx 结合链上提案对象重算把关（见 compute_adapter）。
+            if proposal_id.trim().is_empty() {
+                return Err(GameError::InvalidPayload("proposal_id must not be empty".into()));
+            }
+            Ok(serde_json::json!({ "proposal_id": proposal_id }))
+        }
     }
 }
 
@@ -275,6 +287,51 @@ mod tests {
         assert!(matches!(
             verify(&forged),
             Err(GameError::EnhanceSuccessMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn governance_ops_verify_structurally() {
+        let propose = GameOp::Propose {
+            proposal_id: "p1".into(),
+            kind: crate::governance::ProposalKind::UpdateConfig {
+                config_object: "0xenhance".into(),
+                params: serde_json::json!({}),
+            },
+            proposer: "0xaaa".into(),
+            deposit: 1000,
+            created_at_unix: 0,
+        };
+        assert!(verify(&propose).is_ok());
+
+        let vote = GameOp::Vote {
+            proposal_id: "p1".into(),
+            voter: "0xbbb".into(),
+            stake: 500,
+            approve: true,
+        };
+        assert!(verify(&vote).is_ok());
+
+        let exec = GameOp::Execute {
+            proposal_id: "p1".into(),
+        };
+        assert!(verify(&exec).is_ok());
+
+        // 空 proposal_id 拒绝
+        assert!(matches!(
+            verify(&GameOp::Execute {
+                proposal_id: "".into()
+            }),
+            Err(GameError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            verify(&GameOp::Vote {
+                proposal_id: "p1".into(),
+                voter: "".into(),
+                stake: 100,
+                approve: false
+            }),
+            Err(GameError::InvalidPayload(_))
         ));
     }
 }

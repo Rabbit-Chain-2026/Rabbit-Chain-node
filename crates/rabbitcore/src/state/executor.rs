@@ -19,7 +19,9 @@ use crate::compute::{
     Command, ComputeTx, DomainId, InMemoryObjectStore,
 };
 use crate::crypto::{Address, Hash};
-use std::sync::Arc;
+use crate::game::GameOp;
+use crate::governance::{tally, Proposal, ProposalStatus, TreasuryLedger};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Execution errors
@@ -52,6 +54,8 @@ pub struct StateExecutor {
     domains: Arc<dyn DomainRegistry>,
     /// 国库账户地址（费用收集目标）
     treasury: Address,
+    /// 国库账本（审计视图：收入/支出事件流；余额与 StateDb 国库账户一致）
+    ledger: RwLock<TreasuryLedger>,
 }
 
 /// 默认域注册：main + 游戏域（jzz）。
@@ -99,7 +103,13 @@ impl StateExecutor {
             compute_store,
             domains,
             treasury,
+            ledger: RwLock::new(TreasuryLedger::new()),
         }
+    }
+
+    /// 国库账本快照（收入/支出事件流；余额应与 `rabbit_getAccount` 的国库账户一致）。
+    pub fn treasury_ledger(&self) -> TreasuryLedger {
+        self.ledger.read().expect("treasury ledger lock").clone()
     }
 
     /// 构造共享存储/域的执行器（BlockTime 产块方与区块校验共用同一后端）。
@@ -141,7 +151,8 @@ impl StateExecutor {
             self.domains.clone(),
         );
         let base_fee = block.header.base_fee_per_gas.as_u64();
-        let (computed, _) = self.execute_txs(&body.transactions, base_fee, &executor)?;
+        let block_timestamp = block.header.timestamp;
+        let (computed, _) = self.execute_txs(&body.transactions, base_fee, block_timestamp, &executor)?;
 
         for ((tx, computed_receipt), declared_receipt) in body
             .transactions
@@ -164,15 +175,33 @@ impl StateExecutor {
     }
 
     /// 执行一组计算交易并返回 receipts（不校验声明；产块方用）。费用收取同步进行。
+    /// `block_timestamp` 用于治理生效的确定性判定（FundActivity 窗口/通过检查）。
     pub fn execute_txs(
         &self,
         txs: &[ComputeTx],
         base_fee: u64,
+        block_timestamp: u64,
         executor: &BasicTxExecutor<Arc<dyn ObjectStore>, DefaultAuthorizationPolicy, NoopResourcePolicy, Arc<dyn DomainRegistry>>,
     ) -> Result<(Vec<Receipt>, u64)> {
         let mut receipts = Vec::with_capacity(txs.len());
         let mut total_gas = 0u64;
         for tx in txs {
+            // 治理效果预检（确定性，失败不产生任何对象/账户变更）：
+            // 仅 GAME_DOMAIN Execute（FundActivity）在产块时扣国库。
+            let governance_result = self.apply_governance_effects(tx, block_timestamp);
+            if let Err(e) = governance_result {
+                receipts.push(Receipt {
+                    tx_id: tx.tx_id,
+                    block_hash: Hash::zero(),
+                    status: ReceiptStatus::Failed,
+                    gas_used: 0,
+                    compute_units: 0,
+                    output_refs: vec![],
+                    logs: vec![],
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
             match executor.execute(tx) {
                 Ok(_) => {
                     let gas_used = crate::compute::estimate_tx_gas(tx);
@@ -183,6 +212,20 @@ impl StateExecutor {
                         if fee > 0 {
                             self.credit_treasury(fee);
                         }
+                    }
+                    // 治理效果提交：FundActivity 已通过预检，这里真正扣款。
+                    if let Err(e) = self.commit_governance_effects(tx) {
+                        receipts.push(Receipt {
+                            tx_id: tx.tx_id,
+                            block_hash: Hash::zero(),
+                            status: ReceiptStatus::Failed,
+                            gas_used: 0,
+                            compute_units: 0,
+                            output_refs: vec![],
+                            logs: vec![],
+                            error: Some(e.to_string()),
+                        });
+                        continue;
                     }
                     receipts.push(Receipt {
                         tx_id: tx.tx_id,
@@ -212,6 +255,83 @@ impl StateExecutor {
         Ok((receipts, total_gas))
     }
 
+    /// 治理效果预检（产块/校验两阶段一致）：GAME_DOMAIN `Invoke` Execute 交易，
+    /// 输入提案对象必须 tally = Passed（窗口已过且赞成 ≥50%）；FundActivity 需国库余额充足。
+    fn apply_governance_effects(&self, tx: &ComputeTx, block_timestamp: u64) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        // 非 GameOp 负载（或无效负载）不是治理交易，放行由常规执行路径处理。
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::Execute { .. } = op else {
+            return Ok(());
+        };
+        let proposal = self.input_proposal(tx)?;
+        // 确定性重算 tally（块时间驱动，跨节点一致）。
+        let mut p = proposal.clone();
+        if tally(&mut p, block_timestamp) != ProposalStatus::Passed {
+            return Err(ExecutionError::Block(
+                "governance execute rejected: proposal is not passed at block time".to_string(),
+            ));
+        }
+        if let crate::governance::ProposalKind::FundActivity { amount, .. } = &p.kind {
+            let balance = self.treasury_balance();
+            if balance < *amount as u128 {
+                return Err(ExecutionError::Block(format!(
+                    "governance execute rejected: insufficient treasury balance {} needed {}",
+                    balance, amount
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 治理效果提交：FundActivity 真正从国库账户扣款并记入账本（预检已通过）。
+    fn commit_governance_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        // 非 GameOp 负载（或无效负载）不是治理交易，放行由常规执行路径处理。
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::Execute { .. } = op else {
+            return Ok(());
+        };
+        let proposal = self.input_proposal(tx)?;
+        if let crate::governance::ProposalKind::FundActivity { amount, memo } = &proposal.kind {
+            self.debit_treasury(*amount)?;
+            self.ledger
+                .write()
+                .expect("treasury ledger lock")
+                .record_expense("activity", *amount, memo.clone())
+                .expect("prechecked treasury balance");
+        }
+        Ok(())
+    }
+
+    /// 读取交易输入集中的提案对象（GAME_DOMAIN Execute 的 input_set[0]）。
+    fn input_proposal(&self, tx: &ComputeTx) -> Result<Proposal> {
+        let input = tx.input_set.first().ok_or_else(|| {
+            ExecutionError::Block("governance execute tx missing input proposal".to_string())
+        })?;
+        let obj = self.compute_store.get_output(*input).ok_or_else(|| {
+            ExecutionError::Block("governance execute input proposal not found".to_string())
+        })?;
+        serde_json::from_slice(&obj.state)
+            .map_err(|e| ExecutionError::Block(format!("invalid proposal object state: {e}")))
+    }
+
+    /// 国库账户当前余额。
+    fn treasury_balance(&self) -> u128 {
+        self.state_db
+            .get_account(&self.treasury)
+            .map(|a| a.balance.as_u128())
+            .unwrap_or(0)
+    }
+
     /// 校验单笔 receipt 与重算一致（共识结算：任何节点重跑一致）。
     fn validate_receipt(&self, tx: &ComputeTx, computed: &Receipt, declared: &Receipt) -> Result<()> {
         if computed.status != declared.status
@@ -229,11 +349,29 @@ impl StateExecutor {
         Ok(())
     }
 
-    /// 费用入国库账户（确定性，跨节点一致）。
+    /// 费用入国库账户（确定性，跨节点一致），并同步记入国库账本（审计视图）。
     fn credit_treasury(&self, fee: u64) {
         let mut account = self.state_db.get_account(&self.treasury).unwrap_or_default();
         account.balance = account.balance.saturating_add(U256::from(fee));
         self.state_db.insert_account(self.treasury, account);
+        self.ledger
+            .write()
+            .expect("treasury ledger lock")
+            .record_income("block_gas_fee", fee);
+    }
+
+    /// 从国库账户扣款（FundActivity 生效执行；确定性，跨节点一致）。
+    fn debit_treasury(&self, amount: u64) -> Result<()> {
+        let mut account = self.state_db.get_account(&self.treasury).unwrap_or_default();
+        if account.balance < U256::from(amount) {
+            return Err(ExecutionError::Block(format!(
+                "insufficient treasury balance {} needed {}",
+                account.balance, amount
+            )));
+        }
+        account.balance = account.balance.saturating_sub(U256::from(amount));
+        self.state_db.insert_account(self.treasury, account);
+        Ok(())
     }
 }
 
@@ -498,5 +636,213 @@ mod tests {
         }];
         let block = build_block(vec![tx], receipts);
         executor.execute_block(&block, Hash::zero()).expect("failure receipt matches");
+    }
+
+    // ── 治理生效（FundActivity 扣国库）──────────────────────────────
+
+    fn governance_invoke(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        object_id: ObjectId,
+        version: u64,
+        predecessor: Option<OutputId>,
+        nonce: u64,
+        payload: Vec<u8>,
+        state: Vec<u8>,
+    ) -> ComputeTx {
+        let tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: predecessor.iter().copied().collect(),
+            read_set: vec![],
+            output_proposals: vec![proposal(
+                authority,
+                object_id,
+                version,
+                predecessor,
+                state,
+            )],
+            fee: 0,
+            nonce: Some(nonce),
+            metadata: vec![],
+            payload,
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000_000,
+            priority_fee: 0,
+            gas_limit: 1_000_000,
+        };
+        sign(tx, key)
+    }
+
+    fn governance_mint_proposal(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        object_id: ObjectId,
+        p: &Proposal,
+    ) -> ComputeTx {
+        let tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![proposal(
+                authority,
+                object_id,
+                1,
+                None,
+                serde_json::to_vec(p).expect("proposal json"),
+            )],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            // Mint 策略禁止携带任何费用（fee/max_fee/priority_fee 全 0）
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        sign(tx, key)
+    }
+
+    /// 构造 [mint 提案, vote 500, execute FundActivity] 三条治理交易。
+    fn governance_trip(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        id: &str,
+        amount: u64,
+    ) -> (Vec<ComputeTx>, ObjectId) {
+        let object_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+            format!("jzz/proposal/{id}").as_bytes(),
+        )));
+        let p = crate::governance::create_proposal(
+            id,
+            crate::governance::ProposalKind::FundActivity {
+                amount,
+                memo: "season prize".into(),
+            },
+            "0xaaa",
+            1000,
+            0,
+        )
+        .expect("proposal");
+        let mint = governance_mint_proposal(authority, key, object_id, &p);
+        let v1 = mint.output_proposals[0].output_id;
+
+        let mut v2 = p.clone();
+        v2.votes_for = 500;
+        let vote = governance_invoke(
+            authority,
+            key,
+            object_id,
+            2,
+            Some(v1),
+            2,
+            serde_json::to_vec(&GameOp::Vote {
+                proposal_id: id.into(),
+                voter: "0xbbb".into(),
+                stake: 500,
+                approve: true,
+            })
+            .expect("vote op"),
+            serde_json::to_vec(&v2).expect("proposal json"),
+        );
+        let v2_out = vote.output_proposals[0].output_id;
+
+        let mut v3 = v2.clone();
+        v3.status = ProposalStatus::Executed;
+        let execute = governance_invoke(
+            authority,
+            key,
+            object_id,
+            3,
+            Some(v2_out),
+            3,
+            serde_json::to_vec(&GameOp::Execute {
+                proposal_id: id.into(),
+            })
+            .expect("execute op"),
+            serde_json::to_vec(&v3).expect("proposal json"),
+        );
+        (vec![mint, vote, execute], object_id)
+    }
+
+    #[test]
+    fn fund_activity_executes_and_debits_treasury() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+
+        let (txs, _object_id) = governance_trip(&authority, &key, "fund-ok", 50);
+        let basic = executor.new_basic_executor();
+        let (receipts, _gas) = executor
+            .execute_txs(&txs, 1, 1_700_000_000, &basic)
+            .expect("execute governance trip");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success); // mint
+        assert_eq!(receipts[1].status, ReceiptStatus::Success); // vote（产生费用进国库）
+        assert_eq!(receipts[2].status, ReceiptStatus::Success); // execute（扣款 50）
+
+        // 国库账户被扣 50：账本余额 == 账户余额（不变量）
+        let account = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        let ledger = executor.treasury_ledger();
+        assert_eq!(ledger.balance(), account as u128, "ledger/account invariant");
+        assert!(
+            ledger
+                .events()
+                .iter()
+                .any(|e| matches!(e, crate::governance::LedgerEvent::Expense { amount: 50, .. })),
+            "expense event recorded"
+        );
+        assert!(
+            ledger
+                .events()
+                .iter()
+                .any(|e| matches!(e, crate::governance::LedgerEvent::Income { .. })),
+            "income events recorded"
+        );
+    }
+
+    #[test]
+    fn fund_activity_insufficient_treasury_fails_without_state_change() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+
+        let (txs, _object_id) = governance_trip(&authority, &key, "fund-fail", 10_000_000_000u64);
+        let basic = executor.new_basic_executor();
+        let (receipts, _gas) = executor
+            .execute_txs(&txs, 1, 1_700_000_000, &basic)
+            .expect("execute governance trip");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success);
+        assert_eq!(receipts[1].status, ReceiptStatus::Success);
+        // execute 预检失败：余额不足 → Failed，且无支出事件
+        assert_eq!(receipts[2].status, ReceiptStatus::Failed);
+        assert!(
+            receipts[2]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("insufficient treasury"),
+            "{:?}",
+            receipts[2].error
+        );
+        let ledger = executor.treasury_ledger();
+        let account = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(ledger.balance(), account as u128, "ledger/account invariant");
+        assert!(
+            !ledger
+                .events()
+                .iter()
+                .any(|e| matches!(e, crate::governance::LedgerEvent::Expense { .. })),
+            "no expense on failed execute"
+        );
     }
 }

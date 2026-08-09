@@ -132,6 +132,7 @@ async fn compute_submit_result_output_smoke() {
         .execute_txs(
             std::slice::from_ref(&tx),
             rabbitcore::compute::INITIAL_BASE_FEE,
+            1_700_000_000,
             &executor,
         )
         .expect("block-time execute");

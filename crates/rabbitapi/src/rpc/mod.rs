@@ -1031,8 +1031,12 @@ impl RpcApi {
         }
 
         // BlockTime：提交只入队（真实执行在区块打包时，见 rabbit_submit_work）。
-        // 提交时轻量预检：游戏域门禁（GAME_DOMAIN Invoke 负载语义重算验证）。
-        crate::rpc::compute_adapter::gate_game_tx(&tx)?;
+        // 提交时轻量预检：游戏域门禁（GAME_DOMAIN 负载语义重算验证，含治理提案生命周期）。
+        crate::rpc::compute_adapter::gate_game_tx(
+            &tx,
+            self.compute_store.as_ref(),
+            current_unix_secs(),
+        )?;
 
         let seq = self
             .pending_seq
@@ -1792,7 +1796,12 @@ impl RpcApi {
             let block_base_fee = parent_base_fee.max(rabbitcore::compute::INITIAL_BASE_FEE);
             let (mut receipts, total_gas) = self
                 .state_executor
-                .execute_txs(&packed_txs, block_base_fee, &self.state_executor.new_basic_executor())
+                .execute_txs(
+                    &packed_txs,
+                    block_base_fee,
+                    timestamp,
+                    &self.state_executor.new_basic_executor(),
+                )
                 .map_err(|e| {
                     RpcErrorObject::internal_error(format!("block-time execution failed: {e}"))
                 })?;
@@ -6308,6 +6317,7 @@ mod tests {
             .execute_txs(
                 std::slice::from_ref(&parsed_tx),
                 rabbitcore::compute::INITIAL_BASE_FEE,
+                1_700_000_000,
                 &executor,
             )
             .expect("block-time execute");
@@ -6721,6 +6731,7 @@ mod tests {
             .execute_txs(
                 std::slice::from_ref(&parsed_tx),
                 rabbitcore::compute::INITIAL_BASE_FEE,
+                1_700_000_000,
                 &executor,
             )
             .expect("block-time execute");
