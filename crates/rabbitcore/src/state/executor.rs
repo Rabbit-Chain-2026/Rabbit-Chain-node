@@ -213,8 +213,8 @@ impl StateExecutor {
                             self.credit_treasury(fee);
                         }
                     }
-                    // 治理效果提交：FundActivity 已通过预检，这里真正扣款。
-                    if let Err(e) = self.commit_governance_effects(tx) {
+                    // 治理效果提交：已通过预检，这里真正生效（扣款/记账/记录产物）。
+                    if let Err(e) = self.commit_governance_effects(tx, block_timestamp) {
                         receipts.push(Receipt {
                             tx_id: tx.tx_id,
                             block_hash: Hash::zero(),
@@ -289,7 +289,7 @@ impl StateExecutor {
     }
 
     /// 治理效果提交：FundActivity 真正从国库账户扣款并记入账本（预检已通过）。
-    fn commit_governance_effects(&self, tx: &ComputeTx) -> Result<()> {
+    fn commit_governance_effects(&self, tx: &ComputeTx, block_timestamp: u64) -> Result<()> {
         if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
             return Ok(());
         }
@@ -300,15 +300,26 @@ impl StateExecutor {
         let GameOp::Execute { .. } = op else {
             return Ok(());
         };
-        let proposal = self.input_proposal(tx)?;
-        if let crate::governance::ProposalKind::FundActivity { amount, memo } = &proposal.kind {
-            self.debit_treasury(*amount)?;
-            self.ledger
-                .write()
-                .expect("treasury ledger lock")
-                .record_expense("activity", *amount, memo.clone())
-                .expect("prechecked treasury balance");
+        let mut proposal = self.input_proposal(tx)?;
+        // 链上提案对象 status 恒为 Active，Passed 是块时间派生的判定；
+        // 与预检一致先 tally（Active -> Passed），再交给 execute_proposal 生效。
+        if tally(&mut proposal, block_timestamp) != ProposalStatus::Passed {
+            return Err(ExecutionError::Block(
+                "governance execute commit: proposal not passed at block time".to_string(),
+            ));
         }
+        // 1) FundActivity：先从国库账户扣款（StateDb；预检已保证余额充足）。
+        if let crate::governance::ProposalKind::FundActivity { amount, .. } = &proposal.kind {
+            self.debit_treasury(*amount)?;
+        }
+        // 2) 账本：应用完整治理效果（FundActivity 记支出；全部类型记生效产物），
+        //    与 execute_proposal 同一纯函数，确定性跨节点一致。
+        let mut ledger = self.ledger.write().expect("treasury ledger lock");
+        let outcome = crate::governance::execute_proposal(&mut proposal, &mut ledger)
+            .map_err(|e| {
+                ExecutionError::Block(format!("governance execute commit failed: {e}"))
+            })?;
+        ledger.record_execution(outcome);
         Ok(())
     }
 
@@ -807,6 +818,100 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, crate::governance::LedgerEvent::Income { .. })),
             "income events recorded"
+        );
+        // 生效产物被记录（FundActivity）
+        assert_eq!(
+            ledger.executions(),
+            &[crate::governance::ProposalOutcome::ActivityFunded {
+                amount: 50,
+                destination: "activity".into(),
+                memo: "season prize".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn update_config_execute_records_outcome_without_treasury_change() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+
+        // 构造 UpdateConfig 提案的 [mint, vote, execute]
+        let id = "cfg-ok";
+        let object_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+            format!("jzz/proposal/{id}").as_bytes(),
+        )));
+        let p = crate::governance::create_proposal(
+            id,
+            crate::governance::ProposalKind::UpdateConfig {
+                config_object: "0xenhance".into(),
+                params: serde_json::json!({ "success_permille": [900, 850] }),
+            },
+            "0xaaa",
+            1000,
+            0,
+        )
+        .expect("proposal");
+        let mint = governance_mint_proposal(&authority, &key, object_id, &p);
+        let v1 = mint.output_proposals[0].output_id;
+        let mut v2 = p.clone();
+        v2.votes_for = 500;
+        let vote = governance_invoke(
+            &authority,
+            &key,
+            object_id,
+            2,
+            Some(v1),
+            2,
+            serde_json::to_vec(&GameOp::Vote {
+                proposal_id: id.into(),
+                voter: "0xbbb".into(),
+                stake: 500,
+                approve: true,
+            })
+            .expect("vote op"),
+            serde_json::to_vec(&v2).expect("proposal json"),
+        );
+        let v2_out = vote.output_proposals[0].output_id;
+        let mut v3 = v2.clone();
+        v3.status = ProposalStatus::Executed;
+        let execute = governance_invoke(
+            &authority,
+            &key,
+            object_id,
+            3,
+            Some(v2_out),
+            3,
+            serde_json::to_vec(&GameOp::Execute {
+                proposal_id: id.into(),
+            })
+            .expect("execute op"),
+            serde_json::to_vec(&v3).expect("proposal json"),
+        );
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _gas) = executor
+            .execute_txs(&[mint, vote, execute], 1, 1_700_000_000, &basic)
+            .expect("execute config trip");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success);
+        assert_eq!(receipts[1].status, ReceiptStatus::Success);
+        assert_eq!(receipts[2].status, ReceiptStatus::Success);
+
+        // 无支出事件（UpdateConfig 不动国库），但生效产物被记录
+        let ledger = executor.treasury_ledger();
+        assert!(
+            !ledger
+                .events()
+                .iter()
+                .any(|e| matches!(e, crate::governance::LedgerEvent::Expense { .. })),
+            "no expense for UpdateConfig"
+        );
+        assert_eq!(
+            ledger.executions(),
+            &[crate::governance::ProposalOutcome::ConfigUpdated {
+                object: "0xenhance".into(),
+                params: serde_json::json!({ "success_permille": [900, 850] }),
+            }]
         );
     }
 

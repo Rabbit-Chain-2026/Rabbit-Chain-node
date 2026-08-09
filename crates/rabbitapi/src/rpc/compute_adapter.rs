@@ -14,7 +14,7 @@ use rabbitcore::compute::{
 use rabbitcore::game::GameOp;
 use serde_json::Value;
 
-use super::{compute_error_to_json, current_unix_secs, RpcConfig, RpcErrorObject};
+use super::{compute_error_to_json, current_unix_secs, RpcConfig, RpcErrorObject, VirtualClock};
 
 /// 游戏域（GAME_DOMAIN）`Invoke` 结算门禁：用 shanhai-core 规则重算负载中的声明结果，
 /// 不一致即拒绝。客户端/服务器只能"提议"结算，结果由确定性规则裁决（防伪造战报）。
@@ -228,6 +228,8 @@ pub struct RpcComputeAdapter {
     authorization: Arc<dyn AuthorizationPolicy>,
     resources: Arc<dyn ResourcePolicy>,
     domains: Arc<dyn DomainRegistry>,
+    /// 虚拟时钟（与 RpcApi 共享；testkit 时间跳跃）
+    virtual_clock: Arc<VirtualClock>,
 }
 
 impl RpcComputeAdapter {
@@ -283,7 +285,14 @@ impl RpcComputeAdapter {
             authorization,
             resources,
             domains,
+            virtual_clock: Arc::new(VirtualClock::new()),
         }
+    }
+
+    /// 关联共享虚拟时钟（RpcApi 构造时注入；testkit 时间跳跃）。
+    pub fn with_virtual_clock(mut self, clock: Arc<VirtualClock>) -> Self {
+        self.virtual_clock = clock;
+        self
     }
 
     /// Returns the underlying execution service for background orchestration.
@@ -293,7 +302,7 @@ impl RpcComputeAdapter {
 
     /// Simulates a tx without mutating state.
     pub fn simulate_compute_tx(&self, tx: ComputeTx) -> Result<Value, RpcErrorObject> {
-        gate_game_tx(&tx, self.store.as_ref(), current_unix_secs())?;
+        gate_game_tx(&tx, self.store.as_ref(), self.virtual_clock.now())?;
         let validator = BasicTxValidator {
             store: &self.store,
             authorization: &self.authorization,
@@ -318,7 +327,7 @@ impl RpcComputeAdapter {
 
     /// Submits a tx and waits for the current batch window to flush.
     pub async fn submit_compute_tx(&self, tx: ComputeTx) -> Result<Value, RpcErrorObject> {
-        gate_game_tx(&tx, self.store.as_ref(), current_unix_secs())?;
+        gate_game_tx(&tx, self.store.as_ref(), self.virtual_clock.now())?;
         let outcome = self
             .service
             .submit_and_run(tx.clone())

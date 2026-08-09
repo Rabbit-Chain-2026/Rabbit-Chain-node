@@ -28,6 +28,8 @@ pub struct RunNodeConfig {
     pub mine: bool,
     pub enable_mining_rpc: bool,
     pub disable_local_miner: bool,
+    #[cfg(feature = "testkit")]
+    pub enable_time_travel: bool,
     pub coinbase: Option<String>,
     pub coinbase_count: usize,
     pub http_port: u16,
@@ -81,6 +83,8 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         mine,
         enable_mining_rpc,
         disable_local_miner,
+        #[cfg(feature = "testkit")]
+        enable_time_travel,
         coinbase,
         coinbase_count,
         http_port,
@@ -114,6 +118,10 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
     println!("   HTTP RPC port: {}", http_port);
     println!("   WebSocket port: {}", ws_port);
     let mining_rpc_enabled = mine || enable_mining_rpc;
+    #[cfg(feature = "testkit")]
+    if enable_time_travel {
+        println!("   🧪 testkit: virtual clock enabled (rabbit_increaseTime)");
+    }
     println!(
         "   Mining RPC: {}",
         if mining_rpc_enabled {

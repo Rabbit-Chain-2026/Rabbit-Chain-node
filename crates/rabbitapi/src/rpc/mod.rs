@@ -1,6 +1,8 @@
 //! JSON-RPC Server Implementation
 
 mod compute_adapter;
+pub(crate) mod time;
+pub use time::VirtualClock;
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
@@ -215,6 +217,10 @@ pub struct RpcConfig {
     /// that submit fee-less txs must set this to `false` (the default).
     #[serde(default)]
     pub require_fee_for_compute_tx: bool,
+    /// 测试框架开关：开启后 `rabbit_increaseTime` 可用（虚拟时钟时间跳跃）。
+    /// 仅随 `testkit` feature 编译的构建生效；生产构建无此方法。
+    #[serde(default)]
+    pub enable_time_travel: bool,
 }
 
 /// Persistent backend for compute storage.
@@ -266,6 +272,7 @@ impl Default for RpcConfig {
             auth_token: None,
             rate_limit_per_minute: 600,
             require_fee_for_compute_tx: false,
+            enable_time_travel: false,
         }
     }
 }
@@ -494,6 +501,8 @@ pub struct RpcApi {
     current_base_fee: RwLock<u64>,
     /// BlockTime 状态执行器（产块时执行打包交易 → 真 receipts + 国库）
     state_executor: Arc<StateExecutor>,
+    /// 虚拟时钟（testkit 测试框架；offset=0 时即真实时间）
+    virtual_clock: Arc<VirtualClock>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -555,11 +564,11 @@ impl RpcApi {
             vm: "shanhai".to_string(),
             public: true,
         });
-        let compute_adapter = Arc::new(RpcComputeAdapter::new_with_config(
-            compute_store.clone(),
-            domain_registry.clone(),
-            &config,
-        ));
+        let virtual_clock = Arc::new(VirtualClock::new());
+        let compute_adapter = Arc::new(
+            RpcComputeAdapter::new_with_config(compute_store.clone(), domain_registry.clone(), &config)
+                .with_virtual_clock(virtual_clock.clone()),
+        );
 
         let state_executor = Arc::new(StateExecutor::new_with_compute(
             state_db.clone(),
@@ -591,6 +600,7 @@ impl RpcApi {
             pending_seq: AtomicUsize::new(0),
             current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
             state_executor,
+            virtual_clock,
         }
     }
 
@@ -602,11 +612,11 @@ impl RpcApi {
         domain_registry: Arc<InMemoryDomainRegistry>,
     ) -> Self {
         configure_global_block_activation_height(config.canonical_block_activation_height);
-        let compute_adapter = Arc::new(RpcComputeAdapter::new_with_config(
-            compute_store.clone(),
-            domain_registry.clone(),
-            &config,
-        ));
+        let virtual_clock = Arc::new(VirtualClock::new());
+        let compute_adapter = Arc::new(
+            RpcComputeAdapter::new_with_config(compute_store.clone(), domain_registry.clone(), &config)
+                .with_virtual_clock(virtual_clock.clone()),
+        );
         let state_executor = Arc::new(StateExecutor::new_with_compute(
             state_db.clone(),
             config.chain_id,
@@ -636,6 +646,7 @@ impl RpcApi {
             pending_seq: AtomicUsize::new(0),
             current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
             state_executor,
+            virtual_clock,
         }
     }
 
@@ -648,11 +659,11 @@ impl RpcApi {
     ) -> Self {
         configure_global_block_activation_height(config.canonical_block_activation_height);
         let compute_store_dyn: Arc<dyn ObjectStore> = compute_store.clone();
-        let compute_adapter = Arc::new(RpcComputeAdapter::new_with_config(
-            compute_store_dyn.clone(),
-            domain_registry.clone(),
-            &config,
-        ));
+        let virtual_clock = Arc::new(VirtualClock::new());
+        let compute_adapter = Arc::new(
+            RpcComputeAdapter::new_with_config(compute_store_dyn.clone(), domain_registry.clone(), &config)
+                .with_virtual_clock(virtual_clock.clone()),
+        );
         let state_executor = Arc::new(StateExecutor::new_with_compute(
             state_db.clone(),
             config.chain_id,
@@ -682,6 +693,7 @@ impl RpcApi {
             pending_seq: AtomicUsize::new(0),
             current_base_fee: RwLock::new(rabbitcore::compute::INITIAL_BASE_FEE),
             state_executor,
+            virtual_clock,
         }
     }
 
@@ -772,6 +784,9 @@ impl RpcApi {
             "rabbit_importBlock" => self.rabbit_import_block(params),
             "rabbit_getMetrics" => self.rabbit_get_metrics(params),
             "rabbit_peers" => self.rabbit_peers(params),
+            "rabbit_getTreasury" => self.rabbit_get_treasury(params),
+            #[cfg(feature = "testkit")]
+            "rabbit_increaseTime" => self.rabbit_increase_time(params),
 
             _ => Err(RpcErrorObject::method_not_found(method)),
         }
@@ -1035,7 +1050,7 @@ impl RpcApi {
         crate::rpc::compute_adapter::gate_game_tx(
             &tx,
             self.compute_store.as_ref(),
-            current_unix_secs(),
+            self.virtual_clock.now(),
         )?;
 
         let seq = self
@@ -1461,7 +1476,8 @@ impl RpcApi {
         }
         let req = parse_get_work_request(params)?;
         let latest = self.wait_for_work_change(&req).await?;
-        let now = current_unix_secs();
+        // testkit 时间跳跃：虚拟时钟叠加在真实墙钟上（offset=0 时即真实时间）
+        let now = self.virtual_clock.now();
         let target = mining_target_for_difficulty(
             latest.header.difficulty,
             self.config.mining_work_target_leading_rabbit_bytes,
@@ -1945,6 +1961,52 @@ impl RpcApi {
             .collect::<Vec<_>>();
 
         Ok(serde_json::json!(peers))
+    }
+
+    /// 国库信息：地址 + 账户余额 + 治理账本（收入/支出事件流）。
+    fn rabbit_get_treasury(
+        &self,
+        _params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let treasury = rabbitcore::governance::treasury_address();
+        let account = self.state_db.get_account(&treasury).unwrap_or_default();
+        let ledger = self.state_executor.treasury_ledger();
+        Ok(serde_json::json!({
+            "address": format!("0x{}", hex::encode(treasury.as_bytes())),
+            "balance": format!("0x{:x}", account.balance.as_u128()),
+            "ledger": {
+                "balance": ledger.balance(),
+                "events": ledger.events(),
+                "executions": ledger.executions(),
+            },
+        }))
+    }
+
+    /// 虚拟时钟推进（testkit 测试框架；anvil `evm_increaseTime` 的对应物）。
+    /// 仅 `enable_time_travel` 配置开启时可用；推进后影响 `rabbit_getWork` 的时间戳
+    /// 与治理计票（`gate_game_tx`）的时间判定，使 72h 投票窗口可在 e2e 中即时越过。
+    #[cfg(feature = "testkit")]
+    fn rabbit_increase_time(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        if !self.config.enable_time_travel {
+            return Err(RpcErrorObject::invalid_params(
+                "time travel disabled; start node with --enable-time-travel".to_string(),
+            ));
+        }
+        let params =
+            params.ok_or_else(|| RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let secs = params
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| RpcErrorObject::invalid_params("expected seconds (u64)".to_string()))?;
+        let now = self.virtual_clock.increase(secs);
+        Ok(serde_json::json!({
+            "increased_by": secs,
+            "virtual_now": now,
+            "offset_secs": self.virtual_clock.offset_secs(),
+        }))
     }
 
     fn rabbit_get_latest_block(
@@ -6801,6 +6863,80 @@ mod tests {
             ..RpcConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+
+    #[test]
+    fn test_rabbit_get_treasury_reports_ledger() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let store = Arc::new(InMemoryObjectStore::new());
+        let domains = Arc::new(InMemoryDomainRegistry::new());
+        domains.upsert_domain(DomainConfig {
+            domain_id: DomainId(0),
+            name: "main".to_string(),
+            vm: "wasm".to_string(),
+            public: true,
+        });
+        let api = RpcApi::with_compute(RpcConfig::default(), state_db, store, domains);
+
+        // 无任何交易：国库余额 0，账本空
+        let out = api.rabbit_get_treasury(None).expect("treasury query");
+        assert_eq!(out["balance"], "0x0");
+        assert_eq!(out["ledger"]["balance"], 0u64);
+        assert_eq!(out["ledger"]["events"].as_array().map(|a| a.len()).unwrap_or(0), 0);
+        assert!(out["address"].as_str().unwrap_or("").starts_with("0x"));
+    }
+
+    #[cfg(feature = "testkit")]
+    #[test]
+    fn test_rabbit_increase_time_requires_enabled_config() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let store = Arc::new(InMemoryObjectStore::new());
+        let domains = Arc::new(InMemoryDomainRegistry::new());
+        domains.upsert_domain(DomainConfig {
+            domain_id: DomainId(0),
+            name: "main".to_string(),
+            vm: "wasm".to_string(),
+            public: true,
+        });
+        // 未开启 time travel → 拒绝
+        let api = RpcApi::with_compute(RpcConfig::default(), state_db, store, domains);
+        let err = api
+            .rabbit_increase_time(Some(vec![serde_json::json!(3600u64)]))
+            .expect_err("time travel disabled");
+        assert!(err.data.as_ref().and_then(|v| v.as_str()).unwrap_or("").contains("disabled"));
+
+        // 开启后：推进虚拟时钟，且 getWork 的时间戳随之前进
+        let state_db2 = Arc::new(StateDb::new(Hash::zero()));
+        let store2 = Arc::new(InMemoryObjectStore::new());
+        let domains2 = Arc::new(InMemoryDomainRegistry::new());
+        domains2.upsert_domain(DomainConfig {
+            domain_id: DomainId(0),
+            name: "main".to_string(),
+            vm: "wasm".to_string(),
+            public: true,
+        });
+        let mut config = RpcConfig::default();
+        config.mining_enabled = true;
+        config.enable_time_travel = true;
+        let api2 = RpcApi::with_compute(config, state_db2, store2, domains2);
+        let genesis = Block::new(legacy_rpc_test_root());
+        rabbitnet::global_store_block(genesis.clone()).expect("store genesis");
+        *api2.latest_block.write() = Some(genesis);
+
+        let out = api2
+            .rabbit_increase_time(Some(vec![serde_json::json!(73 * 3600u64)]))
+            .expect("increase time");
+        assert_eq!(out["increased_by"], 73 * 3600u64);
+        let virtual_now = out["virtual_now"].as_u64().expect("virtual now");
+        assert!(virtual_now >= VirtualClock::real_now() + 72 * 3600);
+
+        let work = futures::executor::block_on(api2.rabbit_get_work(None)).expect("get work");
+        let work_ts = work["timestamp"].as_u64().expect("work timestamp");
+        assert!(
+            work_ts >= VirtualClock::real_now() + 72 * 3600,
+            "mined block timestamp must follow the virtual clock, got {work_ts}"
+        );
     }
 
     #[test]

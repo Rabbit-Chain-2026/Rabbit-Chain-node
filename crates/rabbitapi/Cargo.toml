@@ -6,6 +6,12 @@ authors.workspace = true
 license.workspace = true
 description = "RabbitChain API services - JSON-RPC, REST, WebSocket"
 
+[features]
+# testkit：治理等需要时间跳跃的 e2e 测试框架（生产构建不启用）
+testkit = []
+
+default = []
+
 [dependencies]
 rabbitcore.workspace = true
 rabbitnet.workspace = true

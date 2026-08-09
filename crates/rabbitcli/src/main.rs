@@ -73,6 +73,11 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         disable_local_miner: bool,
 
+        /// Enable the testkit virtual clock (rabbit_increaseTime); test framework only
+        #[cfg(feature = "testkit")]
+        #[arg(long, default_value_t = false)]
+        enable_time_travel: bool,
+
         /// Coinbase address
         #[arg(long)]
         coinbase: Option<String>,
@@ -510,6 +515,8 @@ async fn main() -> Result<()> {
             mine,
             enable_mining_rpc,
             disable_local_miner,
+            #[cfg(feature = "testkit")]
+            enable_time_travel,
             coinbase,
             coinbase_file,
             http_port,
@@ -585,6 +592,8 @@ async fn main() -> Result<()> {
                 coinbase: rpc_coinbase,
                 coinbase_addresses,
                 mining_enabled: mine || enable_mining_rpc,
+                #[cfg(feature = "testkit")]
+                enable_time_travel,
                 auth_token: rpc_auth_token,
                 rate_limit_per_minute: rpc_rate_limit_per_minute,
                 mining_work_target_leading_rabbit_bytes,
@@ -664,6 +673,8 @@ async fn main() -> Result<()> {
                 mine,
                 enable_mining_rpc,
                 disable_local_miner,
+                #[cfg(feature = "testkit")]
+                enable_time_travel,
                 coinbase,
                 coinbase_count: api_config.http_rpc.coinbase_addresses.len(),
                 http_port,

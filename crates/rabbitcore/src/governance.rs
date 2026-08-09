@@ -172,12 +172,13 @@ pub enum LedgerEvent {
     Expense { destination: String, amount: u64, memo: String },
 }
 
-/// 国库账本（纯函数）：余额 + 确定性事件流。余额与链上国库账户
-/// （`treasury_address` 的 StateDb balance）保持一致；本结构为审计视图。
+/// 国库账本（纯函数）：余额 + 确定性事件流 + 治理生效记录。
+/// 余额与链上国库账户（`treasury_address` 的 StateDb balance）保持一致；本结构为审计视图。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TreasuryLedger {
     balance: u128,
     events: Vec<LedgerEvent>,
+    executions: Vec<ProposalOutcome>,
 }
 
 impl TreasuryLedger {
@@ -191,6 +192,15 @@ impl TreasuryLedger {
 
     pub fn events(&self) -> &[LedgerEvent] {
         &self.events
+    }
+
+    /// 已生效执行的提案产物（UpdateConfig/Freeze/AddGameOp/FundActivity）。
+    pub fn executions(&self) -> &[ProposalOutcome] {
+        &self.executions
+    }
+
+    pub fn record_execution(&mut self, outcome: ProposalOutcome) {
+        self.executions.push(outcome);
     }
 
     pub fn record_income(&mut self, source: impl Into<String>, amount: u64) {

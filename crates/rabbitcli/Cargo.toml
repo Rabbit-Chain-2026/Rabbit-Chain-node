@@ -10,6 +10,11 @@ description = "RabbitChain CLI and node implementation"
 name = "rabbitchain"
 path = "src/main.rs"
 
+[features]
+testkit = ["rabbitapi/testkit"]
+
+default = []
+
 [dependencies]
 rabbitcore.workspace = true
 rabbitnet.workspace = true
