@@ -787,6 +787,8 @@ impl RpcApi {
             "rabbit_getTreasury" => self.rabbit_get_treasury(params),
             #[cfg(feature = "testkit")]
             "rabbit_increaseTime" => self.rabbit_increase_time(params),
+            #[cfg(feature = "testkit")]
+            "rabbit_fundAccount" => self.rabbit_fund_account(params),
 
             _ => Err(RpcErrorObject::method_not_found(method)),
         }
@@ -1018,6 +1020,24 @@ impl RpcApi {
             let base_fee = *self.current_base_fee.read();
             if let Err(err) = rabbitcore::compute::validate_tx_fee(&tx, base_fee) {
                 return Err(RpcErrorObject::invalid_params(format!("fee validation failed: {err}")));
+            }
+            // 提交时余额预检（快速反馈；权威扣费在区块执行时）：签名者须能承担
+            // gas + 优先费（税/小费，上限 max_fee）。Mint 价值创造免收。
+            if let Some(payer) = rabbitcore::game::ed25519_signer_address(&tx) {
+                let fee = rabbitcore::compute::estimate_tx_gas(&tx)
+                    .saturating_mul(base_fee)
+                    .saturating_add(tx.priority_fee)
+                    .min(tx.max_fee);
+                let balance = self
+                    .state_db
+                    .get_balance(&payer)
+                    .as_u64();
+                if balance < fee {
+                    return Err(RpcErrorObject::invalid_params(format!(
+                        "insufficient balance {} needed {} for gas",
+                        balance, fee
+                    )));
+                }
             }
         }
 
@@ -2003,6 +2023,41 @@ impl RpcApi {
             "increased_by": secs,
             "virtual_now": now,
             "offset_secs": self.virtual_clock.offset_secs(),
+        }))
+    }
+
+    /// 水龙头（testkit 测试框架）：给地址注入原生余额，解决"第一笔 gas"引导问题。
+    /// 仅 `enable_time_travel` 开启时可用（与 increaseTime 同门控）；单次上限 1e12。
+    #[cfg(feature = "testkit")]
+    fn rabbit_fund_account(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        if !self.config.enable_time_travel {
+            return Err(RpcErrorObject::invalid_params(
+                "faucet disabled; start node with --enable-time-travel".to_string(),
+            ));
+        }
+        let params = params
+            .ok_or_else(|| RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let address = params
+            .first()
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .ok_or_else(|| RpcErrorObject::invalid_params("expected address".to_string()))??;
+        let amount = params
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1_000_000_000)
+            .min(1_000_000_000_000);
+        let mut account = self.state_db.get_account(&address).unwrap_or_default();
+        account.balance = account.balance.saturating_add(U256::from(amount));
+        account.state = rabbitcore::account::AccountState::Active;
+        self.state_db.insert_account(address, account);
+        Ok(serde_json::json!({
+            "address": format!("0x{}", hex::encode(address.as_bytes())),
+            "funded": amount,
+            "balance": format!("0x{:x}", self.state_db.get_balance(&address).as_u128()),
         }))
     }
 
