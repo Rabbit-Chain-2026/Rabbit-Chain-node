@@ -91,7 +91,7 @@ pub use shanhai_core::enhancement::{EnhanceConfig, roll_with_config};
 /// 强化规则配置对象逻辑 id（与 shanhai-server `config_object_id` 同源）。
 pub fn enhance_config_object_id() -> crate::compute::ObjectId {
     crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
-        b"jzz/config/enhance",
+        b"shanhai/config/enhance",
     )))
 }
 

@@ -808,7 +808,7 @@ mod tests {
         let domains = InMemoryDomainRegistry::new();
         domains.upsert_domain(DomainConfig {
             domain_id: crate::compute::GAME_DOMAIN,
-            name: "jzz".to_string(),
+            name: "shanhai".to_string(),
             vm: "shanhai".to_string(),
             public: true,
         });

@@ -21,9 +21,9 @@ pub const DEPOSIT_JZ: u64 = 1_000;
 pub const PASS_PROMILLE: u64 = 500;
 
 /// 国库账户地址：交易税/市场税流入，提案 `FundActivity` 拨款。
-/// 固定推导（keccak("jzz/treasury") 后 20 字节），所有节点一致。
+/// 固定推导（keccak("shanhai/treasury") 后 20 字节），所有节点一致。
 pub fn treasury_address() -> crate::crypto::Address {
-    let hash = crate::crypto::keccak256(b"jzz/treasury");
+    let hash = crate::crypto::keccak256(b"shanhai/treasury");
     crate::crypto::Address::from_slice(&hash[12..]).expect("treasury address")
 }
 

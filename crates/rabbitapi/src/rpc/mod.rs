@@ -557,10 +557,10 @@ impl RpcApi {
             vm: "wasm".to_string(),
             public: true,
         });
-        // 游戏域（"jzz"）：山海等 RabbitChain 原生应用的游戏交易/对象域。
+        // 游戏域（"shanhai"）：山海等 RabbitChain 原生应用的游戏交易/对象域。
         domain_registry.upsert_domain(DomainConfig {
             domain_id: GAME_DOMAIN,
-            name: "jzz".to_string(),
+            name: "shanhai".to_string(),
             vm: "shanhai".to_string(),
             public: true,
         });
@@ -3054,7 +3054,7 @@ fn build_default_rpc_api(config: RpcConfig) -> std::result::Result<RpcApi, crate
     });
     domains.upsert_domain(DomainConfig {
         domain_id: GAME_DOMAIN,
-        name: "jzz".to_string(),
+        name: "shanhai".to_string(),
         vm: "shanhai".to_string(),
         public: true,
     });

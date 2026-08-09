@@ -470,7 +470,7 @@ mod tests {
 
     pub(super) fn proposal_object_id(id: &str) -> ObjectId {
         ObjectId(Hash::from_bytes(keccak256(
-            format!("jzz/proposal/{id}").as_bytes(),
+            format!("shanhai/proposal/{id}").as_bytes(),
         )))
     }
 

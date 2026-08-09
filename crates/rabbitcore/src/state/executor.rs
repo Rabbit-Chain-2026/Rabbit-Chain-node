@@ -58,7 +58,7 @@ pub struct StateExecutor {
     ledger: RwLock<TreasuryLedger>,
 }
 
-/// 默认域注册：main + 游戏域（jzz）。
+/// 默认域注册：main + 游戏域(shanhai)。
 pub fn default_game_domains() -> Arc<InMemoryDomainRegistry> {
     let domains = Arc::new(InMemoryDomainRegistry::new());
     domains.upsert_domain(DomainConfig {
@@ -69,7 +69,7 @@ pub fn default_game_domains() -> Arc<InMemoryDomainRegistry> {
     });
     domains.upsert_domain(DomainConfig {
         domain_id: GAME_DOMAIN,
-        name: "jzz".to_string(),
+        name: "shanhai".to_string(),
         vm: "shanhai".to_string(),
         public: true,
     });
@@ -838,7 +838,7 @@ mod tests {
         amount: u64,
     ) -> (Vec<ComputeTx>, ObjectId) {
         let object_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
-            format!("jzz/proposal/{id}").as_bytes(),
+            format!("shanhai/proposal/{id}").as_bytes(),
         )));
         let p = crate::governance::create_proposal(
             id,
@@ -945,7 +945,7 @@ mod tests {
         // 构造 UpdateConfig 提案的 [mint, vote, execute]
         let id = "cfg-ok";
         let object_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
-            format!("jzz/proposal/{id}").as_bytes(),
+            format!("shanhai/proposal/{id}").as_bytes(),
         )));
         let p = crate::governance::create_proposal(
             id,
