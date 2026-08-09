@@ -127,11 +127,19 @@ impl GameOp {
 }
 
 pub use shanhai_core::enhancement::{EnhanceConfig, roll_with_config};
+pub use shanhai_core::monster::{DropSpec, MonsterEntry, MonsterSpec, MonsterTableConfig};
 
 /// 强化规则配置对象逻辑 id（与 shanhai-server `config_object_id` 同源）。
 pub fn enhance_config_object_id() -> crate::compute::ObjectId {
     crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
         b"shanhai/config/enhance",
+    )))
+}
+
+/// 怪物表配置对象逻辑 id（治理 `UpdateConfig` 可更新：加新怪/调掉率）。
+pub fn monster_config_object_id() -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        b"shanhai/config/monsters",
     )))
 }
 
@@ -468,36 +476,19 @@ pub fn derive_action_seed(block_hash: &crate::crypto::Hash, session_id: &str) ->
     u64::from_be_bytes(h[..8].try_into().expect("hash"))
 }
 
-/// 怪物规格（确定性内嵌表：打怪/打boss 的统一掉落源）。
-#[derive(Debug, Clone)]
-pub struct MonsterSpec {
-    pub hp: u64,
-    pub atk: u64,
-    pub def: u64,
-    /// (物品, 掉率千分位, 数量)
-    pub drops: Vec<(String, u16, u64)>,
-}
-
-/// 内嵌怪物表（演示；生产可改为链上配置对象）。
-pub fn monster_spec(id: &str) -> Option<MonsterSpec> {
-    match id {
-        "slime" => Some(MonsterSpec { hp: 50, atk: 8, def: 2, drops: vec![("slime_core".into(), 500, 1)] }),
-        "wolf" => Some(MonsterSpec { hp: 120, atk: 15, def: 5, drops: vec![("wolf_fang".into(), 400, 1), ("wolf_pelt".into(), 300, 1)] }),
-        "boss_dragon" => Some(MonsterSpec { hp: 2000, atk: 60, def: 20, drops: vec![("dragon_scale".into(), 800, 2), ("dragon_heart".into(), 100, 1)] }),
-        _ => None,
-    }
-}
-
 /// 统一规则执行（确定性，零浮点）：动作 → 结果 + 掉落。
+/// 规则对象（EnhanceConfig / MonsterTableConfig）默认取 v1 常量表；
+/// 链上治理更新后以链上对象为准（gate/executor 校验 rules_version 匹配）。
 pub fn execute_action(
     kind: &ActionKind,
     input: &ActionInput,
     seed: u64,
-    cfg: &shanhai_core::enhancement::EnhanceConfig,
+    enhance_cfg: &shanhai_core::enhancement::EnhanceConfig,
+    monsters: &MonsterTableConfig,
 ) -> Result<ActionOutcome, GameError> {
     match (kind, input) {
         (ActionKind::Battle, ActionInput::Battle { monster_id, team }) => {
-            let spec = monster_spec(monster_id).ok_or_else(|| {
+            let spec = monsters.monster(monster_id).ok_or_else(|| {
                 GameError::InvalidPayload(format!("unknown monster {monster_id}"))
             })?;
             // 队伍聚合（确定性）
@@ -533,9 +524,9 @@ pub fn execute_action(
             // 掉落：玩家胜利时按怪物掉落表确定性 roll
             let mut drops = vec![];
             if player_win {
-                for (item, permille, count) in &spec.drops {
-                    if rng.chance(*permille) {
-                        drops.push(ActionDrop { item_id: item.clone(), count: *count });
+                for d in &spec.drops {
+                    if rng.chance(d.permille) {
+                        drops.push(ActionDrop { item_id: d.item_id.clone(), count: d.count });
                     }
                 }
             }
@@ -546,7 +537,7 @@ pub fn execute_action(
         }
         (ActionKind::Enhance, ActionInput::Enhance { current_level, current_pity, star_stones, .. }) => {
             let r = shanhai_core::enhancement::roll_with_config(
-                *current_level, *current_pity, seed, *star_stones, cfg,
+                *current_level, *current_pity, seed, *star_stones, enhance_cfg,
             );
             Ok(ActionOutcome {
                 result: serde_json::json!({ "success": r.success, "new_level": r.new_level, "new_pity": r.pity }),
@@ -832,9 +823,10 @@ mod tests {
 
     #[test]
     fn unified_action_engine_is_deterministic_and_covers_gameplay() {
-        use crate::game::{execute_action, ActionInput, ActionKind, ActionOutcome, MonsterSpec};
-        use crate::game::EnhanceConfig;
+        use crate::game::{execute_action, ActionInput, ActionKind, ActionOutcome};
+        use crate::game::{EnhanceConfig, MonsterTableConfig};
         let cfg = EnhanceConfig::default();
+        let monsters = MonsterTableConfig::default();
         let team = vec![TeamUnit { atk: 30, def: 10, hp: 200 }, TeamUnit { atk: 20, def: 5, hp: 150 }];
         // 打怪（battle）：同一 seed 结果与掉落完全一致
         let a = execute_action(
@@ -842,24 +834,27 @@ mod tests {
             &ActionInput::Battle { monster_id: "wolf".into(), team: team.clone() },
             42,
             &cfg,
+            &monsters,
         ).expect("battle action");
         let b = execute_action(
             &ActionKind::Battle,
             &ActionInput::Battle { monster_id: "wolf".into(), team: team.clone() },
             42,
             &cfg,
+            &monsters,
         ).expect("battle action");
         assert_eq!(a, b, "deterministic outcome");
         // 怪物存在且掉落表确定
-        assert!(monster_spec("slime").is_some());
-        assert!(monster_spec("boss_dragon").is_some());
-        assert!(monster_spec("nope").is_none());
+        assert!(monsters.monster("slime").is_some());
+        assert!(monsters.monster("boss_dragon").is_some());
+        assert!(monsters.monster("nope").is_none());
         // 不同 seed → 可能不同结果（战斗是 seed 驱动的）
         let c = execute_action(
             &ActionKind::Battle,
             &ActionInput::Battle { monster_id: "wolf".into(), team },
             43,
             &cfg,
+            &monsters,
         ).expect("battle action 2");
         let _ = c;
         // 强化（enhance）统一入口与 roll_with_config 一致
@@ -869,6 +864,7 @@ mod tests {
             &ActionInput::Enhance { object_id: "0x01".into(), current_level: 0, current_pity: 0, star_stones: 0 },
             7,
             &cfg,
+            &monsters,
         ).expect("enhance action");
         assert_eq!(o.result, serde_json::json!({ "success": r.success, "new_level": r.new_level, "new_pity": r.pity }));
         assert!(o.drops.is_empty(), "enhance has no drops");
@@ -876,14 +872,45 @@ mod tests {
         assert!(execute_action(
             &ActionKind::Battle,
             &ActionInput::Battle { monster_id: "nope".into(), team: vec![] },
-            1, &cfg,
+            1, &cfg, &monsters,
         ).is_err());
         // 类型/输入不匹配 → 拒
         assert!(execute_action(
             &ActionKind::Battle,
             &ActionInput::Enhance { object_id: "0x01".into(), current_level: 0, current_pity: 0, star_stones: 0 },
-            1, &cfg,
+            1, &cfg, &monsters,
         ).is_err());
+        // 链上配置驱动的规则升级：v2 怪物表新增怪物，execute_action 立即生效
+        let mut v2 = monsters.clone();
+        v2.version = 2;
+        v2.monsters.push(crate::game::MonsterEntry {
+            id: "dire_wolf".into(),
+            spec: crate::game::MonsterSpec {
+                hp: 300,
+                atk: 25,
+                def: 10,
+                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1 }],
+            },
+        });
+        assert!(monsters.monster("dire_wolf").is_none(), "v1 has no dire_wolf");
+        assert!(v2.monster("dire_wolf").is_some(), "v2 adds dire_wolf");
+        let d = execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "dire_wolf".into(), team: vec![TeamUnit { atk: 60, def: 20, hp: 500 }] },
+            9,
+            &cfg,
+            &v2,
+        ).expect("new monster fights under v2");
+        let d2 = execute_action(
+            &ActionKind::Battle,
+            &ActionInput::Battle { monster_id: "dire_wolf".into(), team: vec![TeamUnit { atk: 60, def: 20, hp: 500 }] },
+            9,
+            &cfg,
+            &v2,
+        ).expect("new monster fights under v2");
+        assert_eq!(d, d2, "v2 battle deterministic");
+        assert_eq!(d.result["winner"], "player", "strong team beats dire_wolf");
+        assert!(d.drops.iter().all(|x| x.item_id == "dire_fang"), "only dire_fang drops");
     }
 
     #[test]

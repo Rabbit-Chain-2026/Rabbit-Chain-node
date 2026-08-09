@@ -459,7 +459,9 @@ impl StateExecutor {
         if session.settled {
             return Err(ExecutionError::Block("action session already settled".to_string()));
         }
-        let cfg = match &session.action_type {
+        // 链上规则对象为权威：session.rules_version 必须与链上配置版本一致，
+        // 用该版本配置重算（治理 UpdateConfig 换版本后新规则生效，旧 session 拒绝）。
+        let (enhance_cfg, monsters) = match &session.action_type {
             crate::game::ActionKind::Enhance => {
                 let config_id = crate::game::enhance_config_object_id();
                 let cfg_obj = self
@@ -468,14 +470,42 @@ impl StateExecutor {
                     .ok_or_else(|| {
                         ExecutionError::Block("enhance config object not found".to_string())
                     })?;
-                serde_json::from_slice(&cfg_obj.state).map_err(|e| {
-                    ExecutionError::Block(format!("invalid enhance config state: {e}"))
-                })?
+                let cfg: crate::game::EnhanceConfig = serde_json::from_slice(&cfg_obj.state)
+                    .map_err(|e| {
+                        ExecutionError::Block(format!("invalid enhance config state: {e}"))
+                    })?;
+                if session.rules_version != cfg.version {
+                    return Err(ExecutionError::Block(format!(
+                        "stale enhance rules version: session {}, on-chain config {}",
+                        session.rules_version, cfg.version
+                    )));
+                }
+                (cfg, crate::game::MonsterTableConfig::default())
             }
-            _ => crate::game::EnhanceConfig::default(),
+            crate::game::ActionKind::Battle => {
+                let config_id = crate::game::monster_config_object_id();
+                let cfg_obj = self
+                    .compute_store
+                    .get_latest_output_by_object(config_id)
+                    .ok_or_else(|| {
+                        ExecutionError::Block("monster config object not found".to_string())
+                    })?;
+                let cfg: crate::game::MonsterTableConfig = serde_json::from_slice(&cfg_obj.state)
+                    .map_err(|e| {
+                        ExecutionError::Block(format!("invalid monster config state: {e}"))
+                    })?;
+                if session.rules_version != cfg.version {
+                    return Err(ExecutionError::Block(format!(
+                        "stale monster rules version: session {}, on-chain config {}",
+                        session.rules_version, cfg.version
+                    )));
+                }
+                (crate::game::EnhanceConfig::default(), cfg)
+            }
         };
-        let outcome = crate::game::execute_action(&session.action_type, &session.inputs, seed, &cfg)
-            .map_err(|e| ExecutionError::Block(format!("action rejected: {e}")))?;
+        let outcome =
+            crate::game::execute_action(&session.action_type, &session.inputs, seed, &enhance_cfg, &monsters)
+                .map_err(|e| ExecutionError::Block(format!("action rejected: {e}")))?;
         if outcome.result != claimed {
             return Err(ExecutionError::Block(
                 "action claimed result mismatch".to_string(),
@@ -1519,6 +1549,332 @@ mod tests {
         let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
         assert_eq!(treasury, 10 + enhance_fee + crate::compute::estimate_tx_gas(&trip[1])
             + crate::compute::estimate_tx_gas(&trip[2]));
+    }
+
+    #[test]
+    fn monster_config_update_enables_new_monster_and_rejects_stale_session() {
+        // 场景：治理 UpdateConfig 把怪物表升到 v2（新增 dire_wolf）。
+        // 期望：新 session（v2）可结算新怪；旧 session（v1）被拒（stale rules version）。
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+        let ts = 1_700_000_000u64;
+        let team = vec![
+            crate::game::TeamUnit { atk: 30, def: 10, hp: 200 },
+            crate::game::TeamUnit { atk: 20, def: 5, hp: 150 },
+        ];
+
+        // 1) 铸造链上怪物表 v1（默认表）
+        let cfg_id = crate::game::monster_config_object_id();
+        let cfg1 = crate::game::MonsterTableConfig::default();
+        let mint_cfg = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![proposal(
+                &authority, cfg_id, 1, None,
+                serde_json::to_vec(&cfg1).expect("cfg1 json"),
+            )],
+            fee: 0,
+            nonce: Some(3),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let mint_cfg = sign(mint_cfg, &key);
+        let cfg1_out = output_id_for_obj(&cfg_id, 1);
+
+        // 2) 治理 UpdateConfig：propose → vote → execute（输出 v2 怪物表：加 dire_wolf）
+        let mut cfg2 = cfg1.clone();
+        cfg2.version = 2;
+        cfg2.monsters.push(crate::game::MonsterEntry {
+            id: "dire_wolf".into(),
+            spec: crate::game::MonsterSpec {
+                hp: 300,
+                atk: 25,
+                def: 10,
+                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1 }],
+            },
+        });
+        let proposal_id = "monster-v2";
+        let pobj = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+            format!("shanhai/proposal/{proposal_id}").as_bytes(),
+        )));
+        let p = crate::governance::create_proposal(
+            proposal_id,
+            crate::governance::ProposalKind::UpdateConfig {
+                config_object: format!("0x{}", hex::encode(cfg_id.0.as_bytes())),
+                params: serde_json::to_value(&cfg2).expect("cfg2 value"),
+            },
+            "0xaaa",
+            1000,
+            0,
+        )
+        .expect("proposal");
+        let propose = governance_mint_proposal(&authority, &key, pobj, &p);
+        let pv1 = propose.output_proposals[0].output_id;
+        let mut pv2 = p.clone();
+        pv2.votes_for = 500;
+        let vote = governance_invoke(
+            &authority,
+            &key,
+            pobj,
+            2,
+            Some(pv1),
+            4,
+            serde_json::to_vec(&GameOp::Vote {
+                proposal_id: proposal_id.into(),
+                voter: "0xbbb".into(),
+                stake: 500,
+                approve: true,
+            })
+            .expect("vote op"),
+            serde_json::to_vec(&pv2).expect("proposal json"),
+        );
+        let pv2_out = vote.output_proposals[0].output_id;
+        let mut pv3 = pv2.clone();
+        pv3.status = ProposalStatus::Executed;
+        // execute：input = [提案 v2, 配置 v1]；输出 = [提案 v3, 配置 v2]
+        let execute = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![pv2_out, cfg1_out],
+            read_set: vec![],
+            output_proposals: vec![
+                proposal(&authority, pobj, 3, Some(pv2_out), serde_json::to_vec(&pv3).expect("pv3 json")),
+                proposal(&authority, cfg_id, 2, Some(cfg1_out), serde_json::to_vec(&cfg2).expect("cfg2 json")),
+            ],
+            fee: 0,
+            nonce: Some(5),
+            metadata: vec![],
+            payload: serde_json::to_vec(&GameOp::Execute { proposal_id: proposal_id.into() })
+                .expect("execute op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000_000,
+            priority_fee: 0,
+            gas_limit: 1_000_000,
+        };
+        let execute = sign(execute, &key);
+
+        // 3) 铸造两个动作 session：v1（打 slime，旧规则）+ v2（打 dire_wolf，新规则）
+        let mk_session = |session_id: &str, monster_id: &str, rules_version: u64, nonce: u64| {
+            let action_type = crate::game::ActionKind::Battle;
+            let inputs = crate::game::ActionInput::Battle {
+                monster_id: monster_id.into(),
+                team: team.clone(),
+            };
+            let session = crate::game::ActionSession {
+                session_id: session_id.into(),
+                action_type: action_type.clone(),
+                inputs: inputs.clone(),
+                rules_version,
+                creator: format!("0x{}", hex::encode(authority.as_bytes())),
+                created_at_unix: 0,
+                settled: false,
+                result: None,
+            };
+            let soid = crate::game::action_session_object_id(session_id);
+            let tx = ComputeTx {
+                tx_id: TxId(crate::crypto::Hash::zero()),
+                domain_id: GAME_DOMAIN,
+                command: Command::Mint,
+                input_set: vec![],
+                read_set: vec![],
+                output_proposals: vec![proposal(
+                    &authority,
+                    soid,
+                    1,
+                    None,
+                    serde_json::to_vec(&session).expect("session json"),
+                )],
+                fee: 0,
+                nonce: Some(nonce),
+                metadata: vec![],
+                payload: serde_json::to_vec(&GameOp::ActionStart {
+                    session_id: session_id.into(),
+                    action_type,
+                    inputs,
+                    rules_version,
+                    creator: format!("0x{}", hex::encode(authority.as_bytes())),
+                    created_at_unix: 0,
+                })
+                .expect("action start op"),
+                deadline_unix_secs: None,
+                chain_id: Some(10088),
+                network_id: Some(10088),
+                witness: TxWitness { signatures: vec![], threshold: None },
+                max_fee: 0,
+                priority_fee: 0,
+                gas_limit: 0,
+            };
+            sign(tx, &key)
+        };
+        let s_v1 = mk_session("act-gov-v1", "slime", 1, 6);
+        let s_v2 = mk_session("act-gov-v2", "dire_wolf", 2, 7);
+        let s_v1_out = output_id_for_obj(&crate::game::action_session_object_id("act-gov-v1"), 1);
+        let s_v2_out = output_id_for_obj(&crate::game::action_session_object_id("act-gov-v2"), 1);
+
+        // 4) ActionSettle（v2 新怪）：确定性执行 → 声称结果+掉落 → 通过
+        let seed = 99u64;
+        let action_type = crate::game::ActionKind::Battle;
+        let inputs = crate::game::ActionInput::Battle {
+            monster_id: "dire_wolf".into(),
+            team: team.clone(),
+        };
+        let outcome = crate::game::execute_action(
+            &action_type,
+            &inputs,
+            seed,
+            &crate::game::EnhanceConfig::default(),
+            &cfg2,
+        )
+        .expect("v2 battle");
+        let settle_v2 = build_action_settle_test_tx(
+            &authority,
+            &key,
+            "act-gov-v2",
+            s_v2_out,
+            2,
+            8,
+            seed,
+            outcome.result,
+            outcome.drops,
+        );
+
+        // 5) ActionSettle（v1 旧 session）：规则已升到 v2 → stale 拒绝
+        let settle_v1 = build_action_settle_test_tx(
+            &authority,
+            &key,
+            "act-gov-v1",
+            s_v1_out,
+            2,
+            9,
+            seed,
+            serde_json::json!({ "winner": "player", "rounds": 1 }),
+            vec![],
+        );
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _gas) = executor
+            .execute_txs(
+                &[mint_cfg, propose, vote, execute, s_v1, s_v2, settle_v1, settle_v2],
+                1,
+                ts,
+                &basic,
+            )
+            .expect("execute governance update trip");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "mint cfg: {:?}", receipts[0].error);
+        assert_eq!(receipts[1].status, ReceiptStatus::Success, "propose: {:?}", receipts[1].error);
+        assert_eq!(receipts[2].status, ReceiptStatus::Success, "vote: {:?}", receipts[2].error);
+        assert_eq!(receipts[3].status, ReceiptStatus::Success, "execute: {:?}", receipts[3].error);
+        assert_eq!(receipts[4].status, ReceiptStatus::Success, "session v1 mint: {:?}", receipts[4].error);
+        assert_eq!(receipts[5].status, ReceiptStatus::Success, "session v2 mint: {:?}", receipts[5].error);
+        // 旧规则 session（v1）在新配置（v2）下结算 → 拒
+        assert_eq!(receipts[6].status, ReceiptStatus::Failed, "stale v1 session must fail");
+        assert!(
+            receipts[6].error.as_deref().unwrap_or("").contains("stale monster rules version"),
+            "got: {:?}",
+            receipts[6].error
+        );
+        // 新规则 session（v2）打新怪 → 通过
+        assert_eq!(receipts[7].status, ReceiptStatus::Success, "v2 settle: {:?}", receipts[7].error);
+        // 链上配置已更新为 v2
+        let latest = executor
+            .compute_store
+            .get_latest_output_by_object(cfg_id)
+            .expect("config v2 exists");
+        assert_eq!(latest.version, Version(2));
+        let on_chain: crate::game::MonsterTableConfig =
+            serde_json::from_slice(&latest.state).expect("config v2 state");
+        assert!(on_chain.monster("dire_wolf").is_some());
+    }
+
+    /// ActionSettle 测试助手：消费 session v1，输出 session v2（settled + result）+ 掉落对象。
+    fn build_action_settle_test_tx(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        session_id: &str,
+        session_v1: OutputId,
+        rules_version: u64,
+        nonce: u64,
+        seed: u64,
+        claimed: serde_json::Value,
+        drops: Vec<crate::game::ActionDrop>,
+    ) -> ComputeTx {
+        let object_id = crate::game::action_session_object_id(session_id);
+        let settled = crate::game::ActionSession {
+            session_id: session_id.into(),
+            action_type: crate::game::ActionKind::Battle,
+            inputs: crate::game::ActionInput::Battle {
+                monster_id: "".into(),
+                team: vec![],
+            },
+            rules_version,
+            creator: format!("0x{}", hex::encode(authority.as_bytes())),
+            created_at_unix: 0,
+            settled: true,
+            result: Some(claimed.clone()),
+        };
+        let op = GameOp::ActionSettle {
+            session_id: session_id.into(),
+            seed,
+            random_block_hash: "0xabab".into(),
+            claimed,
+            drops: drops.clone(),
+        };
+        let mut output_proposals = vec![proposal(
+            authority,
+            object_id,
+            2,
+            Some(session_v1),
+            serde_json::to_vec(&settled).expect("settled session json"),
+        )];
+        for d in &drops {
+            let drop_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+                format!("shanhai/action/drop/{session_id}/{}", d.item_id).as_bytes(),
+            )));
+            output_proposals.push(proposal(
+                authority,
+                drop_id,
+                1,
+                None,
+                serde_json::json!({ "kind": "action_drop", "session_id": session_id, "item_id": d.item_id, "count": d.count })
+                    .to_string()
+                    .into_bytes(),
+            ));
+        }
+        let tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![session_v1],
+            read_set: vec![],
+            output_proposals,
+            fee: 0,
+            nonce: Some(nonce),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("action settle op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000_000,
+            priority_fee: 0,
+            gas_limit: 1_000_000,
+        };
+        sign(tx, key)
     }
 
     #[test]

@@ -75,6 +75,19 @@ fn load_enhance_config(
     })
 }
 
+/// 读取链上 MonsterTableConfig 对象（权威打怪规则；治理 UpdateConfig 可加新怪/调掉率）。
+fn load_monster_config(
+    store: &dyn ObjectStore,
+) -> Result<rabbitcore::game::MonsterTableConfig, RpcErrorObject> {
+    let config_id = rabbitcore::game::monster_config_object_id();
+    let obj = store.get_latest_output_by_object(config_id).ok_or_else(|| {
+        RpcErrorObject::invalid_params("monster config object not found on chain".into())
+    })?;
+    serde_json::from_slice(&obj.state).map_err(|e| {
+        RpcErrorObject::invalid_params(format!("invalid monster config object state: {e}"))
+    })
+}
+
 /// 读取链上铸币政策对象（权威铸币上限）；对象不存在时返回 None（由执行器确定性拒绝）。
 fn load_mint_policy(store: &dyn ObjectStore) -> Option<rabbitcore::game::MintPolicy> {
     let config_id = rabbitcore::game::mint_policy_object_id();
@@ -279,19 +292,26 @@ fn gate_execute(
         ));
     }
     // UpdateConfig 生效：交易必须同时产出新版本配置对象，且与提案 params 一致。
+    // 支持两类链上规则对象：EnhanceConfig（强化）/ MonsterTableConfig（怪物表）。
     if let rabbitcore::governance::ProposalKind::UpdateConfig {
         config_object,
         params,
     } = &input_p.kind
     {
-        let expected_id = rabbitcore::game::enhance_config_object_id();
-        let expected_hex = format!("0x{}", hex::encode(expected_id.0.as_bytes()));
-        if config_object.trim().to_lowercase() != expected_hex {
+        let enhance_id = rabbitcore::game::enhance_config_object_id();
+        let monster_id = rabbitcore::game::monster_config_object_id();
+        let enhance_hex = format!("0x{}", hex::encode(enhance_id.0.as_bytes()));
+        let monster_hex = format!("0x{}", hex::encode(monster_id.0.as_bytes()));
+        let target = config_object.trim().to_lowercase();
+        let expected_id = if target == enhance_hex {
+            enhance_id
+        } else if target == monster_hex {
+            monster_id
+        } else {
             return Err(RpcErrorObject::invalid_params(format!(
-                "UpdateConfig: unsupported config object {config_object} (only enhance config)"
+                "UpdateConfig: unsupported config object {config_object} (only enhance/monster config)"
             )));
-        }
-        let cur_version = load_enhance_config(store)?.version;
+        };
         let out_cfg = tx
             .output_proposals
             .iter()
@@ -301,26 +321,52 @@ fn gate_execute(
                     "UpdateConfig: execute must output the new config object".into(),
                 )
             })?;
-        let parsed: rabbitcore::game::EnhanceConfig =
-            serde_json::from_slice(&out_cfg.state).map_err(|e| {
-                RpcErrorObject::invalid_params(format!("invalid new config object state: {e}"))
-            })?;
-        if parsed.version != cur_version.saturating_add(1) {
-            return Err(RpcErrorObject::invalid_params(format!(
-                "UpdateConfig: config version must advance {cur_version} -> {}",
-                cur_version.saturating_add(1)
-            )));
-        }
-        let expected_cfg: rabbitcore::game::EnhanceConfig =
-            serde_json::from_value(params.clone()).map_err(|e| {
-                RpcErrorObject::invalid_params(format!(
-                    "UpdateConfig: proposal params not a valid enhance config: {e}"
-                ))
-            })?;
-        if expected_cfg != parsed {
-            return Err(RpcErrorObject::invalid_params(
-                "UpdateConfig: output config object does not match proposal params".into(),
-            ));
+        if target == enhance_hex {
+            let cur_version = load_enhance_config(store)?.version;
+            let parsed: rabbitcore::game::EnhanceConfig =
+                serde_json::from_slice(&out_cfg.state).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!("invalid new config object state: {e}"))
+                })?;
+            if parsed.version != cur_version.saturating_add(1) {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "UpdateConfig: config version must advance {cur_version} -> {}",
+                    cur_version.saturating_add(1)
+                )));
+            }
+            let expected_cfg: rabbitcore::game::EnhanceConfig =
+                serde_json::from_value(params.clone()).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!(
+                        "UpdateConfig: proposal params not a valid enhance config: {e}"
+                    ))
+                })?;
+            if expected_cfg != parsed {
+                return Err(RpcErrorObject::invalid_params(
+                    "UpdateConfig: output config object does not match proposal params".into(),
+                ));
+            }
+        } else {
+            let cur_version = load_monster_config(store)?.version;
+            let parsed: rabbitcore::game::MonsterTableConfig =
+                serde_json::from_slice(&out_cfg.state).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!("invalid new config object state: {e}"))
+                })?;
+            if parsed.version != cur_version.saturating_add(1) {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "UpdateConfig: config version must advance {cur_version} -> {}",
+                    cur_version.saturating_add(1)
+                )));
+            }
+            let expected_cfg: rabbitcore::game::MonsterTableConfig =
+                serde_json::from_value(params.clone()).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!(
+                        "UpdateConfig: proposal params not a valid monster config: {e}"
+                    ))
+                })?;
+            if expected_cfg != parsed {
+                return Err(RpcErrorObject::invalid_params(
+                    "UpdateConfig: output config object does not match proposal params".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -388,13 +434,37 @@ fn gate_action_settle(
     if expected_seed != *seed {
         return Err(RpcErrorObject::invalid_params("seed mismatch with random block".into()));
     }
-    // 3) 确定性重算
-    let cfg = match &session.action_type {
-        rabbitcore::game::ActionKind::Enhance => load_enhance_config(store)?,
-        _ => rabbitcore::game::EnhanceConfig::default(),
+    // 3) 确定性重算：链上规则对象为权威（session.rules_version 必须匹配配置版本）
+    let (enhance_cfg, monsters) = match &session.action_type {
+        rabbitcore::game::ActionKind::Enhance => {
+            let cfg = load_enhance_config(store)?;
+            if session.rules_version != cfg.version {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "stale enhance rules version: session {}, on-chain config {}",
+                    session.rules_version, cfg.version
+                )));
+            }
+            (cfg, rabbitcore::game::MonsterTableConfig::default())
+        }
+        rabbitcore::game::ActionKind::Battle => {
+            let cfg = load_monster_config(store)?;
+            if session.rules_version != cfg.version {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "stale monster rules version: session {}, on-chain config {}",
+                    session.rules_version, cfg.version
+                )));
+            }
+            (rabbitcore::game::EnhanceConfig::default(), cfg)
+        }
     };
-    let outcome = rabbitcore::game::execute_action(&session.action_type, &session.inputs, *seed, &cfg)
-        .map_err(|e| RpcErrorObject::invalid_params(format!("action rejected: {e}")))?;
+    let outcome = rabbitcore::game::execute_action(
+        &session.action_type,
+        &session.inputs,
+        *seed,
+        &enhance_cfg,
+        &monsters,
+    )
+    .map_err(|e| RpcErrorObject::invalid_params(format!("action rejected: {e}")))?;
     if &outcome.result != claimed {
         return Err(RpcErrorObject::invalid_params("claimed result mismatch".into()));
     }
