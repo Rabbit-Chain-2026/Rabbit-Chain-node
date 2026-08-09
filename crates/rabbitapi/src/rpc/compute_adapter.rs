@@ -95,11 +95,11 @@ fn gate_propose_mint(tx: &ComputeTx) -> Result<(), RpcErrorObject> {
             proposal.status
         )));
     }
-    if proposal.deposit < rabbitcore::governance::DEPOSIT_JZ {
+    if proposal.deposit < rabbitcore::governance::DEPOSIT_SH {
         return Err(RpcErrorObject::invalid_params(format!(
             "proposal deposit too low: {}, minimum {}",
             proposal.deposit,
-            rabbitcore::governance::DEPOSIT_JZ
+            rabbitcore::governance::DEPOSIT_SH
         )));
     }
     if proposal.deadline_unix

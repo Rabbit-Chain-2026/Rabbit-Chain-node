@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// 提案投票窗口（秒）
 pub const VOTE_WINDOW_SECS: u64 = 72 * 3600;
 /// 提案押金（JZ）
-pub const DEPOSIT_JZ: u64 = 1_000;
+pub const DEPOSIT_SH: u64 = 1_000;
 /// 通过阈值（千分位）：赞成质押权重 ≥ 50%
 pub const PASS_PROMILLE: u64 = 500;
 
@@ -105,10 +105,10 @@ pub fn create_proposal(
     deposit: u64,
     created_at_unix: u64,
 ) -> Result<Proposal, GovernanceError> {
-    if deposit < DEPOSIT_JZ {
+    if deposit < DEPOSIT_SH {
         return Err(GovernanceError::DepositTooLow {
             got: deposit,
-            minimum: DEPOSIT_JZ,
+            minimum: DEPOSIT_SH,
         });
     }
     Ok(Proposal {
