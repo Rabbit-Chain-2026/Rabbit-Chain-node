@@ -6,6 +6,7 @@ members = [
     "crates/rabbitstore",
     "crates/rabbitapi",
     "crates/rabbitcli",
+    "crates/zk",
 ]
 
 [workspace.package]
