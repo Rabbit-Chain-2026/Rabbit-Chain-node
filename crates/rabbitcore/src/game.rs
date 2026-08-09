@@ -54,6 +54,11 @@ pub enum GameOp {
     Execute {
         proposal_id: String,
     },
+    /// 山海币发行：权威账户向目标地址铸造（门控：仅铸币权威可提交，见 `mint_authority`）。
+    MintCoin {
+        to: String,
+        amount: u64,
+    },
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
@@ -93,6 +98,51 @@ pub fn enhance_config_object_id() -> crate::compute::ObjectId {
     crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
         b"shanhai/config/enhance",
     )))
+}
+
+/// 山海币铸币权威公钥（共识固定）：对应私钥由游戏运营方持有
+/// （devnet = SH_AUTH_KEY，即服务器权威密钥；公钥 = ed25519 pubkey）。
+pub const MINT_AUTHORITY_PUBKEY: [u8; 32] = [
+    0xd0, 0x4a, 0xb2, 0x32, 0x74, 0x2b, 0xb4, 0xab, 0x3a, 0x13, 0x68, 0xbd, 0x46, 0x15, 0xe4,
+    0xe6, 0xd0, 0x22, 0x4a, 0xb7, 0x1a, 0x01, 0x6b, 0xaf, 0x85, 0x20, 0xa3, 0x32, 0xc9, 0x77,
+    0x87, 0x37,
+];
+
+/// 山海币铸币权威地址（由固定公钥 ed25519 派生）。
+pub fn mint_authority() -> crate::crypto::Address {
+    let hash = crate::crypto::keccak256(&MINT_AUTHORITY_PUBKEY);
+    crate::crypto::Address::from_slice(&hash[12..]).expect("mint authority")
+}
+
+/// 交易是否由铸币权威签名（首个 ed25519 签名的公钥 == 固定公钥）。
+pub fn is_mint_signer(tx: &crate::compute::ComputeTx) -> bool {
+    for sig in &tx.witness.signatures {
+        if sig.scheme == crate::compute::SignatureScheme::Ed25519 {
+            if let Some(pk) = &sig.public_key {
+                if pk.as_slice() == MINT_AUTHORITY_PUBKEY {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 提取交易首个 ed25519 签名的派生地址（用于铸币授权判定）。
+pub fn ed25519_signer_address(tx: &crate::compute::ComputeTx) -> Option<crate::crypto::Address> {
+    for sig in &tx.witness.signatures {
+        if sig.scheme == crate::compute::SignatureScheme::Ed25519 {
+            if let Some(pk) = &sig.public_key {
+                if pk.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(pk);
+                    let hash = crate::crypto::keccak256(&key);
+                    return Some(crate::crypto::Address::from_slice(&hash[12..]).ok()?);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 重算验证游戏结算，返回权威结果（强化按默认配置 = 当前常量表）。
@@ -212,6 +262,15 @@ pub fn verify_with_config(
                 "approve": approve,
                 "stake": stake,
             }))
+        }
+        GameOp::MintCoin { to, amount } => {
+            if to.trim().is_empty() {
+                return Err(GameError::InvalidPayload("mint target must not be empty".into()));
+            }
+            if *amount == 0 {
+                return Err(GameError::InvalidPayload("mint amount must be positive".into()));
+            }
+            Ok(serde_json::json!({ "to": to, "amount": amount }))
         }
         GameOp::Execute { proposal_id } => {
             // 结构化校验：语义（tally=Passed、窗口到期、提案对象一致性）由

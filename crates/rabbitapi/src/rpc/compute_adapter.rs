@@ -32,6 +32,14 @@ pub(crate) fn gate_game_tx(
             let op = GameOp::parse(&tx.payload)
                 .map_err(|e| RpcErrorObject::invalid_params(format!("game payload invalid: {e}")))?;
             match &op {
+                GameOp::MintCoin { .. } => {
+                    // 山海币发行门控：仅铸币权威（固定公钥）可铸造，防通胀。
+                    if !rabbitcore::game::is_mint_signer(tx) {
+                        return Err(RpcErrorObject::invalid_params(
+                            "mint denied: tx is not signed by the mint authority".into(),
+                        ));
+                    }
+                }
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
                 GameOp::Enhance { rules_version, .. } => {
@@ -1058,5 +1066,66 @@ mod config_gate_tests {
         };
         let err = gate_game_tx(&t, &store, VOTE_WINDOW_SECS + 1).unwrap_err();
         assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("does not match"), "{err:?}");
+    }
+
+    // ── 山海币铸币门控（MintCoin）────────────────────────────────
+
+    fn mint_coin_tx_signed(key: &ed25519_dalek::SigningKey, to: Address, amount: u64) -> ComputeTx {
+        let op = GameOp::MintCoin {
+            to: format!("0x{}", hex::encode(to.as_bytes())),
+            amount,
+        };
+        let tx = ComputeTx {
+            tx_id: TxId(Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).unwrap(),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        use ed25519_dalek::Signer as _;
+        let signature = key.sign(&tx.signing_preimage()).to_bytes();
+        let public_key = key.verifying_key().to_bytes();
+        let mut tx = tx;
+        tx.witness.signatures = vec![rabbitcore::compute::TxSignature::ed25519(signature, public_key)];
+        tx.with_expected_tx_id()
+    }
+
+    fn test_target_address(seed: u8) -> Address {
+        let k = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pk = k.verifying_key().to_bytes();
+        let h = keccak256(&pk);
+        Address::from_slice(&h[12..]).unwrap()
+    }
+
+    #[test]
+    fn mint_coin_authority_signed_accepted() {
+        let store = InMemoryObjectStore::new();
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]); // == 铸币权威私钥
+        let t = mint_coin_tx_signed(&authority, test_target_address(0x33), 1_000);
+        gate_game_tx(&t, &store, 100).expect("authority mint accepted");
+    }
+
+    #[test]
+    fn mint_coin_non_authority_denied() {
+        let store = InMemoryObjectStore::new();
+        let rogue = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let t = mint_coin_tx_signed(&rogue, test_target_address(0x55), 1_000);
+        let err = gate_game_tx(&t, &store, 100).unwrap_err();
+        assert!(
+            err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("mint denied"),
+            "{err:?}"
+        );
     }
 }
