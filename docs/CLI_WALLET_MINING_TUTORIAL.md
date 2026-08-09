@@ -340,6 +340,22 @@ curl -fsS http://127.0.0.1:9332/metrics | grep rabbit_pool_shares_accepted_total
 - RPC token 使用长随机值，并按环境隔离。
 - 钱包文件和节点数据目录定期备份。
 
+### 5.5 计算交易（BlockTime 语义：入队 → 区块时间执行）
+
+`rabbit_submitComputeTx` 自 BlockTime 迁移后**只入队，不立即执行**：
+
+```bash
+"$RABBITCHAIN_BIN" --rpc-url http://127.0.0.1:8545 --rpc-token "$RPC_TOKEN" \
+  compute send --tx-file /path/to/tx.json
+# 返回 submit_result: { "queued": true, ... }
+```
+
+交易进入节点的 fee 优先池（`tx_fee_pool`），由矿工在**产块时打包并真实执行**（`StateExecutor::execute_txs` → 生成 receipts → gas 费进国库）。因此：
+
+- 提交后立即查 `rabbit_getComputeTxResult` / `rabbit_getOutput` 可能为空 —— 等一个区块后才有结果；
+- 区块执行后再查：`rabbit_getComputeTxResult` 返回真实 `block_hash` + `status` + `gas_used` + `output_refs`，对象经 `rabbit_getOutput` / `rabbit_getObject` 可查；
+- 单节点验证建议直接跑 `bash scripts/cli_mining_smoke.sh`（脚本已按该语义断言：提交后 `queued:true`，出块后结果/对象可查）。
+
 ## 6. 一键 smoke 验证
 
 仓库已经提供了本地 CLI + 外部 pool/miner 的可重复 smoke：
