@@ -1290,6 +1290,7 @@ mod tests {
         };
         let enhance = sign(enhance, &player_key);
         let enhance_gas = crate::compute::estimate_tx_gas(&enhance);
+        let enhance_fee = enhance_gas.min(enhance.max_fee); // base_fee=1，封顶 max_fee
 
         let basic = executor.new_basic_executor();
         let (receipts, _) = executor
@@ -1323,6 +1324,129 @@ mod tests {
         let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
         assert_eq!(treasury, 10 + vote_gas + execute_gas + enhance_gas);
         assert_eq!(executor.treasury_ledger().balance(), treasury as u128);
+    }
+
+    #[test]
+    fn zk_enhance_executes_with_proof_and_debits_shc() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        let (player_addr, player_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0xbb; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+
+        let config = mint_config_tx(&authority, &auth_key, 1);
+        let policy = mint_policy_tx(&authority, &auth_key, 6_000_000, 2);
+        let trip = mint_shc_trip(&authority, &auth_key, player_addr, 5_000_000, 3);
+        let equip_obj = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(b"zk-eq")));
+        let equip = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![proposal_with_resources(
+                &player_addr,
+                equip_obj,
+                1,
+                None,
+                b"zk-equip".to_vec(),
+                0,
+            )],
+            fee: 0,
+            nonce: Some(6),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let equip = sign(equip, &player_key);
+
+        // 客户端生成 ZK 证明（秘密 seed 不上链）；roll/结果由公开派生
+        let seed = 987654321u64;
+        let roll = zk::enhance::enhance_roll(seed).1;
+        let proof = zk::enhance::prove_enhance(seed, roll, zk::enhance::ZK_ENHANCE_QUERIES);
+        let proof_json = serde_json::to_value(&proof).expect("proof json");
+        let cfg = crate::game::EnhanceConfig::default();
+        let (success, new_level, new_pity) =
+            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_json, &cfg).expect("valid");
+        let op = GameOp::ZkEnhance {
+            object_id: format!("0x{}", hex::encode(equip_obj.0.as_bytes())),
+            current_level: 0,
+            current_pity: 0,
+            star_stones: 0,
+            roll_claim: roll,
+            claimed_success: success,
+            claimed_new_level: new_level,
+            claimed_pity: new_pity,
+            rules_version: 1,
+            proof: proof_json,
+        };
+        let enhance = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![output_id_for_obj(&equip_obj, 1)],
+            read_set: vec![],
+            output_proposals: vec![proposal_with_resources(
+                &player_addr,
+                equip_obj,
+                2,
+                Some(output_id_for_obj(&equip_obj, 1)),
+                b"zk-equip2".to_vec(),
+                0,
+            )],
+            fee: 0,
+            nonce: Some(7),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("zk enhance op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let enhance = sign(enhance, &player_key);
+        let enhance_gas = crate::compute::estimate_tx_gas(&enhance);
+        let enhance_fee = enhance_gas.min(enhance.max_fee); // base_fee=1，封顶 max_fee
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(
+                &[
+                    config,
+                    policy,
+                    trip[0].clone(),
+                    trip[1].clone(),
+                    trip[2].clone(),
+                    equip,
+                    enhance,
+                ],
+                1,
+                1_700_000_000,
+                &basic,
+            )
+            .expect("execute economy");
+        assert_eq!(receipts[6].status, ReceiptStatus::Success, "zk enhance: {:?}", receipts[6].error);
+        // 玩家扣 cost(10) + gas；国库 +10 + gas
+        assert_eq!(
+            state_db.get_balance(&player_addr).as_u64(),
+            5_000_000 - 10 - enhance_fee
+        );
+        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(treasury, 10 + enhance_fee + crate::compute::estimate_tx_gas(&trip[1])
+            + crate::compute::estimate_tx_gas(&trip[2]));
     }
 
     #[test]
