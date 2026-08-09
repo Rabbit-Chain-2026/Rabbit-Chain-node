@@ -206,9 +206,13 @@ impl StateExecutor {
                 Ok(_) => {
                     let gas_used = crate::compute::estimate_tx_gas(tx);
                     total_gas = total_gas.saturating_add(gas_used);
-                    // BlockTime 费用收集：非 Mint 交易按 gas_used × base_fee（上限 max_fee）入国库。
+                    // BlockTime 费用收集：非 Mint 交易按 gas_used × base_fee + priority_fee
+                    // （交易税/小费，上限 max_fee）入国库。
                     if tx.command != Command::Mint {
-                        let fee = gas_used.saturating_mul(base_fee).min(tx.max_fee);
+                        let fee = gas_used
+                            .saturating_mul(base_fee)
+                            .saturating_add(tx.priority_fee)
+                            .min(tx.max_fee);
                         if fee > 0 {
                             self.credit_treasury(fee);
                         }
@@ -436,6 +440,19 @@ mod tests {
         }
     }
 
+    fn proposal_with_resources(
+        authority: &crate::crypto::Address,
+        object_id: ObjectId,
+        version: u64,
+        predecessor: Option<OutputId>,
+        state: Vec<u8>,
+        native_amount: u128,
+    ) -> OutputProposal {
+        let mut p = proposal(authority, object_id, version, predecessor, state);
+        p.resources = vec![(Hash::zero(), crate::compute::ResourceValue::Amount(native_amount))];
+        p
+    }
+
     fn sign(tx: ComputeTx, key: &ed25519_dalek::SigningKey) -> ComputeTx {
         use ed25519_dalek::Signer as _;
         let signature = key.sign(&tx.signing_preimage()).to_bytes();
@@ -480,6 +497,17 @@ mod tests {
         input: OutputId,
         nonce: u64,
     ) -> ComputeTx {
+        settle_tx_with_tax(authority, key, object_id, input, nonce, 0)
+    }
+
+    fn settle_tx_with_tax(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        object_id: ObjectId,
+        input: OutputId,
+        nonce: u64,
+        priority_fee: u64,
+    ) -> ComputeTx {
         let tx = ComputeTx {
             tx_id: TxId(crate::crypto::Hash::zero()),
             domain_id: GAME_DOMAIN,
@@ -496,7 +524,7 @@ mod tests {
             network_id: Some(10088),
             witness: TxWitness { signatures: vec![], threshold: None },
             max_fee: 1_000_000_000,
-            priority_fee: 0,
+            priority_fee,
             gas_limit: 100_000,
         };
         sign(tx, key)
@@ -571,6 +599,84 @@ mod tests {
         let gas_used = crate::compute::estimate_tx_gas(&block.body.as_ref().unwrap().transactions[1]);
         assert_eq!(treasury_balance.as_u64(), gas_used); // base_fee=1
         assert_eq!(transition.to_root, state_db.state_root());
+    }
+
+    #[test]
+    fn priority_fee_is_credited_to_treasury_as_tax() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+        let object_id = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(b"taxobj")));
+
+        // 会话对象携带原生价值 100_000，结果对象带走 95_000，留 5_000 作 priority_fee（税）
+        let mint_tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![proposal_with_resources(
+                &authority,
+                object_id,
+                1,
+                None,
+                b"session".to_vec(),
+                100_000,
+            )],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let mint = sign(mint_tx, &key);
+        let input = mint.output_proposals[0].output_id;
+        // 交易税（市场税）via priority_fee，签名前设置；结果对象带走 95_000
+        let settle_tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![input],
+            read_set: vec![],
+            output_proposals: vec![proposal_with_resources(
+                &authority,
+                object_id,
+                2,
+                Some(input),
+                b"result".to_vec(),
+                95_000,
+            )],
+            fee: 0,
+            nonce: Some(2),
+            metadata: vec![],
+            payload: b"{}".to_vec(),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000_000,
+            priority_fee: 5_000,
+            gas_limit: 100_000,
+        };
+        let settle = sign(settle_tx, &key);
+        let txs = vec![mint, settle];
+        let receipts = make_receipts(&txs);
+        let block = build_block(txs, receipts);
+        executor.execute_block(&block, Hash::zero()).expect("block executes");
+
+        // 国库 = gas_used × base_fee(1) + priority_fee(5000)，封顶 max_fee
+        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        let gas_used = crate::compute::estimate_tx_gas(&block.body.as_ref().unwrap().transactions[1]);
+        assert_eq!(treasury, gas_used.saturating_add(5_000));
+        // 账本支出/收入不变量
+        let ledger = executor.treasury_ledger();
+        assert_eq!(ledger.balance(), treasury as u128);
     }
 
     #[test]
