@@ -41,6 +41,8 @@ pub enum ProposalKind {
     Freeze { object_id: String, reason: String },
     /// 新增玩法交易类型（链上批准 + 链下部署双轨）
     AddGameOp { op_name: String, description: String },
+    /// 山海币铸币提案：投票通过后由 Execute 铸造到目标地址（去中心化造币，替代单一权威）。
+    MintShc { to: String, amount: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,6 +257,8 @@ pub enum ProposalOutcome {
         op_name: String,
         description: String,
     },
+    /// 山海币铸币已执行（投票批准铸造；金额由执行器记入目标账户）。
+    MintShcExecuted { to: String, amount: u64 },
 }
 
 /// 提案生效执行（纯函数）：仅 `Passed` 可执行；`FundActivity` 从国库扣款。
@@ -298,6 +302,10 @@ pub fn execute_proposal(
         } => ProposalOutcome::GameOpApproved {
             op_name: op_name.clone(),
             description: description.clone(),
+        },
+        ProposalKind::MintShc { to, amount } => ProposalOutcome::MintShcExecuted {
+            to: to.clone(),
+            amount: *amount,
         },
     };
     p.status = ProposalStatus::Executed;

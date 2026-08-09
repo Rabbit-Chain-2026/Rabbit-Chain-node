@@ -1003,11 +1003,12 @@ impl RpcApi {
 
         // EIP-1559 fee validation (skip for legacy tx with zero fee fields,
         // unless require_fee_for_compute_tx is enabled).
-        // Mint / 山海币铸币（MintCoin）是价值创造操作，执行器策略明令禁止携带任何费用
-        // （execution/policy: Mint 要求 fee/max_fee/priority_fee 全 0，MintCoin 同样豁免），
-        // 因此 fee-required 校验对它们不适用，否则生产 profile 下永不可提交。
+        // Mint 是价值创造命令，执行器策略明令禁止携带任何费用
+        // （execution/policy: Mint 要求 fee/max_fee/priority_fee 全 0），
+        // 因此 fee-required 校验对 Mint 不适用，否则生产 profile 下 Mint 永不可提交。
+        // 山海币铸币走治理提案（Propose=Mint / Vote / Execute），不再有权威 MintCoin。
         let fee_absent = tx.max_fee == 0 && tx.priority_fee == 0 && tx.gas_limit == 0;
-        let is_mint = tx.command == Command::Mint || rabbitcore::game::is_mint_coin(&tx);
+        let is_mint = tx.command == Command::Mint;
         if !is_mint && fee_absent && self.config.require_fee_for_compute_tx {
             return Err(RpcErrorObject::invalid_params(
                 "fee required: max_fee/priority_fee/gas_limit must be set".to_string(),

@@ -27,28 +27,11 @@ pub(crate) fn gate_game_tx(
         return Ok(());
     }
     match tx.command {
-        Command::Mint => gate_propose_mint(tx)?,
+        Command::Mint => gate_propose_mint(tx, store)?,
         Command::Invoke => {
             let op = GameOp::parse(&tx.payload)
                 .map_err(|e| RpcErrorObject::invalid_params(format!("game payload invalid: {e}")))?;
             match &op {
-                GameOp::MintCoin { amount, .. } => {
-                    // 山海币发行门控：仅铸币权威（固定公钥）可铸造，防通胀。
-                    if !rabbitcore::game::is_mint_signer(tx) {
-                        return Err(RpcErrorObject::invalid_params(
-                            "mint denied: tx is not signed by the mint authority".into(),
-                        ));
-                    }
-                    // 通胀门控（与执行器一致）：单笔铸币不得超过治理策略上限。
-                    if let Some(policy) = load_mint_policy(store) {
-                        if *amount > policy.per_mint_cap {
-                            return Err(RpcErrorObject::invalid_params(format!(
-                                "mint denied: amount {} exceeds per-mint cap {}",
-                                amount, policy.per_mint_cap
-                            )));
-                        }
-                    }
-                }
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
                 GameOp::Enhance { rules_version, .. } => {
@@ -105,7 +88,10 @@ fn parse_proposal_state(state: &[u8]) -> Result<rabbitcore::governance::Proposal
 
 /// 治理 Propose（Mint 提案对象 v1）：校验创建规则（押金/窗口/初始状态），
 /// 防止伪造提案对象绕过治理门槛。非提案对象（session 等）放行。
-fn gate_propose_mint(tx: &ComputeTx) -> Result<(), RpcErrorObject> {
+fn gate_propose_mint(
+    tx: &ComputeTx,
+    store: &dyn ObjectStore,
+) -> Result<(), RpcErrorObject> {
     let Some(out) = tx.output_proposals.first() else {
         return Ok(());
     };
@@ -139,6 +125,27 @@ fn gate_propose_mint(tx: &ComputeTx) -> Result<(), RpcErrorObject> {
         return Err(RpcErrorObject::invalid_params(
             "fresh proposal must have zero votes".into(),
         ));
+    }
+    // 山海币铸币提案（MintShc）：结构性校验 + 治理铸币上限（MintPolicy）。
+    if let rabbitcore::governance::ProposalKind::MintShc { to, amount } = &proposal.kind {
+        if to.trim().is_empty() {
+            return Err(RpcErrorObject::invalid_params(
+                "mint proposal target must not be empty".into(),
+            ));
+        }
+        if *amount == 0 {
+            return Err(RpcErrorObject::invalid_params(
+                "mint proposal amount must be positive".into(),
+            ));
+        }
+        if let Some(policy) = load_mint_policy(store) {
+            if *amount > policy.per_mint_cap {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "mint denied: proposal amount {} exceeds per-mint cap {}",
+                    amount, policy.per_mint_cap
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1084,38 +1091,21 @@ mod config_gate_tests {
         assert!(err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("does not match"), "{err:?}");
     }
 
-    // ── 山海币铸币门控（MintCoin）────────────────────────────────
+    // ── 山海币治理铸币门控（MintShc 提案）────────────────────────────
 
-    fn mint_coin_tx_signed(key: &ed25519_dalek::SigningKey, to: Address, amount: u64) -> ComputeTx {
-        let op = GameOp::MintCoin {
-            to: format!("0x{}", hex::encode(to.as_bytes())),
-            amount,
-        };
-        let tx = ComputeTx {
-            tx_id: TxId(Hash::zero()),
-            domain_id: GAME_DOMAIN,
-            command: Command::Invoke,
-            input_set: vec![],
-            read_set: vec![],
-            output_proposals: vec![],
-            fee: 0,
-            nonce: Some(1),
-            metadata: vec![],
-            payload: serde_json::to_vec(&op).unwrap(),
-            deadline_unix_secs: None,
-            chain_id: Some(10088),
-            network_id: Some(10088),
-            witness: TxWitness { signatures: vec![], threshold: None },
-            max_fee: 0,
-            priority_fee: 0,
-            gas_limit: 0,
-        };
-        use ed25519_dalek::Signer as _;
-        let signature = key.sign(&tx.signing_preimage()).to_bytes();
-        let public_key = key.verifying_key().to_bytes();
-        let mut tx = tx;
-        tx.witness.signatures = vec![rabbitcore::compute::TxSignature::ed25519(signature, public_key)];
-        tx.with_expected_tx_id()
+    fn mint_shc_proposal_tx(_authority: &Address, to: Address, amount: u64) -> ComputeTx {
+        let p = rabbitcore::governance::create_proposal(
+            "gate-mint-shc",
+            rabbitcore::governance::ProposalKind::MintShc {
+                to: format!("0x{}", hex::encode(to.as_bytes())),
+                amount,
+            },
+            "0xproposer",
+            1000,
+            0,
+        )
+        .expect("proposal");
+        tx(Command::Mint, vec![], vec![], output_proposal(&p, 1, None))
     }
 
     fn test_target_address(seed: u8) -> Address {
@@ -1123,26 +1113,6 @@ mod config_gate_tests {
         let pk = k.verifying_key().to_bytes();
         let h = keccak256(&pk);
         Address::from_slice(&h[12..]).unwrap()
-    }
-
-    #[test]
-    fn mint_coin_authority_signed_accepted() {
-        let store = InMemoryObjectStore::new();
-        let authority = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]); // == 铸币权威私钥
-        let t = mint_coin_tx_signed(&authority, test_target_address(0x33), 1_000);
-        gate_game_tx(&t, &store, 100).expect("authority mint accepted");
-    }
-
-    #[test]
-    fn mint_coin_non_authority_denied() {
-        let store = InMemoryObjectStore::new();
-        let rogue = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
-        let t = mint_coin_tx_signed(&rogue, test_target_address(0x55), 1_000);
-        let err = gate_game_tx(&t, &store, 100).unwrap_err();
-        assert!(
-            err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("mint denied"),
-            "{err:?}"
-        );
     }
 
     fn insert_mint_policy(store: &InMemoryObjectStore, cap: u64, version: u64) -> OutputId {
@@ -1177,11 +1147,18 @@ mod config_gate_tests {
     }
 
     #[test]
-    fn mint_coin_over_policy_cap_rejected() {
+    fn mint_shc_proposal_within_cap_accepted() {
         let store = InMemoryObjectStore::new();
-        let authority = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]); // 铸币权威
+        let _ = insert_mint_policy(&store, 1_000_000, 1);
+        let t = mint_shc_proposal_tx(&Address::zero(), test_target_address(0x33), 1_000);
+        gate_game_tx(&t, &store, 100).expect("mint proposal within cap accepted");
+    }
+
+    #[test]
+    fn mint_shc_proposal_over_cap_rejected() {
+        let store = InMemoryObjectStore::new();
         let _ = insert_mint_policy(&store, 500, 1);
-        let t = mint_coin_tx_signed(&authority, test_target_address(0x77), 1_000);
+        let t = mint_shc_proposal_tx(&Address::zero(), test_target_address(0x55), 1_000);
         let err = gate_game_tx(&t, &store, 100).unwrap_err();
         assert!(
             err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("exceeds per-mint cap"),

@@ -176,8 +176,8 @@ impl ComputeTx {
         );
         let needs_outputs = !matches!(self.command, Command::Burn);
 
-        // 纯载荷 Invoke（如山海币 MintCoin）：无输入无输出的 payload-only 交易合法，
-        // 语义由域门控/执行器（gate_game_tx / economy effects）决定。
+        // 纯载荷 Invoke（如山海币 TransferCoin 转账）：无输入无输出的 payload-only
+        // 交易合法，语义由域门控/执行器（gate_game_tx / economy effects）决定。
         let payload_only_invoke = matches!(self.command, Command::Invoke)
             && self.input_set.is_empty()
             && !self.payload.is_empty();

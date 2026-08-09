@@ -54,11 +54,6 @@ pub enum GameOp {
     Execute {
         proposal_id: String,
     },
-    /// 山海币发行：权威账户向目标地址铸造（门控：仅铸币权威可提交，见 `mint_authority`）。
-    MintCoin {
-        to: String,
-        amount: u64,
-    },
     /// 山海币转账：玩家向目标地址转移 SHC（扣发送者，入接收者；gas 由发送者承担）。
     TransferCoin {
         to: String,
@@ -131,47 +126,7 @@ pub fn mint_policy_object_id() -> crate::compute::ObjectId {
     )))
 }
 
-/// 山海币铸币权威公钥（共识固定）：对应私钥由游戏运营方持有
-/// （devnet = SH_AUTH_KEY，即服务器权威密钥；公钥 = ed25519 pubkey）。
-pub const MINT_AUTHORITY_PUBKEY: [u8; 32] = [
-    0xd0, 0x4a, 0xb2, 0x32, 0x74, 0x2b, 0xb4, 0xab, 0x3a, 0x13, 0x68, 0xbd, 0x46, 0x15, 0xe4,
-    0xe6, 0xd0, 0x22, 0x4a, 0xb7, 0x1a, 0x01, 0x6b, 0xaf, 0x85, 0x20, 0xa3, 0x32, 0xc9, 0x77,
-    0x87, 0x37,
-];
-
-/// 山海币铸币权威地址（由固定公钥 ed25519 派生）。
-pub fn mint_authority() -> crate::crypto::Address {
-    let hash = crate::crypto::keccak256(&MINT_AUTHORITY_PUBKEY);
-    crate::crypto::Address::from_slice(&hash[12..]).expect("mint authority")
-}
-
-/// 交易是否由铸币权威签名（首个 ed25519 签名的公钥 == 固定公钥）。
-pub fn is_mint_signer(tx: &crate::compute::ComputeTx) -> bool {
-    for sig in &tx.witness.signatures {
-        if sig.scheme == crate::compute::SignatureScheme::Ed25519 {
-            if let Some(pk) = &sig.public_key {
-                if pk.as_slice() == MINT_AUTHORITY_PUBKEY {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// 交易是否为山海币铸币交易（GAME_DOMAIN + `Invoke` + payload = `GameOp::MintCoin`）。
-/// 与 `Command::Mint` 一致：铸币是价值创造操作，免收 gas（fee 字段全 0）。
-pub fn is_mint_coin(tx: &crate::compute::ComputeTx) -> bool {
-    if tx.domain_id != crate::compute::GAME_DOMAIN || tx.command != crate::compute::Command::Invoke {
-        return false;
-    }
-    matches!(
-        GameOp::parse(&tx.payload),
-        Ok(GameOp::MintCoin { .. })
-    )
-}
-
-/// 提取交易首个 ed25519 签名的派生地址（用于铸币授权判定）。
+/// 提取交易首个 ed25519 签名的派生地址（增强/转账的付款方判定）。
 pub fn ed25519_signer_address(tx: &crate::compute::ComputeTx) -> Option<crate::crypto::Address> {
     for sig in &tx.witness.signatures {
         if sig.scheme == crate::compute::SignatureScheme::Ed25519 {
@@ -305,15 +260,6 @@ pub fn verify_with_config(
                 "approve": approve,
                 "stake": stake,
             }))
-        }
-        GameOp::MintCoin { to, amount } => {
-            if to.trim().is_empty() {
-                return Err(GameError::InvalidPayload("mint target must not be empty".into()));
-            }
-            if *amount == 0 {
-                return Err(GameError::InvalidPayload("mint amount must be positive".into()));
-            }
-            Ok(serde_json::json!({ "to": to, "amount": amount }))
         }
         GameOp::TransferCoin { to, amount } => {
             if to.trim().is_empty() {
