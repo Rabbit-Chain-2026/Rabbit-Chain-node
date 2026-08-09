@@ -25,6 +25,8 @@ pub struct StateDb {
     state_root: RwLock<Hash>,
     /// Account cache
     accounts: RwLock<std::collections::HashMap<Address, Account>>,
+    /// Token balance ledger (双代币拆分：NATIVE / SHC / 未来游戏代币)
+    token_balances: RwLock<std::collections::HashMap<(Address, crate::assets::TokenId), U256>>,
     /// Storage cache
     storage: RwLock<std::collections::HashMap<Address, std::collections::HashMap<Hash, Hash>>>,
     /// Code cache
@@ -36,6 +38,7 @@ impl StateDb {
         Self {
             state_root: RwLock::new(state_root),
             accounts: RwLock::new(std::collections::HashMap::new()),
+            token_balances: RwLock::new(std::collections::HashMap::new()),
             storage: RwLock::new(std::collections::HashMap::new()),
             codes: RwLock::new(std::collections::HashMap::new()),
         }
@@ -59,6 +62,28 @@ impl StateDb {
             .get(address)
             .map(|a| a.balance)
             .unwrap_or_default()
+    }
+
+    /// 代币余额查询（NATIVE 走 account.balance，其他走代币账本）。
+    pub fn get_token_balance(&self, address: &Address, token: crate::assets::TokenId) -> U256 {
+        if token == crate::assets::NATIVE_TOKEN {
+            return self.get_balance(address);
+        }
+        self.token_balances
+            .read()
+            .get(&(*address, token))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 代币余额写入（NATIVE 写 account.balance）。
+    pub fn set_token_balance(&self, address: Address, token: crate::assets::TokenId, amount: U256) {
+        if token == crate::assets::NATIVE_TOKEN {
+            return self.set_balance(address, amount);
+        }
+        self.token_balances
+            .write()
+            .insert((address, token), amount);
     }
 
     pub fn get_nonce(&self, address: &Address) -> u64 {
@@ -143,11 +168,18 @@ impl StateDb {
         // Simplified state root computation
         // In production, this would use Merkle Patricia Trie
         let accounts = self.accounts.read();
+        let tokens = self.token_balances.read();
         let mut data = Vec::new();
 
         for (address, account) in accounts.iter() {
             data.extend_from_slice(address.as_bytes());
             data.extend_from_slice(&account.balance.to_big_endian());
+        }
+        // 代币账本纳入状态根（共识校验：跨节点余额一致）
+        for ((address, token), balance) in tokens.iter() {
+            data.extend_from_slice(address.as_bytes());
+            data.extend_from_slice(&token.0.to_be_bytes());
+            data.extend_from_slice(&balance.to_big_endian());
         }
 
         Hash::from_bytes(crate::crypto::keccak256(&data))

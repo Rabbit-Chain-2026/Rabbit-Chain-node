@@ -756,6 +756,7 @@ impl RpcApi {
 
             // RabbitChain extensions
             "rabbit_getAccount" => self.rabbit_get_account(params),
+            "rabbit_getTokenBalance" => self.rabbit_get_token_balance(params),
             "rabbit_getUtxos" => self.rabbit_get_utxos(params),
             "rabbit_getObject" => self.rabbit_get_object(params),
             "rabbit_getOutput" => self.rabbit_get_output(params),
@@ -883,6 +884,32 @@ impl RpcApi {
             "address": format_rabbit_address(address),
             "balance": format_u256_hex(balance),
             "nonce": format!("0x{:x}", nonce),
+        }))
+    }
+
+    /// `rabbit_getTokenBalance`：查询任意代币余额（`token_id`：0 = 原生，1 = SHC，1+ 游戏代币）。
+    fn rabbit_get_token_balance(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let params = params.ok_or(RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let address = params
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcErrorObject::invalid_params("address is required".to_string()))?
+            .to_string();
+        let address = parse_address(&address)?;
+        let token_id = params
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let token = rabbitcore::assets::TokenId::new(token_id);
+        let balance = self.state_db.get_token_balance(&address, token);
+        Ok(serde_json::json!({
+            "address": format_rabbit_address(address),
+            "token_id": token_id,
+            "token": if token == rabbitcore::assets::NATIVE_TOKEN { "native" } else if token == rabbitcore::assets::SHC_TOKEN { "shc" } else { "game" },
+            "balance": format!("0x{:x}", balance.as_u128()),
         }))
     }
 
@@ -1126,8 +1153,8 @@ impl RpcApi {
             "base_fee_shc": base_fee_shc,
             "suggested_priority_fee": format!("0x{:x}", suggested_priority_fee_shc),
             "suggested_priority_fee_shc": suggested_priority_fee_shc,
-            "unit": "shc",
-            "note": "SHC (山海币) 计价：max_fee/priority_fee/base_fee_per_gas 均以 SHC 计，1 SHC/gas 为初始基础费。",
+            "unit": "native",
+            "note": "原生代币计价：max_fee/priority_fee/base_fee_per_gas 均以原生代币计（1/gas 初始基础费）；游戏代币（SHC）走 token 账本。",
         }))
     }
 
@@ -1988,9 +2015,18 @@ impl RpcApi {
         let treasury = rabbitcore::governance::treasury_address();
         let account = self.state_db.get_account(&treasury).unwrap_or_default();
         let ledger = self.state_executor.treasury_ledger();
+        let native_balance = account.balance.as_u128();
+        let shc_balance = self
+            .state_db
+            .get_token_balance(&treasury, rabbitcore::assets::SHC_TOKEN)
+            .as_u128();
         Ok(serde_json::json!({
             "address": format!("0x{}", hex::encode(treasury.as_bytes())),
-            "balance": format!("0x{:x}", account.balance.as_u128()),
+            "balance": format!("0x{:x}", native_balance),
+            "balances": {
+                "native": format!("0x{:x}", native_balance),
+                "shc": format!("0x{:x}", shc_balance),
+            },
             "ledger": {
                 "balance": ledger.balance(),
                 "events": ledger.events(),
@@ -2050,14 +2086,23 @@ impl RpcApi {
             .and_then(|v| v.as_u64())
             .unwrap_or(1_000_000_000)
             .min(1_000_000_000_000);
-        let mut account = self.state_db.get_account(&address).unwrap_or_default();
-        account.balance = account.balance.saturating_add(U256::from(amount));
-        account.state = rabbitcore::account::AccountState::Active;
-        self.state_db.insert_account(address, account);
+        let token_id = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
+        let token = rabbitcore::assets::TokenId::new(token_id);
+        if token == rabbitcore::assets::NATIVE_TOKEN {
+            let mut account = self.state_db.get_account(&address).unwrap_or_default();
+            account.balance = account.balance.saturating_add(U256::from(amount));
+            account.state = rabbitcore::account::AccountState::Active;
+            self.state_db.insert_account(address, account);
+        } else {
+            let balance = self.state_db.get_token_balance(&address, token);
+            self.state_db
+                .set_token_balance(address, token, balance.saturating_add(U256::from(amount)));
+        }
         Ok(serde_json::json!({
             "address": format!("0x{}", hex::encode(address.as_bytes())),
+            "token_id": token_id,
             "funded": amount,
-            "balance": format!("0x{:x}", self.state_db.get_balance(&address).as_u128()),
+            "balance": format!("0x{:x}", self.state_db.get_token_balance(&address, token).as_u128()),
         }))
     }
 

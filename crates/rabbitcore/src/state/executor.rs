@@ -398,10 +398,10 @@ impl StateExecutor {
         if let crate::governance::ProposalKind::FundActivity { amount, .. } = &proposal.kind {
             self.debit_treasury(*amount)?;
         }
-        // 2) MintShc：投票批准的铸币入账（价值创造；预检已校验治理上限）。
+        // 2) MintShc：投票批准的铸币入账（价值创造；预检已校验治理上限）——SHC 游戏代币。
         if let crate::governance::ProposalKind::MintShc { to, amount } = &proposal.kind {
             let target = parse_address_hex(to)?;
-            self.credit_account(target, *amount);
+            self.credit_token(target, crate::assets::SHC_TOKEN, *amount);
         }
         // 3) 账本：应用完整治理效果（FundActivity 记支出；全部类型记生效产物），
         //    与 execute_proposal 同一纯函数，确定性跨节点一致。
@@ -426,12 +426,11 @@ impl StateExecutor {
             .map_err(|e| ExecutionError::Block(format!("invalid proposal object state: {e}")))
     }
 
-    /// 国库账户当前余额。
+    /// 国库 SHC 余额（游戏代币；FundActivity 支出以此衡量）。
     fn treasury_balance(&self) -> u128 {
         self.state_db
-            .get_account(&self.treasury)
-            .map(|a| a.balance.as_u128())
-            .unwrap_or(0)
+            .get_token_balance(&self.treasury, crate::assets::SHC_TOKEN)
+            .as_u128()
     }
 
     /// 校验单笔 receipt 与重算一致（共识结算：任何节点重跑一致）。
@@ -611,9 +610,8 @@ impl StateExecutor {
                 })?;
                 let balance = self
                     .state_db
-                    .get_account(&payer)
-                    .map(|a| a.balance.as_u64())
-                    .unwrap_or(0);
+                    .get_token_balance(&payer, crate::assets::SHC_TOKEN)
+                    .as_u64();
                 if balance < amount {
                     return Err(ExecutionError::Block(format!(
                         "insufficient shc balance {} needed {} for transfer",
@@ -629,9 +627,8 @@ impl StateExecutor {
                 })?;
                 let balance = self
                     .state_db
-                    .get_account(&payer)
-                    .map(|a| a.balance.as_u64())
-                    .unwrap_or(0);
+                    .get_token_balance(&payer, crate::assets::SHC_TOKEN)
+                    .as_u64();
                 if balance < cost {
                     return Err(ExecutionError::Block(format!(
                         "insufficient shc balance {} needed {} for enhance",
@@ -661,8 +658,8 @@ impl StateExecutor {
                     ExecutionError::Block("transfer requires an ed25519 signer".to_string())
                 })?;
                 let target = parse_address_hex(&to)?;
-                self.debit_account(payer, amount)?;
-                self.credit_account(target, amount);
+                self.debit_token(payer, crate::assets::SHC_TOKEN, amount)?;
+                self.credit_token(target, crate::assets::SHC_TOKEN, amount);
                 Ok(())
             }
             GameOp::Enhance { current_level, .. } | GameOp::ZkEnhance { current_level, .. } => {
@@ -670,13 +667,8 @@ impl StateExecutor {
                 let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
                     ExecutionError::Block("enhance requires an ed25519 signer".to_string())
                 })?;
-                self.debit_account(payer, cost)?;
-                self.credit_account(self.treasury, cost);
-                // 强化成本入国库账本（SHC sink，与账户余额一致：账本 = 账户）。
-                self.ledger
-                    .write()
-                    .expect("treasury ledger lock")
-                    .record_income("shc_enhance_cost", cost);
+                self.debit_token(payer, crate::assets::SHC_TOKEN, cost)?;
+                self.credit_treasury_token(crate::assets::SHC_TOKEN, cost);
                 Ok(())
             }
             _ => Ok(()),
@@ -712,19 +704,19 @@ impl StateExecutor {
         Ok(cfg.cost_sh[current_level.min(11) as usize] as u64)
     }
 
-    /// 账户余额增加（山海币）。
+    /// 原生账户余额增加（gas / 出块奖励 / 原生税）。
     fn credit_account(&self, address: Address, amount: u64) {
         let mut account = self.state_db.get_account(&address).unwrap_or_default();
         account.balance = account.balance.saturating_add(U256::from(amount));
         self.state_db.insert_account(address, account);
     }
 
-    /// 账户余额扣减（山海币），余额不足返回 Err（不改变状态）。
+    /// 原生账户余额扣减，余额不足返回 Err（不改变状态）。
     fn debit_account(&self, address: Address, amount: u64) -> Result<()> {
         let mut account = self.state_db.get_account(&address).unwrap_or_default();
         if account.balance < U256::from(amount) {
             return Err(ExecutionError::Block(format!(
-                "insufficient shc balance {} needed {}",
+                "insufficient balance {} needed {}",
                 account.balance, amount
             )));
         }
@@ -733,29 +725,54 @@ impl StateExecutor {
         Ok(())
     }
 
-    /// 费用入国库账户（确定性，跨节点一致），并同步记入国库账本（审计视图）。
+    /// 代币余额增加（SHC 等游戏代币；NATIVE 走 credit_account）。
+    fn credit_token(&self, address: Address, token: crate::assets::TokenId, amount: u64) {
+        if token == crate::assets::NATIVE_TOKEN {
+            return self.credit_account(address, amount);
+        }
+        let balance = self.state_db.get_token_balance(&address, token);
+        self.state_db
+            .set_token_balance(address, token, balance.saturating_add(U256::from(amount)));
+    }
+
+    /// 代币余额扣减，余额不足返回 Err（不改变状态）。
+    fn debit_token(&self, address: Address, token: crate::assets::TokenId, amount: u64) -> Result<()> {
+        if token == crate::assets::NATIVE_TOKEN {
+            return self.debit_account(address, amount);
+        }
+        let balance = self.state_db.get_token_balance(&address, token);
+        if balance < U256::from(amount) {
+            return Err(ExecutionError::Block(format!(
+                "insufficient token balance {} needed {}",
+                balance, amount
+            )));
+        }
+        self.state_db
+            .set_token_balance(address, token, balance.saturating_sub(U256::from(amount)));
+        Ok(())
+    }
+
+    /// 原生费用入国库（gas / 优先费税；确定性，跨节点一致），并记入国库账本。
     fn credit_treasury(&self, fee: u64) {
-        let mut account = self.state_db.get_account(&self.treasury).unwrap_or_default();
-        account.balance = account.balance.saturating_add(U256::from(fee));
-        self.state_db.insert_account(self.treasury, account);
+        self.credit_account(self.treasury, fee);
         self.ledger
             .write()
             .expect("treasury ledger lock")
             .record_income("block_gas_fee", fee);
     }
 
-    /// 从国库账户扣款（FundActivity 生效执行；确定性，跨节点一致）。
+    /// 游戏代币入国库（SHC：强化成本 sink）。
+    fn credit_treasury_token(&self, token: crate::assets::TokenId, amount: u64) {
+        self.credit_token(self.treasury, token, amount);
+        self.ledger
+            .write()
+            .expect("treasury ledger lock")
+            .record_income("shc_enhance_cost", amount);
+    }
+
+    /// 从国库 SHC 扣款（FundActivity 生效执行；确定性，跨节点一致）。
     fn debit_treasury(&self, amount: u64) -> Result<()> {
-        let mut account = self.state_db.get_account(&self.treasury).unwrap_or_default();
-        if account.balance < U256::from(amount) {
-            return Err(ExecutionError::Block(format!(
-                "insufficient treasury balance {} needed {}",
-                account.balance, amount
-            )));
-        }
-        account.balance = account.balance.saturating_sub(U256::from(amount));
-        self.state_db.insert_account(self.treasury, account);
-        Ok(())
+        self.debit_token(self.treasury, crate::assets::SHC_TOKEN, amount)
     }
 }
 
@@ -843,6 +860,17 @@ mod tests {
         let mut account = state_db.get_account(address).unwrap_or_default();
         account.balance = U256::from(amount);
         state_db.insert_account(*address, account);
+    }
+
+    /// 测试资助：给账户注入任意代币余额（SHC 游戏代币等）。
+    fn fund_token(
+        state_db: &Arc<StateDb>,
+        address: &crate::crypto::Address,
+        token: crate::assets::TokenId,
+        amount: u64,
+    ) {
+        let balance = state_db.get_token_balance(address, token);
+        state_db.set_token_balance(*address, token, balance.saturating_add(U256::from(amount)));
     }
 
     fn mint_session_tx(
@@ -1379,7 +1407,11 @@ mod tests {
         assert_eq!(receipts[1].status, ReceiptStatus::Success, "propose: {:?}", receipts[1].error);
         assert_eq!(receipts[2].status, ReceiptStatus::Success, "vote: {:?}", receipts[2].error);
         assert_eq!(receipts[3].status, ReceiptStatus::Success, "execute: {:?}", receipts[3].error);
-        assert_eq!(state_db.get_balance(&target).as_u64(), 1_000, "vote-approved mint credited");
+        assert_eq!(
+            state_db.get_token_balance(&target, crate::assets::SHC_TOKEN).as_u64(),
+            1_000,
+            "vote-approved mint credited"
+        );
         // 生效产物记录 MintShcExecuted；账本 == 账户（vote/execute 的 gas 入国库）
         let ledger = executor.treasury_ledger();
         assert_eq!(
@@ -1423,7 +1455,11 @@ mod tests {
             "{:?}",
             receipts[3].error
         );
-        assert_eq!(state_db.get_balance(&target).as_u64(), 0, "no credit on rejection");
+        assert_eq!(
+            state_db.get_token_balance(&target, crate::assets::SHC_TOKEN).as_u64(),
+            0,
+            "no credit on rejection"
+        );
     }
 
     #[test]
@@ -1439,6 +1475,7 @@ mod tests {
             let h = crate::crypto::keccak256(&pk);
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
+        fund_native(&state_db, &player_addr, 1_000_000_000); // 玩家 native 余额付 gas
 
         // 配置对象 + 铸币政策（上限覆盖铸币量）+ 治理铸币给玩家 + 玩家自有装备
         let config = mint_config_tx(&authority, &auth_key, 1);
@@ -1544,13 +1581,23 @@ mod tests {
         assert_eq!(receipts[5].status, ReceiptStatus::Success, "equip");
         assert_eq!(receipts[6].status, ReceiptStatus::Success, "enhance: {:?}", receipts[6].error);
 
-        // 玩家余额 = 1_000_000 - 10（强化成本） - gas 费（增强交易的 gas×base_fee=1）
-        let player_bal = state_db.get_balance(&player_addr).as_u64();
-        assert_eq!(player_bal, 1_000_000 - 10 - enhance_gas);
-        // 国库：+10 成本 + gas 费（vote + execute + enhance；propose/policy/config 是 Mint 免收）
-        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
-        assert_eq!(treasury, 10 + vote_gas + execute_gas + enhance_gas);
-        assert_eq!(executor.treasury_ledger().balance(), treasury as u128);
+        // 双代币拆分：强化成本走 SHC（1_000_000 - 10），gas 走 native（1_000_000_000 - gas）
+        let player_shc = state_db.get_token_balance(&player_addr, crate::assets::SHC_TOKEN).as_u64();
+        assert_eq!(player_shc, 1_000_000 - 10);
+        let player_native = state_db.get_balance(&player_addr).as_u64();
+        assert_eq!(player_native, 1_000_000_000 - enhance_gas);
+        // 国库：SHC +10（强化成本 sink）；native + gas（vote + execute + enhance；Mint 免收）
+        let treasury_shc = state_db
+            .get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN)
+            .as_u64();
+        assert_eq!(treasury_shc, 10);
+        let treasury_native = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(treasury_native, vote_gas + execute_gas + enhance_gas);
+        // 账本 = 混合审计视图（native gas 收入 + SHC 成本收入）
+        assert_eq!(
+            executor.treasury_ledger().balance(),
+            (treasury_native + treasury_shc) as u128
+        );
     }
 
     #[test]
@@ -1566,6 +1613,7 @@ mod tests {
             let h = crate::crypto::keccak256(&pk);
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
+        fund_native(&state_db, &player_addr, 1_000_000_000); // 玩家 native 余额付 gas
 
         let config = mint_config_tx(&authority, &auth_key, 1);
         let policy = mint_policy_tx(&authority, &auth_key, 6_000_000, 2);
@@ -1667,14 +1715,26 @@ mod tests {
             )
             .expect("execute economy");
         assert_eq!(receipts[6].status, ReceiptStatus::Success, "zk enhance: {:?}", receipts[6].error);
-        // 玩家扣 cost(10) + gas；国库 +10 + gas
+        // 双代币：SHC 扣强化成本(10)，native 扣 gas
+        assert_eq!(
+            state_db.get_token_balance(&player_addr, crate::assets::SHC_TOKEN).as_u64(),
+            5_000_000 - 10
+        );
         assert_eq!(
             state_db.get_balance(&player_addr).as_u64(),
-            5_000_000 - 10 - enhance_fee
+            1_000_000_000 - enhance_fee
         );
-        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
-        assert_eq!(treasury, 10 + enhance_fee + crate::compute::estimate_tx_gas(&trip[1])
-            + crate::compute::estimate_tx_gas(&trip[2]));
+        // 国库：SHC +10；native + gas（enhance + vote + execute）
+        let treasury_shc = state_db
+            .get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN)
+            .as_u64();
+        assert_eq!(treasury_shc, 10);
+        let treasury_native = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(
+            treasury_native,
+            enhance_fee + crate::compute::estimate_tx_gas(&trip[1])
+                + crate::compute::estimate_tx_gas(&trip[2])
+        );
     }
 
     #[test]
@@ -2005,6 +2065,85 @@ mod tests {
     }
 
     #[test]
+    fn native_and_shc_ledgers_are_independent() {
+        // B：双代币拆分——转账/强化成本走 SHC token 账本，gas 走 native 账本。
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        let (payer_addr, payer_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x44; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &payer_addr, 1_000_000_000);
+        fund_token(&state_db, &payer_addr, crate::assets::SHC_TOKEN, 100_000);
+        let (receiver_addr, _rk) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x45; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+
+        let op = GameOp::TransferCoin {
+            to: format!("0x{}", hex::encode(receiver_addr.as_bytes())),
+            amount: 3_000,
+        };
+        let transfer = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(5),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("transfer op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let transfer = sign(transfer, &payer_key);
+        let transfer_gas = crate::compute::estimate_tx_gas(&transfer);
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[transfer], 1, 1_700_000_000, &basic)
+            .expect("execute transfer");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "{:?}", receipts[0].error);
+
+        // SHC：发送者 100_000 - 3_000，接收者 +3_000（native 不受转账影响）
+        assert_eq!(
+            state_db.get_token_balance(&payer_addr, crate::assets::SHC_TOKEN).as_u64(),
+            100_000 - 3_000
+        );
+        assert_eq!(
+            state_db.get_token_balance(&receiver_addr, crate::assets::SHC_TOKEN).as_u64(),
+            3_000
+        );
+        // native：只扣 gas（转账不碰 native 余额）
+        assert_eq!(state_db.get_balance(&payer_addr).as_u64(), 1_000_000_000 - transfer_gas);
+        assert_eq!(state_db.get_balance(&receiver_addr).as_u64(), 0);
+        // 国库：native 收 gas；SHC 分文未动（转账无税）
+        assert_eq!(
+            state_db.get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN).as_u64(),
+            0
+        );
+        assert_eq!(
+            state_db.get_balance(&crate::governance::treasury_address()).as_u64(),
+            transfer_gas
+        );
+    }
+
+    #[test]
     fn transfer_coin_moves_shc_between_accounts() {
         let state_db = Arc::new(StateDb::new(Hash::zero()));
         let executor = StateExecutor::new(state_db.clone(), 10088);
@@ -2017,6 +2156,7 @@ mod tests {
             let h = crate::crypto::keccak256(&pk);
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
+        fund_native(&state_db, &payer_addr, 100_000_000); // 玩家 native 余额付 gas
         let (receiver_addr, _rk) = {
             use ed25519_dalek::SigningKey;
             let k = SigningKey::from_bytes(&[0x88; 32]);
@@ -2076,9 +2216,19 @@ mod tests {
         assert_eq!(receipts[3].status, ReceiptStatus::Success, "execute");
         assert_eq!(receipts[4].status, ReceiptStatus::Success, "transfer: {:?}", receipts[4].error);
 
-        // 发送者 = 100_000 - 3_000（转账额） - gas；接收者 = 3_000；国库 = vote/execute/transfer gas
-        assert_eq!(state_db.get_balance(&payer_addr).as_u64(), 100_000 - 3_000 - transfer_gas);
-        assert_eq!(state_db.get_balance(&receiver_addr).as_u64(), 3_000);
+        // 双代币：转账走 SHC（100_000 - 3_000）；gas 走 native（100_000_000 - transfer_gas）
+        assert_eq!(
+            state_db.get_token_balance(&payer_addr, crate::assets::SHC_TOKEN).as_u64(),
+            100_000 - 3_000
+        );
+        assert_eq!(
+            state_db.get_token_balance(&receiver_addr, crate::assets::SHC_TOKEN).as_u64(),
+            3_000
+        );
+        assert_eq!(
+            state_db.get_balance(&payer_addr).as_u64(),
+            100_000_000 - transfer_gas
+        );
         let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
         assert_eq!(treasury, vote_gas + execute_gas + transfer_gas);
     }
@@ -2096,6 +2246,7 @@ mod tests {
             let h = crate::crypto::keccak256(&pk);
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
+        fund_native(&state_db, &payer_addr, 100_000_000); // 够付 gas 但 SHC 不够转账额
         let (receiver_addr, _rk) = {
             use ed25519_dalek::SigningKey;
             let k = SigningKey::from_bytes(&[0xaa; 32]);
@@ -2146,8 +2297,15 @@ mod tests {
             "{:?}",
             receipts[4].error
         );
-        assert_eq!(state_db.get_balance(&payer_addr).as_u64(), 40_000, "no state change on rejection");
-        assert_eq!(state_db.get_balance(&receiver_addr).as_u64(), 0);
+        assert_eq!(
+            state_db.get_token_balance(&payer_addr, crate::assets::SHC_TOKEN).as_u64(),
+            40_000,
+            "no state change on rejection"
+        );
+        assert_eq!(
+            state_db.get_token_balance(&receiver_addr, crate::assets::SHC_TOKEN).as_u64(),
+            0
+        );
     }
 
     // ── 治理生效（FundActivity 扣国库）──────────────────────────────
@@ -2293,6 +2451,8 @@ mod tests {
         let executor = StateExecutor::new(state_db.clone(), 10088);
         let (authority, key) = authority();
         fund_native(&state_db, &authority, 100_000_000_000);
+        // FundActivity 支出走 SHC 国库：先注入 SHC
+        fund_token(&state_db, &crate::governance::treasury_address(), crate::assets::SHC_TOKEN, 1_000);
 
         let (txs, _object_id) = governance_trip(&authority, &key, "fund-ok", 50);
         let basic = executor.new_basic_executor();
@@ -2303,10 +2463,16 @@ mod tests {
         assert_eq!(receipts[1].status, ReceiptStatus::Success); // vote（产生费用进国库）
         assert_eq!(receipts[2].status, ReceiptStatus::Success); // execute（扣款 50）
 
-        // 国库账户被扣 50：账本余额 == 账户余额（不变量）
-        let account = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        // 国库 SHC 被扣 50（1_000 - 50）；native 收 vote/execute 的 gas
+        let account_shc = state_db
+            .get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN)
+            .as_u64();
+        assert_eq!(account_shc, 1_000 - 50, "FundActivity debits SHC treasury");
         let ledger = executor.treasury_ledger();
-        assert_eq!(ledger.balance(), account as u128, "ledger/account invariant");
+        // 账本 = 审计视图：gas 收入（vote + execute）减去 FundActivity 支出 50
+        let native_gas_income = crate::compute::estimate_tx_gas(&txs[1])
+            + crate::compute::estimate_tx_gas(&txs[2]);
+        assert_eq!(ledger.balance(), (native_gas_income - 50) as u128);
         assert!(
             ledger
                 .events()

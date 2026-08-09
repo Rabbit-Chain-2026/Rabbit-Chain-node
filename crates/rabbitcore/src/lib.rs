@@ -17,6 +17,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod account;
+pub mod assets;
 pub mod block;
 pub mod blockchain;
 pub mod compute;
