@@ -909,6 +909,22 @@ struct PersistedBlockRecord {
     extra_data: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body: Option<BlockBody>,
+    // 完整头部字段（旧 v1 记录缺省，按旧链值回退；base_fee 改 SHC 计价后必须持久化，
+    // 否则重建头部 compute_hash ≠ 原 hash → genesis_record_hash_mismatch）。
+    #[serde(default = "default_legacy_base_fee")]
+    base_fee_per_gas: U256,
+    #[serde(default)]
+    state_root: Hash,
+    #[serde(default)]
+    transactions_root: Hash,
+    #[serde(default)]
+    receipts_root: Hash,
+    #[serde(default = "default_block_gas_limit")]
+    gas_limit: u64,
+    #[serde(default)]
+    gas_used: u64,
+    #[serde(default)]
+    uncle_hashes: Vec<Hash>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -921,6 +937,14 @@ struct PersistedBlockBodyRecord {
 
 fn default_persisted_header_version() -> u32 {
     1
+}
+
+fn default_legacy_base_fee() -> U256 {
+    U256::from(1_000_000_000u64) // 旧链基础费（hopps 计价 era）；新记录始终持久化真实值
+}
+
+fn default_block_gas_limit() -> u64 {
+    30_000_000
 }
 
 impl From<&Block> for PersistedBlockRecord {
@@ -938,6 +962,13 @@ impl From<&Block> for PersistedBlockRecord {
             mix_hash: block.header.mix_hash,
             extra_data: block.header.extra_data.clone(),
             body: block.body.clone(),
+            base_fee_per_gas: block.header.base_fee_per_gas,
+            state_root: block.header.state_root,
+            transactions_root: block.header.transactions_root,
+            receipts_root: block.header.receipts_root,
+            gas_limit: block.header.gas_limit,
+            gas_used: block.header.gas_used,
+            uncle_hashes: block.header.uncle_hashes.clone(),
         }
     }
 }
@@ -951,20 +982,20 @@ impl PersistedBlockRecord {
         Block::new(BlockHeader {
             version: self.header_version,
             parent_hash: self.parent_hash,
-            uncle_hashes: Vec::new(),
+            uncle_hashes: self.uncle_hashes,
             coinbase: self.coinbase,
-            state_root: Hash::zero(),
-            transactions_root: Hash::zero(),
-            receipts_root: Hash::zero(),
+            state_root: self.state_root,
+            transactions_root: self.transactions_root,
+            receipts_root: self.receipts_root,
             number: U256::from(self.number),
-            gas_limit: 30_000_000,
-            gas_used: 0,
+            gas_limit: self.gas_limit,
+            gas_used: self.gas_used,
             timestamp: self.timestamp,
             difficulty: self.difficulty,
             nonce: self.nonce,
             extra_data: self.extra_data,
             mix_hash: self.mix_hash,
-            base_fee_per_gas: U256::from(1_000_000_000u64),
+            base_fee_per_gas: self.base_fee_per_gas,
             hash: self.hash,
         })
         .with_body(body)

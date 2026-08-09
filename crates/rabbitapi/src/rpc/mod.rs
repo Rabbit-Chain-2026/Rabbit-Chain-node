@@ -1003,11 +1003,11 @@ impl RpcApi {
 
         // EIP-1559 fee validation (skip for legacy tx with zero fee fields,
         // unless require_fee_for_compute_tx is enabled).
-        // Mint 是价值创造命令，执行器策略明令禁止携带任何费用
-        // （execution/policy: Mint 要求 fee/max_fee/priority_fee 全 0），
-        // 因此 fee-required 校验对 Mint 不适用，否则生产 profile 下 Mint 永不可提交。
+        // Mint / 山海币铸币（MintCoin）是价值创造操作，执行器策略明令禁止携带任何费用
+        // （execution/policy: Mint 要求 fee/max_fee/priority_fee 全 0，MintCoin 同样豁免），
+        // 因此 fee-required 校验对它们不适用，否则生产 profile 下永不可提交。
         let fee_absent = tx.max_fee == 0 && tx.priority_fee == 0 && tx.gas_limit == 0;
-        let is_mint = tx.command == Command::Mint;
+        let is_mint = tx.command == Command::Mint || rabbitcore::game::is_mint_coin(&tx);
         if !is_mint && fee_absent && self.config.require_fee_for_compute_tx {
             return Err(RpcErrorObject::invalid_params(
                 "fee required: max_fee/priority_fee/gas_limit must be set".to_string(),
@@ -1097,19 +1097,16 @@ impl RpcApi {
         &self,
         _params: Option<Vec<serde_json::Value>>,
     ) -> Result<serde_json::Value, RpcErrorObject> {
-        let base_fee_hopps = *self.current_base_fee.read();
-        let base_fee_carrots = rabbitcore::compute::hopps_to_carrots(base_fee_hopps);
-        let suggested_priority_fee_hopps = 1_000_000_000u64; // 1 carrot default tip
+        let base_fee_shc = *self.current_base_fee.read();
+        let suggested_priority_fee_shc = 0u64; // 默认无小费
 
         Ok(serde_json::json!({
-            "base_fee": format!("0x{:x}", base_fee_hopps),
-            "base_fee_hopps": base_fee_hopps,
-            "base_fee_carrots": base_fee_carrots,
-            "suggested_priority_fee": format!("0x{:x}", suggested_priority_fee_hopps),
-            "suggested_priority_fee_hopps": suggested_priority_fee_hopps,
-            "suggested_priority_fee_carrots": 1,
-            "unit": "hopps",
-            "note": "1 carrot = 10⁹ hopps, 1 Rbit = 10¹⁸ hopps. Send max_fee/priority_fee in hopps.",
+            "base_fee": format!("0x{:x}", base_fee_shc),
+            "base_fee_shc": base_fee_shc,
+            "suggested_priority_fee": format!("0x{:x}", suggested_priority_fee_shc),
+            "suggested_priority_fee_shc": suggested_priority_fee_shc,
+            "unit": "shc",
+            "note": "SHC (山海币) 计价：max_fee/priority_fee/base_fee_per_gas 均以 SHC 计，1 SHC/gas 为初始基础费。",
         }))
     }
 
@@ -1128,8 +1125,8 @@ impl RpcApi {
                 serde_json::json!({
                     "tx_id": format!("0x{}", hex::encode(p.tx.tx_id.0.as_bytes())),
                     "tip_rate": p.tip_rate,
-                    "priority_fee_hopps": p.tx.priority_fee,
-                    "max_fee_hopps": p.tx.max_fee,
+                    "priority_fee_shc": p.tx.priority_fee,
+                    "max_fee_shc": p.tx.max_fee,
                     "gas_limit": p.tx.gas_limit,
                 })
             })
@@ -1154,13 +1151,12 @@ impl RpcApi {
         let tx = parse_compute_tx(tx_value)?;
         let estimated = rabbitcore::compute::estimate_tx_gas(&tx);
         let base_fee = *self.current_base_fee.read();
-        let max_cost = rabbitcore::compute::hopps_to_carrots(estimated.saturating_mul(base_fee));
+        let max_cost = estimated.saturating_mul(base_fee);
 
         Ok(serde_json::json!({
             "gas_estimated": estimated,
-            "base_fee_hopps": base_fee,
-            "base_fee_carrots": rabbitcore::compute::hopps_to_carrots(base_fee),
-            "max_cost_carrots": max_cost,
+            "base_fee_shc": base_fee,
+            "max_cost_shc": max_cost,
             "unit": "gas",
         }))
     }
@@ -1560,7 +1556,7 @@ impl RpcApi {
                     .to_big_endian()
                 )
             ),
-            "base_fee_hopps": latest.header.base_fee_per_gas.as_u64(),
+            "base_fee_shc": latest.header.base_fee_per_gas.as_u64(),
         }))
     }
 

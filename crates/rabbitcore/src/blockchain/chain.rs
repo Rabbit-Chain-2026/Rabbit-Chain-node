@@ -354,7 +354,7 @@ mod tests {
             nonce: 0,
             extra_data: vec![],
             mix_hash: Hash::zero(),
-            base_fee_per_gas: U256::from(1_000_000_000),
+            base_fee_per_gas: U256::from(crate::compute::INITIAL_BASE_FEE),
             hash: Hash::zero(),
         };
         let body = BlockBody {

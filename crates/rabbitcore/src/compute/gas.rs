@@ -84,11 +84,15 @@ pub const TARGET_GAS_FRACTION: u64 = 2;
 /// Default block gas limit (30M gas — generous for UTXO Compute).
 pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
-/// Initial base fee for genesis (1 carrot).
-pub const INITIAL_BASE_FEE: u64 = 1_000_000_000; // 1 carrot in hopps
+/// Initial base fee for genesis: 1 SHC (山海币) per gas.
+///
+/// SHC is the native account asset (`StateDb.Account.balance`); all EIP-1559
+/// fee fields (`max_fee`/`priority_fee`/`base_fee_per_gas`) are denominated in
+/// SHC, not the legacy hopps/Rbit unit.
+pub const INITIAL_BASE_FEE: u64 = 1;
 
-/// Maximum priority fee (1000 carrots in hopps).
-pub const MAX_PRIORITY_FEE: u64 = 1_000 * 1_000_000_000;
+/// Maximum priority fee (SHC).
+pub const MAX_PRIORITY_FEE: u64 = 1_000_000;
 
 /// Maximum gas limit per transaction. Prevents a single tx from claiming the
 /// entire block gas limit and starving other transactions.

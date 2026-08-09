@@ -156,13 +156,12 @@ pub struct ComputeTx {
     pub witness: TxWitness,
     // ═══════════════════════════════════════════════════════════
     // EIP-1559 fee market fields (v1.2)
-    // All amounts are denominated in **hopps** (chain base unit,
-    // 1 Rbit = 10¹⁸ hopps). Carrots (10⁹ hopps) are a display unit
-    // used by the RPC layer only.
+    // All amounts are denominated in **SHC (山海币)**, the native account
+    // asset carried by `StateDb.Account.balance`.
     // ═══════════════════════════════════════════════════════════
-    /// Maximum total fee the sender is willing to pay (hopps).
+    /// Maximum total fee the sender is willing to pay (SHC).
     pub max_fee: u64,
-    /// Priority fee / tip for the miner, on top of the base fee (hopps).
+    /// Priority fee / tip for the miner, on top of the base fee (SHC).
     pub priority_fee: u64,
     /// Gas limit — maximum gas the sender will consume.
     pub gas_limit: u64,

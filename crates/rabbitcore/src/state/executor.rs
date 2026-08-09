@@ -232,9 +232,9 @@ impl StateExecutor {
                 Ok(_) => {
                     let gas_used = crate::compute::estimate_tx_gas(tx);
                     total_gas = total_gas.saturating_add(gas_used);
-                    // BlockTime 费用收集：非 Mint 交易按 gas_used × base_fee + priority_fee
-                    // （交易税/小费，上限 max_fee）入国库。
-                    if tx.command != Command::Mint {
+                    // BlockTime 费用收集：非 Mint / 非铸币交易按 gas_used × base_fee + priority_fee
+                    // （交易税/小费，上限 max_fee）入国库。铸币（Mint/MintCoin）价值创造，免收。
+                    if tx.command != Command::Mint && !crate::game::is_mint_coin(tx) {
                         let fee = self.tx_gas_fee(tx, base_fee);
                         if fee > 0 {
                             self.credit_treasury(fee);
@@ -410,8 +410,9 @@ impl StateExecutor {
     }
 
     /// 山海币经济效果预检（确定性，失败不产生任何状态变更）：
-    /// - `MintCoin`：签名者必须是铸币权威（防通胀）
+    /// - `MintCoin`：签名者必须是铸币权威（防通胀），且单笔铸币不超过治理策略上限
     /// - `Enhance`：强化成本（cost_sh，来自链上配置）+ gas 费必须由签名者余额承担
+    /// - `TransferCoin`：发送者余额必须覆盖转账金额 + gas 费
     fn apply_economy_effects(&self, tx: &ComputeTx, base_fee: u64) -> Result<()> {
         if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
             return Ok(());
@@ -420,12 +421,39 @@ impl StateExecutor {
             return Ok(());
         };
         match op {
-            GameOp::MintCoin { .. } => {
+            GameOp::MintCoin { amount, .. } => {
                 // 铸币授权：确定性判定（固定公钥），防通胀
                 if !crate::game::is_mint_signer(tx) {
                     return Err(ExecutionError::Block(
                         "mint denied: tx is not signed by the mint authority".to_string(),
                     ));
+                }
+                // 通胀门控：单笔铸币不得超过治理策略上限（链上 MintPolicy 对象）
+                let cap = self.mint_policy()?.per_mint_cap;
+                if amount > cap {
+                    return Err(ExecutionError::Block(format!(
+                        "mint denied: amount {} exceeds per-mint cap {}",
+                        amount, cap
+                    )));
+                }
+                Ok(())
+            }
+            GameOp::TransferCoin { amount, .. } => {
+                let gas = self.tx_gas_fee(tx, base_fee);
+                let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+                    ExecutionError::Block("transfer requires an ed25519 signer".to_string())
+                })?;
+                let balance = self
+                    .state_db
+                    .get_account(&payer)
+                    .map(|a| a.balance.as_u64())
+                    .unwrap_or(0);
+                if balance < amount.saturating_add(gas) {
+                    return Err(ExecutionError::Block(format!(
+                        "insufficient shc balance {} needed {} for transfer",
+                        balance,
+                        amount.saturating_add(gas)
+                    )));
                 }
                 Ok(())
             }
@@ -454,8 +482,9 @@ impl StateExecutor {
     }
 
     /// 山海币经济效果提交（已预检）：
-    /// - `MintCoin`：铸造到目标地址
+    /// - `MintCoin`：铸造到目标地址（免 gas，价值创造）
     /// - `Enhance`：从签名者扣强化成本 + gas 费 → 国库（sink）
+    /// - `TransferCoin`：从发送者扣转账金额 + gas 费，金额入接收者
     fn commit_economy_effects(&self, tx: &ComputeTx, base_fee: u64) -> Result<()> {
         if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
             return Ok(());
@@ -469,6 +498,16 @@ impl StateExecutor {
                 self.credit_account(target, amount);
                 Ok(())
             }
+            GameOp::TransferCoin { to, amount } => {
+                let gas = self.tx_gas_fee(tx, base_fee);
+                let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+                    ExecutionError::Block("transfer requires an ed25519 signer".to_string())
+                })?;
+                let target = parse_address_hex(&to)?;
+                self.debit_account(payer, amount.saturating_add(gas))?;
+                self.credit_account(target, amount);
+                Ok(())
+            }
             GameOp::Enhance { current_level, .. } => {
                 let cost = self.enhance_cost(current_level)?;
                 let gas = self.tx_gas_fee(tx, base_fee);
@@ -477,10 +516,29 @@ impl StateExecutor {
                 })?;
                 self.debit_account(payer, cost.saturating_add(gas))?;
                 self.credit_account(self.treasury, cost);
+                // 强化成本入国库账本（SHC sink，与账户余额一致：账本 = 账户）。
+                self.ledger
+                    .write()
+                    .expect("treasury ledger lock")
+                    .record_income("shc_enhance_cost", cost);
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// 铸币政策（山海币）：读取链上 MintPolicy 对象的 per_mint_cap（治理可调）。
+    fn mint_policy(&self) -> Result<crate::game::MintPolicy> {
+        let config_id = crate::game::mint_policy_object_id();
+        let obj = self
+            .compute_store
+            .get_latest_output_by_object(config_id)
+            .ok_or_else(|| {
+                ExecutionError::Block("mint policy object not found".to_string())
+            })?;
+        serde_json::from_slice(&obj.state).map_err(|e| {
+            ExecutionError::Block(format!("invalid mint policy state: {e}"))
+        })
     }
 
     /// 强化成本（山海币）：读取链上 EnhanceConfig 的 cost_sh[level]。
@@ -945,11 +1003,47 @@ mod tests {
             chain_id: Some(10088),
             network_id: Some(10088),
             witness: TxWitness { signatures: vec![], threshold: None },
-            max_fee: 1_000_000,
+            max_fee: 0,
             priority_fee: 0,
-            gas_limit: 100_000,
+            gas_limit: 0,
         };
         let _ = authority;
+        sign(tx, key)
+    }
+
+    fn mint_policy_tx(
+        authority: &crate::crypto::Address,
+        key: &ed25519_dalek::SigningKey,
+        cap: u64,
+        nonce: u64,
+    ) -> ComputeTx {
+        let object_id = crate::game::mint_policy_object_id();
+        let policy = crate::game::MintPolicy { version: 1, per_mint_cap: cap };
+        let tx = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![proposal(
+                authority,
+                object_id,
+                1,
+                None,
+                serde_json::to_vec(&policy).expect("policy json"),
+            )],
+            fee: 0,
+            nonce: Some(nonce),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
         sign(tx, key)
     }
 
@@ -994,7 +1088,7 @@ mod tests {
         let executor = StateExecutor::new(state_db.clone(), 10088);
         let (authority, key) = authority(); // 0x11*32 == 铸币权威公钥
 
-        // 铸币权威签名 → 目标地址入账
+        // 铸币权威签名 → 目标地址入账（铸币免 gas；需先存在 MintPolicy 通胀门控）
         let (target, target_key) = {
             use ed25519_dalek::SigningKey;
             let k = SigningKey::from_bytes(&[0x33; 32]);
@@ -1002,19 +1096,55 @@ mod tests {
             let h = crate::crypto::keccak256(&pk);
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
-        let tx = mint_coin_tx(&authority, &key, target, 1_000, 1);
+        let policy = mint_policy_tx(&authority, &key, 1_000_000, 1);
+        let mint = mint_coin_tx(&authority, &key, target, 1_000, 2);
         let basic = executor.new_basic_executor();
         let (receipts, _) = executor
-            .execute_txs(&[tx], 1, 1_700_000_000, &basic)
+            .execute_txs(&[policy, mint], 1, 1, &basic)
             .expect("execute mint");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "policy: {:?}", receipts[0].error);
         assert_eq!(
-            receipts[0].status,
+            receipts[1].status,
             ReceiptStatus::Success,
             "mint failed: {:?}",
-            receipts[0].error
+            receipts[1].error
         );
         assert_eq!(state_db.get_balance(&target).as_u64(), 1_000);
+        // 铸币免 gas：国库不因铸币入账
+        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(treasury, 0, "mint must not credit treasury gas");
         let _ = target_key;
+    }
+
+    #[test]
+    fn mint_coin_over_cap_rejected_when_policy_set() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, key) = authority();
+        let (target, _tk) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x66; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        // 治理策略：单笔上限 500；铸 1000 → 拒绝；铸 500 → 成功
+        let policy = mint_policy_tx(&authority, &key, 500, 1);
+        let over = mint_coin_tx(&authority, &key, target, 1_000, 2);
+        let ok = mint_coin_tx(&authority, &key, target, 500, 3);
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[policy, over, ok], 1, 1, &basic)
+            .expect("execute economy");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "policy");
+        assert_eq!(receipts[1].status, ReceiptStatus::Failed);
+        assert!(
+            receipts[1].error.as_deref().unwrap_or("").contains("exceeds per-mint cap"),
+            "{:?}",
+            receipts[1].error
+        );
+        assert_eq!(receipts[2].status, ReceiptStatus::Success, "within cap: {:?}", receipts[2].error);
+        assert_eq!(state_db.get_balance(&target).as_u64(), 500);
     }
 
     #[test]
@@ -1060,9 +1190,10 @@ mod tests {
             (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
         };
 
-        // 配置对象 + 给玩家铸币 1_000_000（覆盖强化成本 10 + gas 费）+ 玩家自有装备
+        // 配置对象 + 铸币政策（上限覆盖铸币量）+ 给玩家铸币 + 玩家自有装备
         let config = mint_config_tx(&authority, &auth_key, 1);
-        let mint = mint_coin_tx(&authority, &auth_key, player_addr, 1_000_000, 2);
+        let policy = mint_policy_tx(&authority, &auth_key, 2_000_000, 2);
+        let mint = mint_coin_tx(&authority, &auth_key, player_addr, 1_000_000, 3);
         let equip_obj = ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(b"shc-eq")));
         let equip = ComputeTx {
             tx_id: TxId(crate::crypto::Hash::zero()),
@@ -1079,7 +1210,7 @@ mod tests {
                 0,
             )],
             fee: 0,
-            nonce: Some(3),
+            nonce: Some(4),
             metadata: vec![],
             payload: vec![],
             deadline_unix_secs: None,
@@ -1121,7 +1252,7 @@ mod tests {
                 0,
             )],
             fee: 0,
-            nonce: Some(4),
+            nonce: Some(5),
             metadata: vec![],
             payload: serde_json::to_vec(&op).expect("enhance op"),
             deadline_unix_secs: None,
@@ -1134,23 +1265,147 @@ mod tests {
         };
         let enhance = sign(enhance, &player_key);
         let enhance_gas = crate::compute::estimate_tx_gas(&enhance);
-        let mint_gas = crate::compute::estimate_tx_gas(&mint);
 
         let basic = executor.new_basic_executor();
         let (receipts, _) = executor
-            .execute_txs(&[config, mint, equip, enhance], 1, 1, &basic)
+            .execute_txs(&[config, policy, mint, equip, enhance], 1, 1, &basic)
             .expect("execute economy");
         assert_eq!(receipts[0].status, ReceiptStatus::Success, "config");
-        assert_eq!(receipts[1].status, ReceiptStatus::Success, "mint");
-        assert_eq!(receipts[2].status, ReceiptStatus::Success, "equip");
-        assert_eq!(receipts[3].status, ReceiptStatus::Success, "enhance: {:?}", receipts[3].error);
+        assert_eq!(receipts[1].status, ReceiptStatus::Success, "policy");
+        assert_eq!(receipts[2].status, ReceiptStatus::Success, "mint");
+        assert_eq!(receipts[3].status, ReceiptStatus::Success, "equip");
+        assert_eq!(receipts[4].status, ReceiptStatus::Success, "enhance: {:?}", receipts[4].error);
 
         // 玩家余额 = 1_000_000 - 10（强化成本） - gas 费（增强交易的 gas×base_fee=1）
         let player_bal = state_db.get_balance(&player_addr).as_u64();
         assert_eq!(player_bal, 1_000_000 - 10 - enhance_gas);
-        // 国库：+10 成本 + gas 费（铸币交易 gas + 增强交易 gas）
+        // 国库：+10 成本 + 增强交易 gas 费（铸币免 gas，不入账）；账本与账户余额一致
         let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
-        assert_eq!(treasury, 10 + mint_gas + enhance_gas);
+        assert_eq!(treasury, 10 + enhance_gas);
+        assert_eq!(executor.treasury_ledger().balance(), treasury as u128);
+    }
+
+    #[test]
+    fn transfer_coin_moves_shc_between_accounts() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        let (payer_addr, payer_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x77; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        let (receiver_addr, _rk) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x88; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+
+        let policy = mint_policy_tx(&authority, &auth_key, 1_000_000, 1);
+        let mint = mint_coin_tx(&authority, &auth_key, payer_addr, 100_000, 2);
+        let op = GameOp::TransferCoin {
+            to: format!("0x{}", hex::encode(receiver_addr.as_bytes())),
+            amount: 3_000,
+        };
+        let transfer = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(3),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("transfer op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let transfer = sign(transfer, &payer_key);
+        let transfer_gas = crate::compute::estimate_tx_gas(&transfer);
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[policy, mint, transfer], 1, 1, &basic)
+            .expect("execute economy");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "policy");
+        assert_eq!(receipts[1].status, ReceiptStatus::Success, "mint");
+        assert_eq!(receipts[2].status, ReceiptStatus::Success, "transfer: {:?}", receipts[2].error);
+
+        // 发送者 = 100_000 - 3_000（转账额） - gas；接收者 = 3_000；国库 = gas
+        assert_eq!(state_db.get_balance(&payer_addr).as_u64(), 100_000 - 3_000 - transfer_gas);
+        assert_eq!(state_db.get_balance(&receiver_addr).as_u64(), 3_000);
+        let treasury = state_db.get_balance(&crate::governance::treasury_address()).as_u64();
+        assert_eq!(treasury, transfer_gas);
+    }
+
+    #[test]
+    fn transfer_coin_insufficient_balance_rejected() {
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        let (payer_addr, payer_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x99; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        let (receiver_addr, _rk) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0xaa; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+
+        let policy = mint_policy_tx(&authority, &auth_key, 1_000_000, 1);
+        let mint = mint_coin_tx(&authority, &auth_key, payer_addr, 100, 2); // 只够转 0
+        let op = GameOp::TransferCoin {
+            to: format!("0x{}", hex::encode(receiver_addr.as_bytes())),
+            amount: 1_000,
+        };
+        let transfer = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(3),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("transfer op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let transfer = sign(transfer, &payer_key);
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[policy, mint, transfer], 1, 1, &basic)
+            .expect("execute economy");
+        assert_eq!(receipts[2].status, ReceiptStatus::Failed);
+        assert!(
+            receipts[2].error.as_deref().unwrap_or("").contains("insufficient shc balance"),
+            "{:?}",
+            receipts[2].error
+        );
+        assert_eq!(state_db.get_balance(&payer_addr).as_u64(), 100, "no state change on rejection");
+        assert_eq!(state_db.get_balance(&receiver_addr).as_u64(), 0);
     }
 
     // ── 治理生效（FundActivity 扣国库）──────────────────────────────

@@ -32,12 +32,21 @@ pub(crate) fn gate_game_tx(
             let op = GameOp::parse(&tx.payload)
                 .map_err(|e| RpcErrorObject::invalid_params(format!("game payload invalid: {e}")))?;
             match &op {
-                GameOp::MintCoin { .. } => {
+                GameOp::MintCoin { amount, .. } => {
                     // 山海币发行门控：仅铸币权威（固定公钥）可铸造，防通胀。
                     if !rabbitcore::game::is_mint_signer(tx) {
                         return Err(RpcErrorObject::invalid_params(
                             "mint denied: tx is not signed by the mint authority".into(),
                         ));
+                    }
+                    // 通胀门控（与执行器一致）：单笔铸币不得超过治理策略上限。
+                    if let Some(policy) = load_mint_policy(store) {
+                        if *amount > policy.per_mint_cap {
+                            return Err(RpcErrorObject::invalid_params(format!(
+                                "mint denied: amount {} exceeds per-mint cap {}",
+                                amount, policy.per_mint_cap
+                            )));
+                        }
                     }
                 }
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
@@ -79,6 +88,13 @@ fn load_enhance_config(
     serde_json::from_slice(&obj.state).map_err(|e| {
         RpcErrorObject::invalid_params(format!("invalid enhance config object state: {e}"))
     })
+}
+
+/// 读取链上铸币政策对象（权威铸币上限）；对象不存在时返回 None（由执行器确定性拒绝）。
+fn load_mint_policy(store: &dyn ObjectStore) -> Option<rabbitcore::game::MintPolicy> {
+    let config_id = rabbitcore::game::mint_policy_object_id();
+    let obj = store.get_latest_output_by_object(config_id)?;
+    serde_json::from_slice(&obj.state).ok()
 }
 
 /// 解析对象 state 为治理提案对象。
@@ -1125,6 +1141,50 @@ mod config_gate_tests {
         let err = gate_game_tx(&t, &store, 100).unwrap_err();
         assert!(
             err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("mint denied"),
+            "{err:?}"
+        );
+    }
+
+    fn insert_mint_policy(store: &InMemoryObjectStore, cap: u64, version: u64) -> OutputId {
+        let object_id = rabbitcore::game::mint_policy_object_id();
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(object_id.0.as_bytes());
+        data.extend_from_slice(&version.to_be_bytes());
+        let output_id = OutputId(Hash::from_bytes(keccak256(&data)));
+        let policy = rabbitcore::game::MintPolicy { version, per_mint_cap: cap };
+        let out = ObjectOutput {
+            output_id,
+            object_id,
+            version: Version(version),
+            domain_id: GAME_DOMAIN,
+            kind: ObjectKind::State,
+            owner: Ownership::Address(Address::zero()),
+            predecessor: None,
+            state: serde_json::to_vec(&policy).unwrap(),
+            state_root: None,
+            resources: Default::default(),
+            lock: Script::default(),
+            logic: None,
+            created_at: 0,
+            ttl: None,
+            rent_reserve: None,
+            flags: 0,
+            extensions: vec![],
+            spent: false,
+        };
+        store.insert_output(out).unwrap();
+        output_id
+    }
+
+    #[test]
+    fn mint_coin_over_policy_cap_rejected() {
+        let store = InMemoryObjectStore::new();
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]); // 铸币权威
+        let _ = insert_mint_policy(&store, 500, 1);
+        let t = mint_coin_tx_signed(&authority, test_target_address(0x77), 1_000);
+        let err = gate_game_tx(&t, &store, 100).unwrap_err();
+        assert!(
+            err.data.as_ref().and_then(serde_json::Value::as_str).unwrap_or("").contains("exceeds per-mint cap"),
             "{err:?}"
         );
     }

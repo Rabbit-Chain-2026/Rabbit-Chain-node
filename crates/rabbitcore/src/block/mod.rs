@@ -516,8 +516,8 @@ pub fn create_genesis_block() -> Block {
         difficulty: U256::zero(),
         nonce: 0,
         extra_data: b"RabbitChain Genesis".to_vec(),
-        mix_hash: Hash::zero(),
-        base_fee_per_gas: U256::from(1_000_000_000),
+            mix_hash: Hash::zero(),
+            base_fee_per_gas: U256::from(crate::compute::INITIAL_BASE_FEE),
         hash: Hash::zero(),
     };
 

@@ -59,6 +59,11 @@ pub enum GameOp {
         to: String,
         amount: u64,
     },
+    /// 山海币转账：玩家向目标地址转移 SHC（扣发送者，入接收者；gas 由发送者承担）。
+    TransferCoin {
+        to: String,
+        amount: u64,
+    },
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
@@ -100,6 +105,32 @@ pub fn enhance_config_object_id() -> crate::compute::ObjectId {
     )))
 }
 
+/// 山海币铸币政策（治理可调，防通胀）：单笔铸币上限。
+/// 链上对象 `keccak("shanhai/config/mint")`；由权威铸造 v1，治理 `UpdateConfig` 可推进版本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintPolicy {
+    /// 配置版本（UpdateConfig 推进；语义同 EnhanceConfig.version）。
+    pub version: u64,
+    /// 单笔铸币上限（SHC）。超过则 `mint denied: exceeds per-mint cap`。
+    pub per_mint_cap: u64,
+}
+
+impl Default for MintPolicy {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            per_mint_cap: 1_000_000_000,
+        }
+    }
+}
+
+/// 铸币政策对象 id（链上配置对象）。
+pub fn mint_policy_object_id() -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        b"shanhai/config/mint",
+    )))
+}
+
 /// 山海币铸币权威公钥（共识固定）：对应私钥由游戏运营方持有
 /// （devnet = SH_AUTH_KEY，即服务器权威密钥；公钥 = ed25519 pubkey）。
 pub const MINT_AUTHORITY_PUBKEY: [u8; 32] = [
@@ -126,6 +157,18 @@ pub fn is_mint_signer(tx: &crate::compute::ComputeTx) -> bool {
         }
     }
     false
+}
+
+/// 交易是否为山海币铸币交易（GAME_DOMAIN + `Invoke` + payload = `GameOp::MintCoin`）。
+/// 与 `Command::Mint` 一致：铸币是价值创造操作，免收 gas（fee 字段全 0）。
+pub fn is_mint_coin(tx: &crate::compute::ComputeTx) -> bool {
+    if tx.domain_id != crate::compute::GAME_DOMAIN || tx.command != crate::compute::Command::Invoke {
+        return false;
+    }
+    matches!(
+        GameOp::parse(&tx.payload),
+        Ok(GameOp::MintCoin { .. })
+    )
 }
 
 /// 提取交易首个 ed25519 签名的派生地址（用于铸币授权判定）。
@@ -269,6 +312,15 @@ pub fn verify_with_config(
             }
             if *amount == 0 {
                 return Err(GameError::InvalidPayload("mint amount must be positive".into()));
+            }
+            Ok(serde_json::json!({ "to": to, "amount": amount }))
+        }
+        GameOp::TransferCoin { to, amount } => {
+            if to.trim().is_empty() {
+                return Err(GameError::InvalidPayload("transfer target must not be empty".into()));
+            }
+            if *amount == 0 {
+                return Err(GameError::InvalidPayload("transfer amount must be positive".into()));
             }
             Ok(serde_json::json!({ "to": to, "amount": amount }))
         }
