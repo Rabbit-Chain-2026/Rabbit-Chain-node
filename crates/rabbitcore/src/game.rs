@@ -72,8 +72,8 @@ pub enum GameOp {
         claimed_new_level: u8,
         claimed_pity: u8,
         rules_version: u64,
-        /// ZK 证明（`zk::enhance::EnhanceProof` 序列化）。
-        proof: serde_json::Value,
+        /// ZK 证明：hex 编码的 bincode（`zk::enhance::EnhanceProof`）。
+        proof_hex: String,
     },
 }
 
@@ -241,7 +241,7 @@ pub fn verify_with_config(
             claimed_success,
             claimed_new_level,
             claimed_pity,
-            proof,
+            proof_hex,
             ..
         } => {
             let default_cfg = shanhai_core::enhancement::EnhanceConfig::default();
@@ -251,7 +251,7 @@ pub fn verify_with_config(
                 *current_pity,
                 *star_stones,
                 *roll_claim,
-                proof,
+                proof_hex,
                 cfg,
             )?;
             if success != *claimed_success {
@@ -347,14 +347,16 @@ pub fn verify_zk_enhance(
     current_pity: u8,
     star_stones: u16,
     roll_claim: u64,
-    proof: &serde_json::Value,
+    proof_hex: &str,
     cfg: &shanhai_core::enhancement::EnhanceConfig,
 ) -> Result<(bool, u8, u8), GameError> {
     if roll_claim >= 1000 {
         return Err(GameError::InvalidPayload("roll claim out of range".into()));
     }
-    let proof: zk::enhance::EnhanceProof = serde_json::from_value(proof.clone())
-        .map_err(|e| GameError::InvalidPayload(format!("invalid zk proof: {e}")))?;
+    let raw = hex::decode(proof_hex.trim().strip_prefix("0x").unwrap_or(proof_hex.trim()))
+        .map_err(|e| GameError::InvalidPayload(format!("proof hex invalid: {e}")))?;
+    let proof = zk::enhance::from_bytes(&raw)
+        .map_err(|e| GameError::InvalidPayload(e))?;
     zk::enhance::verify_enhance(&proof, roll_claim, zk::enhance::ZK_ENHANCE_QUERIES)
         .map_err(|e| GameError::InvalidPayload(format!("zk proof rejected: {e}")))?;
     let base = cfg.success_permille[current_level.min(11) as usize];
@@ -567,11 +569,11 @@ mod tests {
         let seed = 424242u64;
         let roll = enhance_roll(seed).1;
         let proof = prove_enhance(seed, roll, ZK_ENHANCE_QUERIES);
-        let proof_json = serde_json::to_value(&proof).expect("proof json");
+        let proof_hex = hex::encode(zk::enhance::to_bytes(&proof));
         let cfg = crate::game::EnhanceConfig::default();
         // 结果派生（与 roll_with_config 公开部分一致；同时覆盖 helper）
         let (success, new_level, new_pity) =
-            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_json, &cfg).expect("valid");
+            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_hex, &cfg).expect("valid");
         let op = GameOp::ZkEnhance {
             object_id: "0xzk".into(),
             current_level: 0,
@@ -582,7 +584,7 @@ mod tests {
             claimed_new_level: new_level,
             claimed_pity: new_pity,
             rules_version: 1,
-            proof: proof_json.clone(),
+            proof_hex: proof_hex.clone(),
         };
         assert!(verify(&op).is_ok(), "valid zk proof accepted");
         // 伪造：roll_claim 与证明不符 → 拒
@@ -599,10 +601,12 @@ mod tests {
         assert!(verify(&forged_res).is_err(), "forged result rejected");
         // 伪造：证明内容被篡改 → 拒
         let mut forged_proof = op.clone();
-        if let GameOp::ZkEnhance { proof, .. } = &mut forged_proof {
-            if let serde_json::Value::Object(m) = proof {
-                m.insert("challenge".into(), serde_json::json!("0xdead"));
-            }
+        if let GameOp::ZkEnhance { proof_hex, .. } = &mut forged_proof {
+            // 篡改最后一个字节 → 反序列化/验证失败
+            let mut b = zk::enhance::to_bytes(&proof);
+            let last = b.last_mut().unwrap();
+            *last ^= 0xFF;
+            *proof_hex = hex::encode(b);
         }
         assert!(verify(&forged_proof).is_err(), "tampered proof rejected");
     }

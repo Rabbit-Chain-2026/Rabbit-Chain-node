@@ -1375,10 +1375,10 @@ mod tests {
         let seed = 987654321u64;
         let roll = zk::enhance::enhance_roll(seed).1;
         let proof = zk::enhance::prove_enhance(seed, roll, zk::enhance::ZK_ENHANCE_QUERIES);
-        let proof_json = serde_json::to_value(&proof).expect("proof json");
+        let proof_hex = hex::encode(zk::enhance::to_bytes(&proof));
         let cfg = crate::game::EnhanceConfig::default();
         let (success, new_level, new_pity) =
-            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_json, &cfg).expect("valid");
+            crate::game::verify_zk_enhance(0, 0, 0, roll, &proof_hex, &cfg).expect("valid");
         let op = GameOp::ZkEnhance {
             object_id: format!("0x{}", hex::encode(equip_obj.0.as_bytes())),
             current_level: 0,
@@ -1389,7 +1389,7 @@ mod tests {
             claimed_new_level: new_level,
             claimed_pity: new_pity,
             rules_version: 1,
-            proof: proof_json,
+            proof_hex,
         };
         let enhance = ComputeTx {
             tx_id: TxId(crate::crypto::Hash::zero()),

@@ -74,16 +74,15 @@ pub struct EnhanceProof {
     pub tau_fri: FriProof,
     pub quotient_fri: FriProof,
     pub challenge: Fp,
-    /// 约束检查打开：每列在 {χ, ωχ, ω⁻¹χ, ω⁻²χ} 的求值（列主序）。
+    /// 约束检查打开：每列在 {χ, ωχ, ω⁻⁴χ, ω⁻⁵χ} 的求值（列主序）。
     pub col_opens: Vec<[Fp; 4]>,
-    pub c_at_chi: Vec<Fp>, // 每个约束 C_c(χ)
-    pub q_at_chi: Fp,      // Q(χ)
+    pub q_at_chi: Fp, // Q(χ)
 }
 
 pub const N_LOG2: u32 = 4; // 16 行迹
 pub const FRI_K: u32 = 5; // FRI 域 32 点（覆盖商 deg < 32）
 /// 共识固定的 FRI 查询数（证明方与链上验证方必须一致）。
-pub const ZK_ENHANCE_QUERIES: usize = 8;
+pub const ZK_ENHANCE_QUERIES: usize = 4;
 
 /// 由承诺（τ/Q 根 + 系数）推导挑战 χ。
 fn derive_challenge(tau_root: &[u8; 32], q_root: &[u8; 32], q_coeffs: &[Fp]) -> Fp {
@@ -252,7 +251,8 @@ pub fn prove_enhance(seed: u64, roll: u64, num_queries: usize) -> EnhanceProof {
     }
     // FRI（域 k = FRI_K）；FRI 内部抄本与 STARK 挑战抄本分离，双方同序
     let boundary_pt = omega.pow(10); // row 10（r 位公开行）
-    let tau_fri = prove(&tau, FRI_K, num_queries, Transcript::new(), Some(boundary_pt));
+    // 迹组合 τ 的 deg < 16（列由 16 行插值）→ FRI k=4；商 Q 的 deg < 32 → k=5
+    let tau_fri = prove(&tau, FRI_K - 1, num_queries, Transcript::new(), Some(boundary_pt));
     let quotient_fri = prove(&q_combined, FRI_K, num_queries, Transcript::new(), None);
     // 约束检查挑战与打开：{χ, ωχ, ω⁻⁴χ, ω⁻⁵χ}
     let chi = derive_challenge(&tau_fri.roots[0], &quotient_fri.roots[0], &quotient_fri.final_coeffs);
@@ -264,16 +264,11 @@ pub fn prove_enhance(seed: u64, roll: u64, num_queries: usize) -> EnhanceProof {
             col_opens[j][i] = cols[j].eval(p);
         }
     }
-    let mut c_at_chi = vec![];
-    for (_rows, c) in &csts {
-        c_at_chi.push(c.eval(chi));
-    }
     EnhanceProof {
         tau_fri,
         quotient_fri,
         challenge: chi,
         col_opens,
-        c_at_chi,
         q_at_chi: q_combined.eval(chi),
     }
 }
@@ -295,7 +290,7 @@ pub fn verify_enhance(proof: &EnhanceProof, roll: u64, num_queries: usize) -> Re
     let alphas: Vec<Fp> = (0..num_csts).map(|_| tr.squeeze_fp()).collect();
     verify(
         &proof.tau_fri,
-        FRI_K,
+        FRI_K - 1,
         num_queries,
         Transcript::new(),
         Some((boundary_pt, expected)),
@@ -382,6 +377,16 @@ pub fn verify_enhance(proof: &EnhanceProof, roll: u64, num_queries: usize) -> Re
         return Err("constraint check failed".into());
     }
     Ok(())
+}
+
+/// 紧凑二进制序列化（bincode）：tx 载荷用 hex 承载，比 JSON 数组小 60%+。
+pub fn to_bytes(proof: &EnhanceProof) -> Vec<u8> {
+    bincode::serialize(proof).expect("proof bincode")
+}
+
+/// 从紧凑二进制反序列化。
+pub fn from_bytes(bytes: &[u8]) -> Result<EnhanceProof, String> {
+    bincode::deserialize(bytes).map_err(|e| format!("invalid proof bytes: {e}"))
 }
 
 #[cfg(test)]
