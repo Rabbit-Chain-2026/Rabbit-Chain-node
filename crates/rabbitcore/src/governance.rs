@@ -7,7 +7,7 @@
 //!
 //! 规则（方案-山海原生应用.md §4）：
 //! - 提案需押金（防垃圾提案）
-//! - 投票期 72h；计票按 JZ 质押权重（经济权益 = 治理权，防女巫）
+//! - 投票期 72h；计票按山海币质押权重（经济权益 = 治理权，防女巫）
 //! - 赞成权重 ≥ 50% 通过
 //! - 国库 = 链上账本对象（交易税/市场税流入），FundActivity 从国库拨款
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// 提案投票窗口（秒）
 pub const VOTE_WINDOW_SECS: u64 = 72 * 3600;
-/// 提案押金（JZ）
+/// 提案押金（山海币）
 pub const DEPOSIT_SH: u64 = 1_000;
 /// 通过阈值（千分位）：赞成质押权重 ≥ 50%
 pub const PASS_PROMILLE: u64 = 500;
@@ -59,7 +59,7 @@ pub struct Proposal {
     pub kind: ProposalKind,
     /// 提案人地址（hex）
     pub proposer: String,
-    /// 押金（JZ）
+    /// 押金（山海币）
     pub deposit: u64,
     pub created_at_unix: u64,
     pub deadline_unix: u64,
@@ -74,7 +74,7 @@ pub struct Vote {
     pub proposal_id: String,
     /// 投票人地址（hex）
     pub voter: String,
-    /// 本次投入的质押权重（JZ）
+    /// 本次投入的质押权重（山海币）
     pub stake: u128,
     pub approve: bool,
 }
