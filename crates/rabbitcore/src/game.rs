@@ -59,6 +59,12 @@ pub enum GameOp {
         to: String,
         amount: u64,
     },
+    /// 通用代币转账（TokenId 扩展）：任意注册代币（token_id >= 1；0=原生走协议层）。
+    TransferToken {
+        token_id: u64,
+        to: String,
+        amount: u64,
+    },
     /// ZK 强化：客户端证明"存在秘密 seed 使 xorshift64³(seed) mod 1000 = roll_claim"，
     /// 链上原生验证证明后按公开 roll_claim 派生强化结果（seed 永不上链）。
     ZkEnhance {
@@ -93,6 +99,12 @@ pub enum GameOp {
         random_block_hash: String,
         claimed: serde_json::Value,
         drops: Vec<ActionDrop>,
+    },
+    /// 打金闭环：SellDrop（Invoke 消耗掉落对象 v1，国库 SHC → 签名者）。
+    /// 价格以掉落对象内嵌的 `price_shc` 为权威（settle 时确定性写入，不可伪造）。
+    SellDrop {
+        session_id: String,
+        item_id: String,
     },
 }
 
@@ -339,6 +351,19 @@ pub fn verify_with_config(
                 "drops": drops,
             }))
         }
+        GameOp::SellDrop { session_id, item_id } => {
+            if session_id.trim().is_empty() || item_id.trim().is_empty() {
+                return Err(GameError::InvalidPayload(
+                    "sell requires session_id and item_id".into(),
+                ));
+            }
+            // 语义验证（对象存在/未消费/所有权/价格/国库余额）在
+            // gate_game_tx 与执行器结合链上对象执行（见 compute_adapter/executor）。
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "item_id": item_id,
+            }))
+        }
         GameOp::Propose {
             proposal_id,
             kind,
@@ -382,6 +407,20 @@ pub fn verify_with_config(
                 "approve": approve,
                 "stake": stake,
             }))
+        }
+        GameOp::TransferToken { token_id, to, amount } => {
+            if *token_id == 0 {
+                return Err(GameError::InvalidPayload(
+                    "native token transfer must use protocol-level commands".into(),
+                ));
+            }
+            if to.trim().is_empty() {
+                return Err(GameError::InvalidPayload("transfer target must not be empty".into()));
+            }
+            if *amount == 0 {
+                return Err(GameError::InvalidPayload("transfer amount must be positive".into()));
+            }
+            Ok(serde_json::json!({ "token_id": token_id, "to": to, "amount": amount }))
         }
         GameOp::TransferCoin { to, amount } => {
             if to.trim().is_empty() {
@@ -436,6 +475,9 @@ pub enum ActionInput {
 pub struct ActionDrop {
     pub item_id: String,
     pub count: u64,
+    /// 总价值（SHC）= 单价 × 数量；掉落对象上链时携带，SellDrop 时国库支付。
+    #[serde(default)]
+    pub price_shc: u64,
 }
 
 /// 统一输出：结果 + 掉落。
@@ -458,6 +500,13 @@ pub struct ActionSession {
     pub settled: bool,
     /// 结算结果（settle 输出 v2 回填）。
     pub result: Option<serde_json::Value>,
+}
+
+/// 掉落对象逻辑 id（确定性：同一 session 同一物品唯一链上资产）。
+pub fn action_drop_object_id(session_id: &str, item_id: &str) -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        format!("shanhai/action/drop/{session_id}/{item_id}").as_bytes(),
+    )))
 }
 
 /// 动作 session 对象逻辑 id。
@@ -526,7 +575,11 @@ pub fn execute_action(
             if player_win {
                 for d in &spec.drops {
                     if rng.chance(d.permille) {
-                        drops.push(ActionDrop { item_id: d.item_id.clone(), count: d.count });
+                        drops.push(ActionDrop {
+                            item_id: d.item_id.clone(),
+                            count: d.count,
+                            price_shc: d.price_shc.saturating_mul(d.count),
+                        });
                     }
                 }
             }
@@ -889,7 +942,7 @@ mod tests {
                 hp: 300,
                 atk: 25,
                 def: 10,
-                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1 }],
+                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1, price_shc: 15 }],
             },
         });
         assert!(monsters.monster("dire_wolf").is_none(), "v1 has no dire_wolf");

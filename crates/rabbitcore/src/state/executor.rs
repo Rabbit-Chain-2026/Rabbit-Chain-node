@@ -228,6 +228,20 @@ impl StateExecutor {
                 });
                 continue;
             }
+            // 打金闭环预检（确定性）：SellDrop 校验掉落对象 + 国库 SHC 足额。
+            if let Err(e) = self.apply_drop_sell_effects(tx) {
+                receipts.push(Receipt {
+                    tx_id: tx.tx_id,
+                    block_hash: Hash::zero(),
+                    status: ReceiptStatus::Failed,
+                    gas_used: 0,
+                    compute_units: 0,
+                    output_refs: vec![],
+                    logs: vec![],
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
             // 费用预检（确定性）：非 Mint 交易必须由签名者余额承担 gas + 优先费
             // （税/小费，上限 max_fee）。Mint 价值创造免收。
             if let Err(e) = self.apply_fee_effects(tx, base_fee) {
@@ -291,6 +305,20 @@ impl StateExecutor {
                     }
                     // 费用提交（已预检）：真实借记签名者 gas/税 → 国库（杜绝凭空入账）。
                     if let Err(e) = self.commit_fee_effects(tx, base_fee) {
+                        receipts.push(Receipt {
+                            tx_id: tx.tx_id,
+                            block_hash: Hash::zero(),
+                            status: ReceiptStatus::Failed,
+                            gas_used: 0,
+                            compute_units: 0,
+                            output_refs: vec![],
+                            logs: vec![],
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                    // 打金闭环提交（已预检）：国库 SHC → 签名者。
+                    if let Err(e) = self.commit_drop_sell_effects(tx) {
                         receipts.push(Receipt {
                             tx_id: tx.tx_id,
                             block_hash: Hash::zero(),
@@ -592,6 +620,88 @@ impl StateExecutor {
         Ok(())
     }
 
+    /// 打金闭环预检（确定性）：`SellDrop` 消耗掉落对象，国库 SHC 支付给签名者。
+    fn apply_drop_sell_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::SellDrop { session_id, item_id } = op else {
+            return Ok(());
+        };
+        // 预检：对象必须未消费（可卖）
+        let input = tx.input_set.first().ok_or_else(|| {
+            ExecutionError::Block("sell drop missing input object".to_string())
+        })?;
+        let obj = self.compute_store.get_output(*input).ok_or_else(|| {
+            ExecutionError::Block("sell drop input object not found".to_string())
+        })?;
+        if obj.spent {
+            return Err(ExecutionError::Block("drop already sold (spent)".to_string()));
+        }
+        let price = self.sell_drop_price(tx, &session_id, &item_id)?;
+        let treasury_shc = self.treasury_balance();
+        if (treasury_shc as u64) < price {
+            return Err(ExecutionError::Block(format!(
+                "insufficient treasury shc {} needed {} for drop sell",
+                treasury_shc, price
+            )));
+        }
+        Ok(())
+    }
+
+    /// 打金闭环提交（已预检）：国库 SHC → 签名者（掉落变现）。
+    fn commit_drop_sell_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::SellDrop { session_id, item_id } = op else {
+            return Ok(());
+        };
+        let price = self.sell_drop_price(tx, &session_id, &item_id)?;
+        let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+            ExecutionError::Block("sell drop requires an ed25519 signer".to_string())
+        })?;
+        self.debit_treasury(price)?;
+        self.credit_token(payer, crate::assets::SHC_TOKEN, price);
+        self.ledger
+            .write()
+            .expect("treasury ledger lock")
+            .record_expense("drop_redeem", price, "shc sink -> player")
+            .map_err(|e| ExecutionError::Block(format!("treasury ledger expense failed: {e}")))?;
+        Ok(())
+    }
+
+    /// 读取掉落对象的权威价格（内嵌于对象 state，settle 时确定性写入）。
+    fn sell_drop_price(&self, tx: &ComputeTx, session_id: &str, item_id: &str) -> Result<u64> {
+        let input = tx.input_set.first().ok_or_else(|| {
+            ExecutionError::Block("sell drop missing input object".to_string())
+        })?;
+        let obj = self.compute_store.get_output(*input).ok_or_else(|| {
+            ExecutionError::Block("sell drop input object not found".to_string())
+        })?;
+        // 注：commit 阶段输入已被本交易消费（spent=true），price 读取不校验 spent；
+        // 未消费校验在预检（apply_drop_sell_effects）完成。
+        let state: serde_json::Value = serde_json::from_slice(&obj.state)
+            .map_err(|e| ExecutionError::Block(format!("invalid drop state: {e}")))?;
+        if state.get("kind").and_then(|x| x.as_str()) != Some("action_drop")
+            || state.get("session_id").and_then(|x| x.as_str()) != Some(session_id)
+            || state.get("item_id").and_then(|x| x.as_str()) != Some(item_id)
+        {
+            return Err(ExecutionError::Block("drop object mismatch".to_string()));
+        }
+        let price = state.get("price_shc").and_then(|x| x.as_u64()).unwrap_or(0);
+        if price == 0 {
+            return Err(ExecutionError::Block("drop has no sell value".to_string()));
+        }
+        Ok(price)
+    }
+
     /// 山海币经济效果预检（确定性，失败不产生任何状态变更）：
     /// - `Enhance`：强化成本（cost_sh，来自链上配置）由签名者余额承担
     /// - `TransferCoin`：发送者余额覆盖转账金额
@@ -604,6 +714,25 @@ impl StateExecutor {
             return Ok(());
         };
         match op {
+            GameOp::TransferToken { token_id, amount, .. } => {
+                let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+                    ExecutionError::Block("transfer requires an ed25519 signer".to_string())
+                })?;
+                let token = crate::assets::TokenId::new(token_id);
+                if token == crate::assets::NATIVE_TOKEN {
+                    return Err(ExecutionError::Block(
+                        "native token transfer must use protocol-level commands".to_string(),
+                    ));
+                }
+                let balance = self.state_db.get_token_balance(&payer, token).as_u64();
+                if balance < amount {
+                    return Err(ExecutionError::Block(format!(
+                        "insufficient token {} balance {} needed {} for transfer",
+                        token.0, balance, amount
+                    )));
+                }
+                Ok(())
+            }
             GameOp::TransferCoin { amount, .. } => {
                 let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
                     ExecutionError::Block("transfer requires an ed25519 signer".to_string())
@@ -653,6 +782,21 @@ impl StateExecutor {
             return Ok(());
         };
         match op {
+            GameOp::TransferToken { token_id, to, amount } => {
+                let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+                    ExecutionError::Block("transfer requires an ed25519 signer".to_string())
+                })?;
+                let token = crate::assets::TokenId::new(token_id);
+                if token == crate::assets::NATIVE_TOKEN {
+                    return Err(ExecutionError::Block(
+                        "native token transfer must use protocol-level commands".to_string(),
+                    ));
+                }
+                let target = parse_address_hex(&to)?;
+                self.debit_token(payer, token, amount)?;
+                self.credit_token(target, token, amount);
+                Ok(())
+            }
             GameOp::TransferCoin { to, amount } => {
                 let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
                     ExecutionError::Block("transfer requires an ed25519 signer".to_string())
@@ -1788,7 +1932,7 @@ mod tests {
                 hp: 300,
                 atk: 25,
                 def: 10,
-                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1 }],
+                drops: vec![crate::game::DropSpec { item_id: "dire_fang".into(), permille: 600, count: 1, price_shc: 15 }],
             },
         });
         let proposal_id = "monster-v2";
@@ -2062,6 +2206,293 @@ mod tests {
             gas_limit: 1_000_000,
         };
         sign(tx, key)
+    }
+
+    #[test]
+    fn transfer_token_moves_any_registered_token() {
+        // TokenId 扩展：通用 TransferToken 移动任意注册代币（此处 GEM = token 2）。
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        let (from_addr, from_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x61; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &from_addr, 1_000_000_000);
+        fund_token(&state_db, &from_addr, crate::assets::TokenId::new(2), 1_000);
+        let (to_addr, _tk) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x62; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        let op = GameOp::TransferToken {
+            token_id: 2,
+            to: format!("0x{}", hex::encode(to_addr.as_bytes())),
+            amount: 40,
+        };
+        let transfer = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(5),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("transfer token op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let transfer = sign(transfer, &from_key);
+        let gas = crate::compute::estimate_tx_gas(&transfer);
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[transfer], 1, 1_700_000_000, &basic)
+            .expect("execute");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "{:?}", receipts[0].error);
+        // GEM(token 2) 移动：from 1_000 - 40，to +40；SHC/native 不受影响
+        assert_eq!(
+            state_db.get_token_balance(&from_addr, crate::assets::TokenId::new(2)).as_u64(),
+            1_000 - 40
+        );
+        assert_eq!(
+            state_db.get_token_balance(&to_addr, crate::assets::TokenId::new(2)).as_u64(),
+            40
+        );
+        assert_eq!(
+            state_db.get_token_balance(&from_addr, crate::assets::SHC_TOKEN).as_u64(),
+            0,
+            "SHC untouched by GEM transfer"
+        );
+        assert_eq!(state_db.get_balance(&from_addr).as_u64(), 1_000_000_000 - gas);
+        let _ = auth_key;
+    }
+
+    #[test]
+    fn sell_drop_redeems_shc_from_treasury_to_player() {
+        // B 打金闭环：掉落对象（归玩家）→ SellDrop（玩家签名）→ 国库 SHC → 玩家。
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        let (player_addr, player_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x51; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &player_addr, 1_000_000_000);
+        fund_token(&state_db, &crate::governance::treasury_address(), crate::assets::SHC_TOKEN, 1_000);
+
+        // 铸造掉落对象 v1（owner = 玩家，内嵌价格 3 SHC）
+        let drop_id = crate::game::action_drop_object_id("s1", "goblin_coin");
+        let drop_state = serde_json::json!({
+            "kind": "action_drop", "session_id": "s1", "item_id": "goblin_coin", "count": 1, "price_shc": 3,
+        })
+        .to_string()
+        .into_bytes();
+        let drop = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![{
+                let mut p = proposal(&authority, drop_id, 1, None, drop_state);
+                p.owner = Ownership::Address(player_addr);
+                p
+            }],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let drop = sign(drop, &auth_key);
+        let drop_out = output_id_for_obj(&drop_id, 1);
+
+        // SellDrop（玩家签名）
+        let op = GameOp::SellDrop { session_id: "s1".into(), item_id: "goblin_coin".into() };
+        let sell = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![drop_out],
+            read_set: vec![],
+            output_proposals: vec![{
+                let mut p = proposal(
+                    &authority,
+                    drop_id,
+                    2,
+                    Some(drop_out),
+                    serde_json::json!({ "kind": "action_drop_redeemed", "session_id": "s1", "item_id": "goblin_coin" })
+                        .to_string()
+                        .into_bytes(),
+                );
+                p.owner = Ownership::Address(player_addr);
+                p
+            }],
+            fee: 0,
+            nonce: Some(2),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("sell op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let sell = sign(sell, &player_key);
+        let sell_gas = crate::compute::estimate_tx_gas(&sell);
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[drop, sell.clone()], 1, 1_700_000_000, &basic)
+            .expect("execute sell");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "{:?}", receipts[0].error);
+        assert_eq!(receipts[1].status, ReceiptStatus::Success, "sell: {:?}", receipts[1].error);
+
+        // 玩家 SHC +3（goblin_coin 单价 3），国库 SHC -3，掉落对象已消费
+        assert_eq!(
+            state_db.get_token_balance(&player_addr, crate::assets::SHC_TOKEN).as_u64(),
+            3
+        );
+        assert_eq!(
+            state_db.get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN).as_u64(),
+            1_000 - 3
+        );
+        let spent = executor.compute_store.get_output(drop_out).expect("drop exists");
+        assert!(spent.spent, "drop consumed by SellDrop");
+        // 玩家 native 只扣 sell 的 gas
+        assert_eq!(state_db.get_balance(&player_addr).as_u64(), 1_000_000_000 - sell_gas);
+    }
+
+    #[test]
+    fn sell_drop_rejects_unowned_or_unpriced_drop() {
+        // 未拥有（另一玩家签名）→ 授权拒绝；价格 0 → 无价值拒绝
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        let (owner_addr, owner_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x52; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        let (other_addr, other_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x53; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &other_addr, 1_000_000_000);
+        fund_token(&state_db, &crate::governance::treasury_address(), crate::assets::SHC_TOKEN, 1_000);
+
+        let drop_id = crate::game::action_drop_object_id("s2", "goblin_coin");
+        let drop_state = serde_json::json!({
+            "kind": "action_drop", "session_id": "s2", "item_id": "goblin_coin", "count": 1, "price_shc": 3,
+        })
+        .to_string()
+        .into_bytes();
+        let drop = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Mint,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![{
+                let mut p = proposal(&authority, drop_id, 1, None, drop_state);
+                p.owner = Ownership::Address(owner_addr);
+                p
+            }],
+            fee: 0,
+            nonce: Some(1),
+            metadata: vec![],
+            payload: vec![],
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 0,
+            priority_fee: 0,
+            gas_limit: 0,
+        };
+        let drop = sign(drop, &auth_key);
+        let drop_out = output_id_for_obj(&drop_id, 1);
+
+        let mk_sell = |signer: &ed25519_dalek::SigningKey, nonce: u64| {
+            let op = GameOp::SellDrop { session_id: "s2".into(), item_id: "goblin_coin".into() };
+            let tx = ComputeTx {
+                tx_id: TxId(crate::crypto::Hash::zero()),
+                domain_id: GAME_DOMAIN,
+                command: Command::Invoke,
+                input_set: vec![drop_out],
+                read_set: vec![],
+                output_proposals: vec![{
+                    let mut p = proposal(
+                        &authority,
+                        drop_id,
+                        2,
+                        Some(drop_out),
+                        serde_json::json!({ "kind": "action_drop_redeemed", "session_id": "s2", "item_id": "goblin_coin" })
+                            .to_string()
+                            .into_bytes(),
+                    );
+                    p.owner = Ownership::Address(owner_addr);
+                    p
+                }],
+                fee: 0,
+                nonce: Some(nonce),
+                metadata: vec![],
+                payload: serde_json::to_vec(&op).expect("sell op"),
+                deadline_unix_secs: None,
+                chain_id: Some(10088),
+                network_id: Some(10088),
+                witness: TxWitness { signatures: vec![], threshold: None },
+                max_fee: 1_000_000,
+                priority_fee: 0,
+                gas_limit: 100_000,
+            };
+            sign(tx, signer)
+        };
+        let other_sell = mk_sell(&other_key, 2);
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[drop, other_sell], 1, 1_700_000_000, &basic)
+            .expect("execute");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success);
+        // 非 owner 签名 → 授权层拒绝（SignatureOwnerMismatch）
+        assert_eq!(receipts[1].status, ReceiptStatus::Failed, "unowned sell must fail");
+        assert!(
+            receipts[1].error.as_deref().unwrap_or("").contains("Signature does not match owner"),
+            "{:?}",
+            receipts[1].error
+        );
+        let _ = owner_key;
     }
 
     #[test]

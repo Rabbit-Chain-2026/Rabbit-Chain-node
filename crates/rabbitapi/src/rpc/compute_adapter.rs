@@ -35,6 +35,7 @@ pub(crate) fn gate_game_tx(
                 GameOp::Vote { .. } => gate_vote(tx, store, now_unix, &op)?,
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
                 GameOp::ActionSettle { .. } => gate_action_settle(tx, store, &op)?,
+                GameOp::SellDrop { .. } => gate_sell_drop(tx, store, &op)?,
                 GameOp::Enhance { rules_version, .. } | GameOp::ZkEnhance { rules_version, .. } => {
                     // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
                     // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
@@ -85,6 +86,19 @@ fn load_monster_config(
     })?;
     serde_json::from_slice(&obj.state).map_err(|e| {
         RpcErrorObject::invalid_params(format!("invalid monster config object state: {e}"))
+    })
+}
+
+/// 读取链上 TokenRegistry 对象（代币注册元数据；治理 UpdateConfig 可注册新代币）。
+fn load_token_registry(
+    store: &dyn ObjectStore,
+) -> Result<rabbitcore::assets::TokenRegistry, RpcErrorObject> {
+    let config_id = rabbitcore::assets::token_registry_object_id();
+    let obj = store.get_latest_output_by_object(config_id).ok_or_else(|| {
+        RpcErrorObject::invalid_params("token registry object not found on chain".into())
+    })?;
+    serde_json::from_slice(&obj.state).map_err(|e| {
+        RpcErrorObject::invalid_params(format!("invalid token registry state: {e}"))
     })
 }
 
@@ -292,7 +306,7 @@ fn gate_execute(
         ));
     }
     // UpdateConfig 生效：交易必须同时产出新版本配置对象，且与提案 params 一致。
-    // 支持两类链上规则对象：EnhanceConfig（强化）/ MonsterTableConfig（怪物表）。
+    // 支持三类链上规则/资产对象：EnhanceConfig / MonsterTableConfig / TokenRegistry。
     if let rabbitcore::governance::ProposalKind::UpdateConfig {
         config_object,
         params,
@@ -300,16 +314,20 @@ fn gate_execute(
     {
         let enhance_id = rabbitcore::game::enhance_config_object_id();
         let monster_id = rabbitcore::game::monster_config_object_id();
+        let registry_id = rabbitcore::assets::token_registry_object_id();
         let enhance_hex = format!("0x{}", hex::encode(enhance_id.0.as_bytes()));
         let monster_hex = format!("0x{}", hex::encode(monster_id.0.as_bytes()));
+        let registry_hex = format!("0x{}", hex::encode(registry_id.0.as_bytes()));
         let target = config_object.trim().to_lowercase();
         let expected_id = if target == enhance_hex {
             enhance_id
         } else if target == monster_hex {
             monster_id
+        } else if target == registry_hex {
+            registry_id
         } else {
             return Err(RpcErrorObject::invalid_params(format!(
-                "UpdateConfig: unsupported config object {config_object} (only enhance/monster config)"
+                "UpdateConfig: unsupported config object {config_object} (enhance/monster/token-registry)"
             )));
         };
         let out_cfg = tx
@@ -344,7 +362,7 @@ fn gate_execute(
                     "UpdateConfig: output config object does not match proposal params".into(),
                 ));
             }
-        } else {
+        } else if target == monster_hex {
             let cur_version = load_monster_config(store)?.version;
             let parsed: rabbitcore::game::MonsterTableConfig =
                 serde_json::from_slice(&out_cfg.state).map_err(|e| {
@@ -360,6 +378,29 @@ fn gate_execute(
                 serde_json::from_value(params.clone()).map_err(|e| {
                     RpcErrorObject::invalid_params(format!(
                         "UpdateConfig: proposal params not a valid monster config: {e}"
+                    ))
+                })?;
+            if expected_cfg != parsed {
+                return Err(RpcErrorObject::invalid_params(
+                    "UpdateConfig: output config object does not match proposal params".into(),
+                ));
+            }
+        } else {
+            let cur_version = load_token_registry(store)?.version;
+            let parsed: rabbitcore::assets::TokenRegistry =
+                serde_json::from_slice(&out_cfg.state).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!("invalid new config object state: {e}"))
+                })?;
+            if parsed.version != cur_version.saturating_add(1) {
+                return Err(RpcErrorObject::invalid_params(format!(
+                    "UpdateConfig: config version must advance {cur_version} -> {}",
+                    cur_version.saturating_add(1)
+                )));
+            }
+            let expected_cfg: rabbitcore::assets::TokenRegistry =
+                serde_json::from_value(params.clone()).map_err(|e| {
+                    RpcErrorObject::invalid_params(format!(
+                        "UpdateConfig: proposal params not a valid token registry: {e}"
                     ))
                 })?;
             if expected_cfg != parsed {
@@ -484,6 +525,50 @@ fn gate_action_settle(
     }
     if tx.output_proposals.len() - 1 != drops.len() {
         return Err(RpcErrorObject::invalid_params("drop object count mismatch".into()));
+    }
+    Ok(())
+}
+
+/// 打金闭环门禁（SellDrop）：消耗掉落对象 v1 → 国库 SHC 支付给签名者。
+/// 1) 输入[0] 是未消费的 action_drop 对象（session_id/item_id 匹配、价格内嵌）
+/// 2) 对象 owner == 签名者（否则授权层 SignatureOwnerMismatch；此处快速反馈）
+pub(crate) fn gate_sell_drop(
+    tx: &ComputeTx,
+    store: &dyn ObjectStore,
+    op: &GameOp,
+) -> Result<(), RpcErrorObject> {
+    let GameOp::SellDrop { session_id, item_id } = op else {
+        unreachable!("gate_sell_drop called with non-sell op")
+    };
+    let input = tx.input_set.first().ok_or_else(|| {
+        RpcErrorObject::invalid_params("sell drop missing input object".into())
+    })?;
+    let obj = store.get_output(*input).ok_or_else(|| {
+        RpcErrorObject::invalid_params("sell drop input object not found on chain".into())
+    })?;
+    if obj.spent {
+        return Err(RpcErrorObject::invalid_params("drop already sold (spent)".into()));
+    }
+    let state: serde_json::Value = serde_json::from_slice(&obj.state)
+        .map_err(|e| RpcErrorObject::invalid_params(format!("invalid drop state: {e}")))?;
+    if state.get("kind").and_then(|x| x.as_str()) != Some("action_drop")
+        || state.get("session_id").and_then(|x| x.as_str()) != Some(session_id.as_str())
+        || state.get("item_id").and_then(|x| x.as_str()) != Some(item_id.as_str())
+    {
+        return Err(RpcErrorObject::invalid_params("drop object mismatch".into()));
+    }
+    let price = state.get("price_shc").and_then(|x| x.as_u64()).unwrap_or(0);
+    if price == 0 {
+        return Err(RpcErrorObject::invalid_params("drop has no sell value".into()));
+    }
+    // 签名者必须拥有该掉落对象（授权层也会校验；此处尽早拒绝）
+    let signer = rabbitcore::game::ed25519_signer_address(tx).ok_or_else(|| {
+        RpcErrorObject::invalid_params("sell drop requires an ed25519 signer".into())
+    })?;
+    if !matches!(&obj.owner, rabbitcore::compute::Ownership::Address(a) if *a == signer) {
+        return Err(RpcErrorObject::invalid_params(
+            "sell drop: object not owned by signer".into(),
+        ));
     }
     Ok(())
 }
