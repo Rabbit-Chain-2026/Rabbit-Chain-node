@@ -242,6 +242,20 @@ impl StateExecutor {
                 });
                 continue;
             }
+            // ZK 塔挑战预检（确定性）：证明验证 + 奖励 SHC 国库足额。
+            if let Err(e) = self.apply_zk_tower_effects(tx) {
+                receipts.push(Receipt {
+                    tx_id: tx.tx_id,
+                    block_hash: Hash::zero(),
+                    status: ReceiptStatus::Failed,
+                    gas_used: 0,
+                    compute_units: 0,
+                    output_refs: vec![],
+                    logs: vec![],
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
             // PvP 结算预检（确定性）：双方承诺已揭晓 + 组合种子战斗结果一致。
             if let Err(e) = self.apply_pvp_effects(tx) {
                 receipts.push(Receipt {
@@ -319,6 +333,20 @@ impl StateExecutor {
                     }
                     // 费用提交（已预检）：真实借记签名者 gas/税 → 国库（杜绝凭空入账）。
                     if let Err(e) = self.commit_fee_effects(tx, base_fee) {
+                        receipts.push(Receipt {
+                            tx_id: tx.tx_id,
+                            block_hash: Hash::zero(),
+                            status: ReceiptStatus::Failed,
+                            gas_used: 0,
+                            compute_units: 0,
+                            output_refs: vec![],
+                            logs: vec![],
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                    // ZK 塔挑战提交（已预检）：国库 SHC → 签名者（塔挑战奖励）。
+                    if let Err(e) = self.commit_zk_tower_effects(tx) {
                         receipts.push(Receipt {
                             tx_id: tx.tx_id,
                             block_hash: Hash::zero(),
@@ -701,6 +729,61 @@ impl StateExecutor {
                 report.total_rounds
             )));
         }
+        Ok(())
+    }
+
+    /// ZK 塔挑战预检（确定性，跨节点一致）：原生验证 STARK 证明 → 奖励 SHC 国库足额。
+    fn apply_zk_tower_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::ZkTowerClaim { growth_permille, difficulty_a, difficulty_b, difficulty_c, claimed_final, proof_hex, .. } = op else {
+            return Ok(());
+        };
+        let reward = crate::game::verify_tower_claim(
+            growth_permille,
+            difficulty_a,
+            difficulty_b,
+            difficulty_c,
+            claimed_final,
+            &proof_hex,
+        )
+        .map_err(|e| ExecutionError::Block(format!("tower claim rejected: {e}")))?;
+        let treasury_shc = self.treasury_balance();
+        if (treasury_shc as u64) < reward {
+            return Err(ExecutionError::Block(format!(
+                "insufficient treasury shc {} needed {} for tower reward",
+                treasury_shc, reward
+            )));
+        }
+        Ok(())
+    }
+
+    /// ZK 塔挑战提交（已预检）：国库 SHC → 签名者（重模拟摘要兑现）。
+    fn commit_zk_tower_effects(&self, tx: &ComputeTx) -> Result<()> {
+        if tx.domain_id != GAME_DOMAIN || tx.command != Command::Invoke {
+            return Ok(());
+        }
+        let Ok(op) = GameOp::parse(&tx.payload) else {
+            return Ok(());
+        };
+        let GameOp::ZkTowerClaim { claimed_final, .. } = op else {
+            return Ok(());
+        };
+        let reward = crate::game::tower_reward_shc(claimed_final);
+        let payer = crate::game::ed25519_signer_address(tx).ok_or_else(|| {
+            ExecutionError::Block("tower claim requires an ed25519 signer".to_string())
+        })?;
+        self.debit_treasury(reward)?;
+        self.credit_token(payer, crate::assets::SHC_TOKEN, reward);
+        self.ledger
+            .write()
+            .expect("treasury ledger lock")
+            .record_expense("tower_reward", reward, "zk summary reward")
+            .map_err(|e| ExecutionError::Block(format!("treasury ledger expense failed: {e}")))?;
         Ok(())
     }
 
@@ -2377,6 +2460,152 @@ mod tests {
         );
         assert_eq!(state_db.get_balance(&from_addr).as_u64(), 1_000_000_000 - gas);
         let _ = auth_key;
+    }
+
+    #[test]
+    fn zk_tower_claim_redeems_reward_after_proof_verification() {
+        // M2：客户端离链模拟 255 层塔 → STARK 摘要证明 → 链上验证 + SHC 奖励。
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        fund_token(&state_db, &crate::governance::treasury_address(), crate::assets::SHC_TOKEN, 1_000_000);
+        let (player_addr, player_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x81; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &player_addr, 1_000_000_000);
+
+        // 客户端：秘密初始实力 + 公开塔配置 → 模拟 → 证明
+        let initial = 4242u64;
+        let growth = 50u64;
+        let (a, b, c) = (1u64, 100u64, 500u64);
+        let final_power = zk::tower::simulate_tower(initial, growth, a, b, c, zk::tower::TOWER_LAYERS);
+        let proof = zk::tower::prove_tower(initial, growth, a, b, c, zk::enhance::ZK_ENHANCE_QUERIES);
+        let proof_hex = hex::encode(zk::tower::to_bytes(&proof));
+        let reward = crate::game::tower_reward_shc(final_power);
+        assert!(reward > 0, "tower with these params must yield reward");
+
+        let op = GameOp::ZkTowerClaim {
+            tower_id: "tower-1".into(),
+            growth_permille: growth,
+            difficulty_a: a,
+            difficulty_b: b,
+            difficulty_c: c,
+            claimed_final: final_power,
+            rules_version: 1,
+            proof_hex: proof_hex.clone(),
+        };
+        let claim = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(5),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("tower op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let claim = sign(claim, &player_key);
+        let claim_gas = crate::compute::estimate_tx_gas(&claim);
+        // gas 费 = min(估算×base_fee, max_fee)；base_fee 巨大时饱和到 max_fee
+        let claim_fee = claim_gas
+            .saturating_mul(1_700_000_000)
+            .saturating_add(0)
+            .min(claim.max_fee);
+
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[claim], 1, 1_700_000_000, &basic)
+            .expect("execute tower");
+        assert_eq!(receipts[0].status, ReceiptStatus::Success, "{:?}", receipts[0].error);
+        // 玩家 SHC +reward；国库 SHC −reward；native 只扣 gas
+        assert_eq!(
+            state_db.get_token_balance(&player_addr, crate::assets::SHC_TOKEN).as_u64(),
+            reward
+        );
+        assert_eq!(
+            state_db.get_token_balance(&crate::governance::treasury_address(), crate::assets::SHC_TOKEN).as_u64(),
+            1_000_000 - reward
+        );
+        assert_eq!(state_db.get_balance(&player_addr).as_u64(), 1_000_000_000 - claim_fee);
+    }
+
+    #[test]
+    fn zk_tower_claim_rejects_forged_proof() {
+        // 伪造：声称 final 与证明不符 / 篡改证明 → 拒绝
+        let state_db = Arc::new(StateDb::new(Hash::zero()));
+        let executor = StateExecutor::new(state_db.clone(), 10088);
+        let (authority, auth_key) = authority();
+        fund_native(&state_db, &authority, 100_000_000_000);
+        let (player_addr, player_key) = {
+            use ed25519_dalek::SigningKey;
+            let k = SigningKey::from_bytes(&[0x82; 32]);
+            let pk = k.verifying_key().to_bytes();
+            let h = crate::crypto::keccak256(&pk);
+            (crate::crypto::Address::from_slice(&h[12..]).unwrap(), k)
+        };
+        fund_native(&state_db, &player_addr, 1_000_000_000);
+        let initial = 4242u64;
+        let growth = 50u64;
+        let (a, b, c) = (1u64, 100u64, 500u64);
+        let final_power = zk::tower::simulate_tower(initial, growth, a, b, c, zk::tower::TOWER_LAYERS);
+        let proof = zk::tower::prove_tower(initial, growth, a, b, c, zk::enhance::ZK_ENHANCE_QUERIES);
+        let mut proof_bytes = zk::tower::to_bytes(&proof);
+        let last = proof_bytes.last_mut().unwrap();
+        *last ^= 0xFF;
+        let op = GameOp::ZkTowerClaim {
+            tower_id: "tower-2".into(),
+            growth_permille: growth,
+            difficulty_a: a,
+            difficulty_b: b,
+            difficulty_c: c,
+            claimed_final: final_power,
+            rules_version: 1,
+            proof_hex: hex::encode(proof_bytes),
+        };
+        let claim = ComputeTx {
+            tx_id: TxId(crate::crypto::Hash::zero()),
+            domain_id: GAME_DOMAIN,
+            command: Command::Invoke,
+            input_set: vec![],
+            read_set: vec![],
+            output_proposals: vec![],
+            fee: 0,
+            nonce: Some(5),
+            metadata: vec![],
+            payload: serde_json::to_vec(&op).expect("tower op"),
+            deadline_unix_secs: None,
+            chain_id: Some(10088),
+            network_id: Some(10088),
+            witness: TxWitness { signatures: vec![], threshold: None },
+            max_fee: 1_000_000,
+            priority_fee: 0,
+            gas_limit: 100_000,
+        };
+        let claim = sign(claim, &player_key);
+        let basic = executor.new_basic_executor();
+        let (receipts, _) = executor
+            .execute_txs(&[claim], 1, 1_700_000_000, &basic)
+            .expect("execute");
+        assert_eq!(receipts[0].status, ReceiptStatus::Failed, "tampered proof must fail");
+        assert!(
+            receipts[0].error.as_deref().unwrap_or("").contains("rejected"),
+            "{:?}",
+            receipts[0].error
+        );
     }
 
     #[test]

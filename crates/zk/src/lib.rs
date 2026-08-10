@@ -16,3 +16,4 @@ pub mod merkle;
 pub mod poly;
 pub mod enhance;
 pub mod stark;
+pub mod tower;

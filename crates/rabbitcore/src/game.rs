@@ -88,6 +88,22 @@ pub enum GameOp {
         claimed_rounds: u32,
         rules_version: u64,
     },
+    /// 塔挑战重模拟摘要（M2：ZK 主战场）：客户端离链模拟 N 层塔（秘密初始实力 +
+    /// 公开难度多项式/成长率），生成 STARK 证明，链上 O(log N) 验证摘要并发放 SHC。
+    ZkTowerClaim {
+        tower_id: String,
+        /// 成长率（千分位，公开塔配置）。
+        growth_permille: u64,
+        /// 公开难度多项式系数 d(i) = A·i² + B·i + C。
+        difficulty_a: u64,
+        difficulty_b: u64,
+        difficulty_c: u64,
+        /// 声称的终层实力（毫秒，摘要）。
+        claimed_final: u64,
+        rules_version: u64,
+        /// ZK 证明：hex 编码的 bincode（`zk::tower::TowerProof`）。
+        proof_hex: String,
+    },
     /// ZK 强化：客户端证明"存在秘密 seed 使 xorshift64³(seed) mod 1000 = roll_claim"，
     /// 链上原生验证证明后按公开 roll_claim 派生强化结果（seed 永不上链）。
     ZkEnhance {
@@ -459,6 +475,18 @@ pub fn verify_with_config(
             }
             Ok(serde_json::json!({ "pvp_id": pvp_id }))
         }
+        GameOp::ZkTowerClaim { tower_id, claimed_final, proof_hex, .. } => {
+            if tower_id.trim().is_empty() {
+                return Err(GameError::InvalidPayload("tower claim requires tower_id".into()));
+            }
+            if *claimed_final == 0 {
+                return Err(GameError::InvalidPayload("tower claim requires positive final power".into()));
+            }
+            if proof_hex.trim().is_empty() {
+                return Err(GameError::InvalidPayload("tower claim requires proof".into()));
+            }
+            Ok(serde_json::json!({ "tower_id": tower_id, "claimed_final": claimed_final }))
+        }
         GameOp::TransferToken { token_id, to, amount } => {
             if *token_id == 0 {
                 return Err(GameError::InvalidPayload(
@@ -591,6 +619,47 @@ pub fn pvp_result_object_id(pvp_id: &str) -> crate::compute::ObjectId {
     crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
         format!("shanhai/pvp/{pvp_id}/result").as_bytes(),
     )))
+}
+
+/// 塔挑战 SHC 奖励：按终层实力（毫秒）线性折算（power/1000 → 每 10 实力 1 SHC）。
+/// 封顶 100k SHC（指数成长下防止奖励爆炸；平衡参数可走治理）。
+pub const TOWER_REWARD_CAP: u64 = 100_000;
+
+pub fn tower_reward_shc(claimed_final: u64) -> u64 {
+    ((claimed_final / 1000) / 10).min(TOWER_REWARD_CAP)
+}
+
+/// 塔挑战摘要验证（纯函数，链上原生执行）：解码证明 → 验证 STARK（O(log N + 查询)）
+/// → 返回奖励 SHC。与 ZkEnhance 同模式：客户端离链模拟，链上验摘要。
+pub fn verify_tower_claim(
+    growth_permille: u64,
+    difficulty_a: u64,
+    difficulty_b: u64,
+    difficulty_c: u64,
+    claimed_final: u64,
+    proof_hex: &str,
+) -> Result<u64, GameError> {
+    let raw = hex::decode(proof_hex.trim().strip_prefix("0x").unwrap_or(proof_hex.trim()))
+        .map_err(|e| GameError::InvalidPayload(format!("tower proof hex invalid: {e}")))?;
+    let proof = zk::tower::from_bytes(&raw)
+        .map_err(|e| GameError::InvalidPayload(e))?;
+    zk::tower::verify_tower(
+        &proof,
+        growth_permille,
+        difficulty_a,
+        difficulty_b,
+        difficulty_c,
+        claimed_final,
+        zk::enhance::ZK_ENHANCE_QUERIES,
+    )
+    .map_err(|e| GameError::InvalidPayload(format!("tower zk proof rejected: {e}")))?;
+    let reward = tower_reward_shc(claimed_final);
+    if reward == 0 {
+        return Err(GameError::InvalidPayload(
+            "tower claim final power too low for reward".into(),
+        ));
+    }
+    Ok(reward)
 }
 
 /// 动作 session 对象逻辑 id。

@@ -38,6 +38,18 @@ pub(crate) fn gate_game_tx(
                 GameOp::SellDrop { .. } => gate_sell_drop(tx, store, &op)?,
                 GameOp::PvpReveal { .. } => gate_pvp_reveal(tx, store, &op)?,
                 GameOp::PvpSettle { .. } => gate_pvp_settle(tx, store, &op)?,
+                GameOp::ZkTowerClaim { proof_hex, growth_permille, difficulty_a, difficulty_b, difficulty_c, claimed_final, .. } => {
+                    // 塔挑战重模拟摘要：链上原生验证 STARK 证明（O(log N + 查询)）
+                    rabbitcore::game::verify_tower_claim(
+                        *growth_permille,
+                        *difficulty_a,
+                        *difficulty_b,
+                        *difficulty_c,
+                        *claimed_final,
+                        proof_hex,
+                    )
+                    .map_err(|e| RpcErrorObject::invalid_params(format!("tower claim rejected: {e}")))?;
+                }
                 GameOp::Enhance { rules_version, .. } | GameOp::ZkEnhance { rules_version, .. } => {
                     // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
                     // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
