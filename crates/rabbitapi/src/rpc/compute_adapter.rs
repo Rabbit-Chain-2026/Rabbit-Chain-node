@@ -36,6 +36,8 @@ pub(crate) fn gate_game_tx(
                 GameOp::Execute { .. } => gate_execute(tx, store, now_unix, &op)?,
                 GameOp::ActionSettle { .. } => gate_action_settle(tx, store, &op)?,
                 GameOp::SellDrop { .. } => gate_sell_drop(tx, store, &op)?,
+                GameOp::PvpReveal { .. } => gate_pvp_reveal(tx, store, &op)?,
+                GameOp::PvpSettle { .. } => gate_pvp_settle(tx, store, &op)?,
                 GameOp::Enhance { rules_version, .. } | GameOp::ZkEnhance { rules_version, .. } => {
                     // 链上 EnhanceConfig 对象为权威规则：rules_version 必须匹配，
                     // 结果用该版本配置重算（治理 UpdateConfig 通过后新版本生效）。
@@ -569,6 +571,132 @@ pub(crate) fn gate_sell_drop(
         return Err(RpcErrorObject::invalid_params(
             "sell drop: object not owned by signer".into(),
         ));
+    }
+    Ok(())
+}
+
+/// PvP 承诺对象 state 解析（v1 = 未揭晓，v2 = revealed）。
+fn parse_pvp_commit(state: &[u8]) -> Result<serde_json::Value, RpcErrorObject> {
+    serde_json::from_slice(state)
+        .map_err(|e| RpcErrorObject::invalid_params(format!("invalid pvp commit state: {e}")))
+}
+
+/// PvP 双盲揭晓门禁：keccak(seed‖pvp_id‖committer‖team) 必须等于承诺。
+pub(crate) fn gate_pvp_reveal(
+    tx: &ComputeTx,
+    store: &dyn ObjectStore,
+    op: &GameOp,
+) -> Result<(), RpcErrorObject> {
+    let GameOp::PvpReveal { pvp_id, committer, seed } = op else {
+        unreachable!("gate_pvp_reveal called with non-reveal op")
+    };
+    let input = tx.input_set.first().ok_or_else(|| {
+        RpcErrorObject::invalid_params("pvp reveal missing input commitment".into())
+    })?;
+    let obj = store.get_output(*input).ok_or_else(|| {
+        RpcErrorObject::invalid_params("pvp commitment not found on chain".into())
+    })?;
+    if obj.spent {
+        return Err(RpcErrorObject::invalid_params("pvp commitment already revealed".into()));
+    }
+    let state = parse_pvp_commit(&obj.state)?;
+    if state.get("kind").and_then(|x| x.as_str()) != Some("pvp_commit")
+        || state.get("pvp_id").and_then(|x| x.as_str()) != Some(pvp_id.as_str())
+        || state.get("committer").and_then(|x| x.as_str()) != Some(committer.as_str())
+    {
+        return Err(RpcErrorObject::invalid_params("pvp commitment mismatch".into()));
+    }
+    let teams: rabbitcore::game::BattleTeams =
+        serde_json::from_value(state.get("team").cloned().unwrap_or(serde_json::Value::Null))
+            .map_err(|e| RpcErrorObject::invalid_params(format!("invalid pvp team: {e}")))?;
+    let committed = hex::decode(
+        state
+            .get("commit_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(""),
+    )
+    .map_err(|e| RpcErrorObject::invalid_params(format!("commit hash hex: {e}")))?;
+    let actual = rabbitcore::game::pvp_commit_hash(*seed, pvp_id, committer, &teams);
+    if committed != actual {
+        return Err(RpcErrorObject::invalid_params("pvp reveal: seed does not match commitment".into()));
+    }
+    // 输出 v2 必须标记 revealed 且 seed 一致
+    let out = tx.output_proposals.first().ok_or_else(|| {
+        RpcErrorObject::invalid_params("pvp reveal missing output record".into())
+    })?;
+    let out_state = parse_pvp_commit(&out.state)?;
+    if out_state.get("revealed").and_then(|x| x.as_bool()) != Some(true)
+        || out_state.get("seed").and_then(|x| x.as_u64()) != Some(*seed)
+    {
+        return Err(RpcErrorObject::invalid_params("pvp reveal output must mark revealed".into()));
+    }
+    Ok(())
+}
+
+/// PvP 结算门禁：双方承诺均已揭晓 → 组合种子 → 确定性战斗 → 验证声称结果。
+pub(crate) fn gate_pvp_settle(
+    tx: &ComputeTx,
+    store: &dyn ObjectStore,
+    op: &GameOp,
+) -> Result<(), RpcErrorObject> {
+    let GameOp::PvpSettle { pvp_id, claimed_winner, claimed_rounds, rules_version } = op else {
+        unreachable!("gate_pvp_settle called with non-settle op")
+    };
+    let _ = rules_version;
+    if tx.input_set.len() != 2 {
+        return Err(RpcErrorObject::invalid_params(
+            "pvp settle requires both revealed commitments".into(),
+        ));
+    }
+    let mut seeds = Vec::new();
+    let mut teams: Option<rabbitcore::game::BattleTeams> = None;
+    for id in &tx.input_set {
+        let obj = store.get_output(*id).ok_or_else(|| {
+            RpcErrorObject::invalid_params("pvp commitment not found on chain".into())
+        })?;
+        let state = parse_pvp_commit(&obj.state)?;
+        if state.get("kind").and_then(|x| x.as_str()) != Some("pvp_commit")
+            || state.get("pvp_id").and_then(|x| x.as_str()) != Some(pvp_id.as_str())
+            || state.get("revealed").and_then(|x| x.as_bool()) != Some(true)
+        {
+            return Err(RpcErrorObject::invalid_params(
+                "pvp settle: both commitments must be revealed".into(),
+            ));
+        }
+        let seed = state.get("seed").and_then(|x| x.as_u64()).unwrap_or(0);
+        seeds.push(seed);
+        let t: rabbitcore::game::BattleTeams =
+            serde_json::from_value(state.get("team").cloned().unwrap_or(serde_json::Value::Null))
+                .map_err(|e| RpcErrorObject::invalid_params(format!("invalid pvp team: {e}")))?;
+        teams = Some(match teams {
+            None => t.clone(),
+            Some(existing) => {
+                if existing != t {
+                    return Err(RpcErrorObject::invalid_params(
+                        "pvp settle: teams must be identical across both commitments".into(),
+                    ));
+                }
+                existing
+            }
+        });
+    }
+    let teams = teams.ok_or_else(|| RpcErrorObject::invalid_params("pvp teams missing".into()))?;
+    let seed = rabbitcore::game::pvp_combined_seed(seeds[0], seeds[1]);
+    let report = rabbitcore::game::resolve_battle(&teams, seed);
+    if report.winner != *claimed_winner {
+        return Err(RpcErrorObject::invalid_params(format!(
+            "pvp winner mismatch: claimed {claimed_winner}, computed {}",
+            report.winner
+        )));
+    }
+    if report.total_rounds != *claimed_rounds {
+        return Err(RpcErrorObject::invalid_params(format!(
+            "pvp rounds mismatch: claimed {claimed_rounds}, computed {}",
+            report.total_rounds
+        )));
     }
     Ok(())
 }

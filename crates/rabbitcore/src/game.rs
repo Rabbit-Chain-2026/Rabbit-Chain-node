@@ -65,6 +65,29 @@ pub enum GameOp {
         to: String,
         amount: u64,
     },
+    /// PvP 双盲承诺（方案B）：提交 H(seed‖pvp_id‖committer‖team) 与队伍，先承诺后揭晓。
+    PvpCommit {
+        pvp_id: String,
+        committer: String,
+        team: BattleTeams,
+        /// 32 字节 hex 承诺（keccak256(seed‖pvp_id‖committer‖team_json)）。
+        commit_hash: String,
+        created_at_unix: u64,
+    },
+    /// PvP 双盲揭晓：提交秘密 seed，门禁校验与承诺一致；双方都揭晓后可得组合种子。
+    PvpReveal {
+        pvp_id: String,
+        committer: String,
+        seed: u64,
+    },
+    /// PvP 结算：消费双方已揭晓的承诺，组合种子 = keccak(seed_a‖seed_b) 低 64 位，
+    /// 用承诺内队伍确定性战斗，验证声称结果。
+    PvpSettle {
+        pvp_id: String,
+        claimed_winner: u8,
+        claimed_rounds: u32,
+        rules_version: u64,
+    },
     /// ZK 强化：客户端证明"存在秘密 seed 使 xorshift64³(seed) mod 1000 = roll_claim"，
     /// 链上原生验证证明后按公开 roll_claim 派生强化结果（seed 永不上链）。
     ZkEnhance {
@@ -109,7 +132,7 @@ pub enum GameOp {
 }
 
 /// 战斗双方队伍（直接使用 shanhai-core 类型，序列化后跨进程传递）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BattleTeams {
     pub a: Team,
     pub b: Team,
@@ -140,6 +163,10 @@ impl GameOp {
 
 pub use shanhai_core::enhancement::{EnhanceConfig, roll_with_config};
 pub use shanhai_core::monster::{DropSpec, MonsterEntry, MonsterSpec, MonsterTableConfig};
+/// PvP/战斗确定性解析（包装 shanhai_core::battle::resolve）。
+pub fn resolve_battle(teams: &BattleTeams, seed: u64) -> shanhai_core::battle::BattleReport {
+    shanhai_core::battle::resolve(&teams.a, &teams.b, seed)
+}
 
 /// 强化规则配置对象逻辑 id（与 shanhai-server `config_object_id` 同源）。
 pub fn enhance_config_object_id() -> crate::compute::ObjectId {
@@ -408,6 +435,30 @@ pub fn verify_with_config(
                 "stake": stake,
             }))
         }
+        GameOp::PvpCommit { pvp_id, committer, commit_hash, created_at_unix, .. } => {
+            if pvp_id.trim().is_empty() || committer.trim().is_empty() {
+                return Err(GameError::InvalidPayload("pvp commit requires pvp_id and committer".into()));
+            }
+            let raw = hex::decode(commit_hash.trim().strip_prefix("0x").unwrap_or(commit_hash.trim()))
+                .map_err(|e| GameError::InvalidPayload(format!("commit hash hex: {e}")))?;
+            if raw.len() != 32 {
+                return Err(GameError::InvalidPayload("commit hash must be 32 bytes".into()));
+            }
+            let _ = created_at_unix;
+            Ok(serde_json::json!({ "pvp_id": pvp_id, "committer": committer }))
+        }
+        GameOp::PvpReveal { pvp_id, committer, .. } => {
+            if pvp_id.trim().is_empty() || committer.trim().is_empty() {
+                return Err(GameError::InvalidPayload("pvp reveal requires pvp_id and committer".into()));
+            }
+            Ok(serde_json::json!({ "pvp_id": pvp_id, "committer": committer }))
+        }
+        GameOp::PvpSettle { pvp_id, .. } => {
+            if pvp_id.trim().is_empty() {
+                return Err(GameError::InvalidPayload("pvp settle requires pvp_id".into()));
+            }
+            Ok(serde_json::json!({ "pvp_id": pvp_id }))
+        }
         GameOp::TransferToken { token_id, to, amount } => {
             if *token_id == 0 {
                 return Err(GameError::InvalidPayload(
@@ -506,6 +557,39 @@ pub struct ActionSession {
 pub fn action_drop_object_id(session_id: &str, item_id: &str) -> crate::compute::ObjectId {
     crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
         format!("shanhai/action/drop/{session_id}/{item_id}").as_bytes(),
+    )))
+}
+
+/// PvP 承诺对象逻辑 id（确定性：pvp_id + 参与者）。
+pub fn pvp_commitment_object_id(pvp_id: &str, committer: &str) -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        format!("shanhai/pvp/{pvp_id}/{committer}").as_bytes(),
+    )))
+}
+
+/// PvP 承诺：keccak256(seed‖pvp_id‖committer‖team_json)（先承诺后揭晓，防挑种子）。
+pub fn pvp_commit_hash(seed: u64, pvp_id: &str, committer: &str, teams: &BattleTeams) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&seed.to_be_bytes());
+    buf.extend_from_slice(pvp_id.as_bytes());
+    buf.extend_from_slice(committer.as_bytes());
+    buf.extend_from_slice(&serde_json::to_vec(teams).expect("teams json"));
+    crate::crypto::keccak256(&buf)
+}
+
+/// PvP 组合种子：keccak256(seed_a‖seed_b) 低 64 位（双方各自贡献，单一玩家不可预测）。
+pub fn pvp_combined_seed(seed_a: u64, seed_b: u64) -> u64 {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(&seed_a.to_be_bytes());
+    buf.extend_from_slice(&seed_b.to_be_bytes());
+    let h = crate::crypto::keccak256(&buf);
+    u64::from_be_bytes(h[..8].try_into().expect("hash"))
+}
+
+/// PvP 结果对象逻辑 id。
+pub fn pvp_result_object_id(pvp_id: &str) -> crate::compute::ObjectId {
+    crate::compute::ObjectId(crate::crypto::Hash::from_bytes(crate::crypto::keccak256(
+        format!("shanhai/pvp/{pvp_id}/result").as_bytes(),
     )))
 }
 
