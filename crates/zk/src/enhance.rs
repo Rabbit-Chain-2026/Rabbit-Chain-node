@@ -80,9 +80,15 @@ pub struct EnhanceProof {
 }
 
 pub const N_LOG2: u32 = 4; // 16 行迹
-pub const FRI_K: u32 = 5; // FRI 域 32 点（覆盖商 deg < 32）
-/// 共识固定的 FRI 查询数（证明方与链上验证方必须一致）。
-pub const ZK_ENHANCE_QUERIES: usize = 4;
+/// FRI 域：4 倍低度膨胀（扩展域）——tau(deg<16) 用 k-1=6 → 64 点；商(deg<32) 用 k=7 → 128 点。
+/// 旧值 FRI_K=5（32 点覆盖 deg<32，无膨胀）使 FRI 不提供低阶证明，仅靠约束挑战；
+/// 4 倍膨胀后 FRI 每查询错误概率 ≈ (deg/|D|) ≈ 1/4（见 verify_enhance 的 soundness 注释）。
+pub const FRI_K: u32 = 7;
+/// 共识固定的 FRI 查询数下限（证明方与链上验证方必须一致；低于下限拒绝）。
+/// 2026-08 安全加固：4 → 16（FRI 整体错误概率 ≈ (1/4)^16 ≈ 2^-32，叠加约束挑战 2^-64）。
+pub const ZK_ENHANCE_QUERIES: usize = 16;
+/// 查询数绝对下限（防降级攻击：恶意证明方用少量查询换取假证明）。
+pub const MIN_ENHANCE_QUERIES: usize = 16;
 
 /// 由承诺（τ/Q 根 + 系数）推导挑战 χ。
 fn derive_challenge(tau_root: &[u8; 32], q_root: &[u8; 32], q_coeffs: &[Fp]) -> Fp {
@@ -249,9 +255,9 @@ pub fn prove_enhance(seed: u64, roll: u64, num_queries: usize) -> EnhanceProof {
     for (c, &a) in quotients.iter().zip(alphas.iter()) {
         q_combined = q_combined + c.scale(a);
     }
-    // FRI（域 k = FRI_K）；FRI 内部抄本与 STARK 挑战抄本分离，双方同序
+    // FRI（域 k = FRI_K，4 倍低度膨胀）；FRI 内部抄本与 STARK 挑战抄本分离，双方同序
     let boundary_pt = omega.pow(10); // row 10（r 位公开行）
-    // 迹组合 τ 的 deg < 16（列由 16 行插值）→ FRI k=4；商 Q 的 deg < 32 → k=5
+    // 迹组合 τ 的 deg < 16 → FRI k=FRI_K-1（64 点）；商 Q 的 deg < 32 → k=FRI_K（128 点）
     let tau_fri = prove(&tau, FRI_K - 1, num_queries, Transcript::new(), Some(boundary_pt));
     let quotient_fri = prove(&q_combined, FRI_K, num_queries, Transcript::new(), None);
     // 约束检查挑战与打开：{χ, ωχ, ω⁻⁴χ, ω⁻⁵χ}
@@ -275,6 +281,12 @@ pub fn prove_enhance(seed: u64, roll: u64, num_queries: usize) -> EnhanceProof {
 
 /// 验证：roll、queries 公开。返回 Err(原因)。
 pub fn verify_enhance(proof: &EnhanceProof, roll: u64, num_queries: usize) -> Result<(), String> {
+    if num_queries < MIN_ENHANCE_QUERIES {
+        return Err(format!(
+            "query count {} below soundness floor {MIN_ENHANCE_QUERIES}",
+            num_queries
+        ));
+    }
     let omega = Fp::root_of_unity(N_LOG2);
     let boundary_pt = omega.pow(10);
     // 边界期望值：τ(ω^10) = Σ β_j·public_j；r 位公开，其余 0
@@ -428,15 +440,16 @@ mod tests {
     fn enhance_proof_roundtrip() {
         let seed = 987654321u64;
         let roll = enhance_roll(seed).1;
-        let proof = prove_enhance(seed, roll, 8);
-        assert_eq!(verify_enhance(&proof, roll, 8).unwrap(), ());
+        let proof = prove_enhance(seed, roll, ZK_ENHANCE_QUERIES);
+        assert_eq!(verify_enhance(&proof, roll, ZK_ENHANCE_QUERIES).unwrap(), ());
     }
 
     #[test]
     fn enhance_wrong_roll_rejected() {
         let seed = 555555u64;
         let roll = enhance_roll(seed).1;
-        let proof = prove_enhance(seed, roll, 8);
-        assert!(verify_enhance(&proof, (roll + 1) % 1000, 8).is_err());
+        let proof = prove_enhance(seed, roll, ZK_ENHANCE_QUERIES);
+        assert!(verify_enhance(&proof, (roll + 1) % 1000, ZK_ENHANCE_QUERIES).is_err());
     }
+
 }
