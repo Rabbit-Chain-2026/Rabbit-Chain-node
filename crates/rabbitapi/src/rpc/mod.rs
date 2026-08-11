@@ -760,6 +760,8 @@ impl RpcApi {
             "rabbit_getUtxos" => self.rabbit_get_utxos(params),
             "rabbit_getObject" => self.rabbit_get_object(params),
             "rabbit_getOutput" => self.rabbit_get_output(params),
+            "rabbit_getProof" => self.rabbit_get_proof(params),
+            "rabbit_verifyProof" => self.rabbit_verify_proof(params),
             "rabbit_getDomain" => self.rabbit_get_domain(params),
             "rabbit_listDomains" => self.rabbit_list_domains(params),
             "rabbit_simulateComputeTx" => self.rabbit_simulate_compute_tx(params),
@@ -954,6 +956,85 @@ impl RpcApi {
         let output_id = parse_output_id(output_id)?;
         let maybe_output = self.compute_store.get_output(output_id);
         Ok(serde_json::json!(maybe_output.map(object_output_to_json)))
+    }
+
+    /// `rabbit_getProof`：返回某个 unspent output 在 unspent MPT 状态根下的
+    /// 包含证明（root + output_id + value + trie nodes）。轻客户端可据此
+    /// 验证该 output 属于链上状态（配合 `rabbit_verifyProof`）。
+    fn rabbit_get_proof(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let params = params.ok_or(RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let output_id = params
+            .first()
+            .ok_or_else(|| RpcErrorObject::invalid_params("Missing output_id".to_string()))?
+            .as_str()
+            .ok_or_else(|| RpcErrorObject::invalid_params("output_id must be string".to_string()))?;
+        let output_id = parse_output_id(output_id)?;
+        // 从持久化 compute store 收集 unspent 集并生成 MPT 包含证明
+        let Some(store) = self.persistent_compute_store.as_ref() else {
+            return Err(RpcErrorObject::invalid_params(
+                "proof requires persistent compute store".into(),
+            ));
+        };
+        let Some(outputs) = store.collect_outputs() else {
+            return Err(RpcErrorObject::invalid_params("cannot enumerate outputs".into()));
+        };
+        let Some(proof) = rabbitstore::prove_unspent_output(&outputs, &output_id) else {
+            return Ok(serde_json::json!(null));
+        };
+        Ok(serde_json::json!({
+            "root": format!("0x{}", hex::encode(proof.root.as_bytes())),
+            "output_id": format!("0x{}", hex::encode(proof.output_id)),
+            "value": format!("0x{}", hex::encode(&proof.value)),
+            "nodes": proof.nodes.iter().map(|n| format!("0x{}", hex::encode(n))).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `rabbit_verifyProof`：验证 MPT 包含证明（root + output_id + value + nodes）
+    /// 是否成立——proof 根与声明的 state_root 一致且叶子值 == value。
+    fn rabbit_verify_proof(
+        &self,
+        params: Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, RpcErrorObject> {
+        let params = params.ok_or(RpcErrorObject::invalid_params("Missing params".to_string()))?;
+        let proof = params
+            .first()
+            .ok_or_else(|| RpcErrorObject::invalid_params("Missing proof object".to_string()))?;
+        let root_hex = proof.get("root").and_then(|x| x.as_str()).ok_or_else(|| {
+            RpcErrorObject::invalid_params("proof.root required".to_string())
+        })?;
+        let output_id_hex = proof.get("output_id").and_then(|x| x.as_str()).ok_or_else(|| {
+            RpcErrorObject::invalid_params("proof.output_id required".to_string())
+        })?;
+        let value_hex = proof.get("value").and_then(|x| x.as_str()).ok_or_else(|| {
+            RpcErrorObject::invalid_params("proof.value required".to_string())
+        })?;
+        let nodes = proof.get("nodes").and_then(|x| x.as_array()).ok_or_else(|| {
+            RpcErrorObject::invalid_params("proof.nodes required".to_string())
+        })?;
+        let root = parse_hash(root_hex)?;
+        let key = parse_output_id(output_id_hex)?.0.as_bytes().to_vec();
+        let value = hex::decode(value_hex.trim().strip_prefix("0x").unwrap_or(value_hex.trim()))
+            .map_err(|e| RpcErrorObject::invalid_params(format!("value hex: {e}")))?;
+        let proof_nodes: Result<Vec<Vec<u8>>, _> = nodes
+            .iter()
+            .map(|n| {
+                let h = n.as_str().ok_or_else(|| {
+                    RpcErrorObject::invalid_params("proof node must be hex string".to_string())
+                })?;
+                hex::decode(h.trim().strip_prefix("0x").unwrap_or(h.trim()))
+                    .map_err(|e| RpcErrorObject::invalid_params(format!("node hex: {e}")))
+            })
+            .collect();
+        let proof_nodes = proof_nodes?;
+        // 用 rabbitstore 的 MPT 验证器：proof 根 == 声明根 + key/value 沿路径匹配
+        let mut root_bytes = [0u8; 32];
+        root_bytes.copy_from_slice(root.as_bytes());
+        let trie_proof = rabbitstore::trie::TrieProof::new(proof_nodes, rabbitstore::trie::NodeHash::from_bytes(root_bytes));
+        let ok = rabbitstore::trie::verify_unspent_proof(&root, &key, Some(&value), &trie_proof);
+        Ok(serde_json::json!({ "valid": ok, "root": root_hex }))
     }
 
     fn rabbit_get_domain(
@@ -6415,6 +6496,54 @@ mod tests {
             domain_value.get("domain_id").and_then(|v| v.as_u64()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn test_rabbit_get_and_verify_proof_roundtrip() {
+        let api = build_test_api_with_persistent_compute();
+        let output = rabbitcore::compute::ObjectOutput {
+            output_id: rabbitcore::compute::OutputId(Hash::from_bytes([0x42; 32])),
+            object_id: rabbitcore::compute::ObjectId(Hash::from_bytes([0x43; 32])),
+            version: rabbitcore::compute::Version(1),
+            domain_id: rabbitcore::compute::DomainId(0),
+            kind: rabbitcore::compute::ObjectKind::State,
+            owner: rabbitcore::compute::Ownership::Shared,
+            predecessor: None,
+            state: vec![9, 8, 7],
+            state_root: None,
+            resources: vec![],
+            lock: rabbitcore::compute::Script::default(),
+            logic: None,
+            created_at: 0,
+            ttl: None,
+            rent_reserve: None,
+            flags: 0,
+            extensions: vec![],
+            spent: false,
+        };
+        api.compute_store.insert_output(output).unwrap();
+
+        // getProof → verifyProof 往返
+        let output_id_hex = format!("0x{}", hex::encode([0x42; 32]));
+        let proof = api
+            .rabbit_get_proof(Some(vec![serde_json::Value::String(output_id_hex.clone())]))
+            .unwrap();
+        assert!(proof.get("root").is_some(), "proof must include mpt root");
+        assert!(proof.get("nodes").is_some());
+        let verify = api.rabbit_verify_proof(Some(vec![proof.clone()])).unwrap();
+        assert_eq!(verify.get("valid").and_then(|v| v.as_bool()), Some(true));
+
+        // 伪造 value → 验证失败
+        let mut forged = proof.clone();
+        forged["value"] = serde_json::Value::String("0xdeadbeef".into());
+        let verify_bad = api.rabbit_verify_proof(Some(vec![forged])).unwrap();
+        assert_eq!(verify_bad.get("valid").and_then(|v| v.as_bool()), Some(false));
+
+        // 伪造 root → 验证失败
+        let mut forged_root = proof.clone();
+        forged_root["root"] = serde_json::Value::String(format!("0x{}", hex::encode([0xEE; 32])));
+        let verify_root = api.rabbit_verify_proof(Some(vec![forged_root])).unwrap();
+        assert_eq!(verify_root.get("valid").and_then(|v| v.as_bool()), Some(false));
     }
 
     #[tokio::test]
