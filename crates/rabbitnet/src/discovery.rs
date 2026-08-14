@@ -151,16 +151,12 @@ impl Discovery {
         // REDLINE_ALLOW: listen_addr parse failure propagates as error —
         // silent fallback to 0.0.0.0 would expose the node to all interfaces
         // without the operator's knowledge.
-        let listen_ip = self
-            .config
-            .listen_addr
-            .parse::<IpAddr>()
-            .map_err(|e| {
-                NetworkError::ProtocolError(format!(
-                    "invalid listen_addr '{}': {e}",
-                    self.config.listen_addr
-                ))
-            })?;
+        let listen_ip = self.config.listen_addr.parse::<IpAddr>().map_err(|e| {
+            NetworkError::ProtocolError(format!(
+                "invalid listen_addr '{}': {e}",
+                self.config.listen_addr
+            ))
+        })?;
         let listen_config = ListenConfig::from_ip(listen_ip, self.config.listen_port);
 
         let enr_key = CombinedKey::generate_secp256k1();

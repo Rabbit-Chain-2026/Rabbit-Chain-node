@@ -235,9 +235,7 @@ pub async fn run_node(cfg: RunNodeConfig) -> Result<()> {
         .map(|cfg| cfg.network_id)
         .unwrap_or(10086);
     let spawn_local_miner = mine && !disable_local_miner;
-    let rpc_token_for_miner = rpc_config
-        .as_ref()
-        .and_then(|cfg| cfg.auth_token.clone());
+    let rpc_token_for_miner = rpc_config.as_ref().and_then(|cfg| cfg.auth_token.clone());
     configure_global_block_persistence(Some(PathBuf::from(&p2p_sync_blocks_path)))?;
     if global_latest_block().is_none() {
         global_store_block(genesis.clone())?;
@@ -488,7 +486,11 @@ async fn rpc_call<T: DeserializeOwned>(
 }
 
 fn parse_hex_u256(raw: &str) -> anyhow::Result<U256> {
-    let mut trimmed = raw.trim().strip_prefix("0x").unwrap_or(raw.trim()).to_string();
+    let mut trimmed = raw
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(raw.trim())
+        .to_string();
     if trimmed.is_empty() {
         return Ok(U256::zero());
     }

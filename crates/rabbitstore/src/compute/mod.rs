@@ -2,12 +2,12 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use serde::{Deserialize, Serialize};
 use rabbitcore::compute::{
     execution::ObjectStore,
     primitives::{ObjectId, OutputId, TxId},
     ObjectOutput,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{db::KeyValueDB, Result, StorageError};
 
@@ -144,18 +144,19 @@ impl ComputeStore {
     /// Load all checkpoints ordered by height ascending.
     pub fn list_checkpoints(&self) -> Result<Vec<DurableComputeCheckpoint>> {
         let mut out = Vec::new();
-        self.db.for_each_prefix(CHECKPOINT_PREFIX, &mut |key, value| {
-            if !key.starts_with(CHECKPOINT_PREFIX) {
-                return Ok(());
-            }
-            let Some(payload) = value.strip_prefix(CHECKPOINT_BINARY_MAGIC) else {
-                return Ok(());
-            };
-            if let Ok(entry) = bincode::deserialize::<DurableComputeCheckpoint>(payload) {
-                out.push(entry);
-            }
-            Ok(())
-        })?;
+        self.db
+            .for_each_prefix(CHECKPOINT_PREFIX, &mut |key, value| {
+                if !key.starts_with(CHECKPOINT_PREFIX) {
+                    return Ok(());
+                }
+                let Some(payload) = value.strip_prefix(CHECKPOINT_BINARY_MAGIC) else {
+                    return Ok(());
+                };
+                if let Ok(entry) = bincode::deserialize::<DurableComputeCheckpoint>(payload) {
+                    out.push(entry);
+                }
+                Ok(())
+            })?;
         out.sort_by_key(|e| e.height);
         Ok(out)
     }
@@ -202,8 +203,7 @@ impl ComputeStore {
 
     /// Records a replay key used at `now_unix_secs`.
     pub fn put_replay_key(&self, key: &str, now_unix_secs: u64) -> Result<()> {
-        self.db
-            .put(&replay_key(key), &now_unix_secs.to_be_bytes())
+        self.db.put(&replay_key(key), &now_unix_secs.to_be_bytes())
     }
 
     /// Deletes replay keys older than the retention window.
@@ -332,7 +332,9 @@ impl ObjectStore for ComputeStore {
 
     fn mark_spent(&self, output_id: OutputId) -> rabbitcore::compute::error::ComputeResult<()> {
         let Some(mut output) = self.get_output(output_id) else {
-            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(output_id.0));
+            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(
+                output_id.0,
+            ));
         };
         if output.spent {
             return Err(rabbitcore::compute::ComputeError::InvalidOperation(
@@ -352,7 +354,9 @@ impl ObjectStore for ComputeStore {
 
     fn unmark_spent(&self, output_id: OutputId) -> rabbitcore::compute::error::ComputeResult<()> {
         let Some(mut output) = self.get_output(output_id) else {
-            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(output_id.0));
+            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(
+                output_id.0,
+            ));
         };
         output.spent = false;
         let serialized = encode_output(&output)
@@ -367,7 +371,9 @@ impl ObjectStore for ComputeStore {
 
     fn remove_output(&self, output_id: OutputId) -> rabbitcore::compute::error::ComputeResult<()> {
         let Some(existing) = self.get_output(output_id) else {
-            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(output_id.0));
+            return Err(rabbitcore::compute::ComputeError::ObjectNotFound(
+                output_id.0,
+            ));
         };
         let mut batch = self.db.batch();
         batch.delete(&output_key(output_id));
@@ -591,11 +597,9 @@ fn build_unspent_mpt(
 /// Key = `output_id` (32 bytes). Value = bincode of output with `spent=false`.
 /// Empty set returns the zero hash (matches empty-block mining templates).
 pub fn compute_unspent_mpt_root(outputs: &[ObjectOutput]) -> rabbitcore::crypto::Hash {
-    use rabbitcore::crypto::Hash;
-    match build_unspent_mpt(outputs) {
-        Some((root, _)) => root,
-        None => Hash::zero(),
-    }
+    // 委托 rabbitcore（同一 MPT 核心）避免双实现漂移；proof RPC 的根
+    // 与 header state_root 的 unspent 部分由此保证一致。
+    rabbitcore::state::compute_unspent_mpt_root(outputs)
 }
 
 /// Generate an inclusion proof for `output_id` against the unspent MPT of `outputs`.
@@ -628,7 +632,10 @@ pub fn prove_unspent_output(
 pub fn build_persistent_unspent_mpt(
     outputs: &[ObjectOutput],
     db: Arc<dyn crate::db::KeyValueDB>,
-) -> Option<(rabbitcore::crypto::Hash, std::sync::Arc<crate::trie::MerklePatriciaTrie>)> {
+) -> Option<(
+    rabbitcore::crypto::Hash,
+    std::sync::Arc<crate::trie::MerklePatriciaTrie>,
+)> {
     use crate::trie::{CachedTrieDB, MerklePatriciaTrie, PersistentTrieDB};
     use rabbitcore::crypto::Hash;
     use std::sync::Arc;
@@ -763,6 +770,31 @@ mod tests {
             extensions: vec![],
             spent: false,
         }
+    }
+
+    #[test]
+    fn unspent_mpt_root_matches_rabbitcore_impl() {
+        // 一致性契约：rabbitstore（委托 rabbitcore）与独立计算必须同根，
+        // 保证 header state_root 与 rabbit_getProof 的根一致。
+        let outputs: Vec<rabbitcore::compute::ObjectOutput> = (0..16)
+            .map(|i| {
+                let mut o = sample_output();
+                o.output_id = OutputId(Hash::from_bytes([i as u8; 32]));
+                o.object_id = ObjectId(Hash::from_bytes([i as u8 + 1; 32]));
+                o.state = vec![i, i + 1];
+                o.spent = i % 3 == 0; // 部分已花
+                o
+            })
+            .collect();
+        let root_store = super::compute_unspent_mpt_root(&outputs);
+        let root_core = rabbitcore::state::compute_unspent_mpt_root(&outputs);
+        assert_eq!(
+            root_store, root_core,
+            "MPT root must be deterministic across crates"
+        );
+        assert!(!root_core.is_zero());
+        // 空集 → zero
+        assert!(rabbitcore::state::compute_unspent_mpt_root(&[]).is_zero());
     }
 
     #[test]
@@ -1015,8 +1047,8 @@ mod tests {
 
     #[test]
     fn persistent_replay_registry_survives_new_handle() {
-        use rabbitcore::compute::execution::ReplayNonceRegistry;
         use super::PersistentReplayNonceRegistry;
+        use rabbitcore::compute::execution::ReplayNonceRegistry;
 
         let db = Arc::new(MemDatabase::new());
         let store = Arc::new(ComputeStore::new(db.clone()));

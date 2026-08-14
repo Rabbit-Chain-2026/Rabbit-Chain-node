@@ -395,9 +395,7 @@ impl PeerManager {
                 .get(&b.info.peer_id)
                 .copied()
                 .unwrap_or(0);
-            height_b
-                .cmp(&height_a)
-                .then_with(|| score_b.cmp(&score_a))
+            height_b.cmp(&height_a).then_with(|| score_b.cmp(&score_a))
         });
 
         peers
@@ -519,9 +517,18 @@ impl PeerManager {
     /// Broadcast a message to all active peers except one source peer.
     /// Full outbound buffers drop the message and lower score (do not disconnect).
     pub fn broadcast_except(&self, source_peer_id: &str, message: ProtocolMessage) {
-        for peer in self.peers.read().values().filter(|peer| {
-            peer.status == PeerStatus::Connected && peer.info.peer_id.as_str() != source_peer_id
-        }) {
+        // P2P-H4: collect targets under the read lock, then send after releasing
+        // it — cloning + try_send must not happen while holding the peers lock.
+        let targets: Vec<Arc<Peer>> = self
+            .peers
+            .read()
+            .values()
+            .filter(|peer| {
+                peer.status == PeerStatus::Connected && peer.info.peer_id.as_str() != source_peer_id
+            })
+            .cloned()
+            .collect();
+        for peer in targets {
             if peer.send(message.clone()).is_err() {
                 self.update_score(&peer.info.peer_id, -1);
             }
@@ -530,14 +537,31 @@ impl PeerManager {
 
     /// Update last activity timestamp for a peer.
     pub fn touch_peer(&self, peer_id: &str) -> bool {
+        let now = current_timestamp();
         let mut activity = self.activity.write();
         let Some(last_seen) = activity.get_mut(peer_id) else {
             return false;
         };
-        *last_seen = current_timestamp();
+        let should_refresh_globals = now.saturating_sub(*last_seen) >= 1;
+        *last_seen = now;
         drop(activity);
-        set_global_peers(self.get_active_peer_infos());
+        // P2P-H3: only refresh the global peer snapshot at most once per second —
+        // this method runs on every inbound frame, and the previous code cloned
+        // the whole peer list per frame.
+        if should_refresh_globals {
+            set_global_peers(self.get_active_peer_infos());
+        }
         true
+    }
+
+    /// Return whether a single peer has been idle for longer than `max_idle_secs`.
+    /// Prefer over `stale_peers` when only one peer needs checking (P2P-M3).
+    pub fn is_peer_stale(&self, peer_id: &str, max_idle_secs: u64) -> bool {
+        let now = current_timestamp();
+        self.activity
+            .read()
+            .get(peer_id)
+            .is_some_and(|last_seen| now.saturating_sub(*last_seen) > max_idle_secs)
     }
 
     /// Return peer IDs that have been idle for longer than `max_idle_secs`.

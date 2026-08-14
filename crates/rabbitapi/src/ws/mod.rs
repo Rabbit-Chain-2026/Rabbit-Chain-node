@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::broadcast;
-use tokio_tungstenite::tungstenite::Message;
 
 /// WebSocket error types
 #[derive(Error, Debug, Clone)]

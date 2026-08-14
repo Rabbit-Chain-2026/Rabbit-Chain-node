@@ -9,13 +9,6 @@ use crate::{
     set_global_synced_height, NetworkError, Result,
 };
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
 use rabbitcore::account::Account;
 use rabbitcore::account::U256;
 use rabbitcore::block::{
@@ -24,11 +17,21 @@ use rabbitcore::block::{
 };
 use rabbitcore::crypto::Address;
 use rabbitcore::crypto::Hash;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
 
 const SYNC_TICK_SECS: u64 = 2;
 const SYNC_RESPONSE_TIMEOUT_SECS: u64 = 3;
 const SYNC_BATCH_LIMIT: u64 = 8;
 const SYNC_REORG_BATCH_LIMIT: u64 = 512;
+// Cap on how far ahead of the local head a peer-announced height may pull the
+// sync target (10 s blocks ⇒ ~28 hours). Guards against bogus HEAD announcements.
+const MAX_SYNC_TARGET_AHEAD: u64 = 10_000;
 const TARGET_BLOCK_INTERVAL_SECS: u64 = 10;
 const MIN_MINING_DIFFICULTY: u128 = 250_000;
 const BASE_MINING_DIFFICULTY: u128 = 1_000_000;
@@ -280,7 +283,13 @@ impl SyncManager {
                 if local > *local_height.read() {
                     *local_height.write() = local;
                 }
-                let target_head = peer_manager.highest_peer_height().max(target);
+                // P2P-H6: clamp the target head so a malicious peer announcing a
+                // bogus huge height cannot drive the sync loop into endless
+                // header fetches. Honest peers stay well within this window.
+                let target_head = peer_manager
+                    .highest_peer_height()
+                    .max(target)
+                    .min(local.saturating_add(MAX_SYNC_TARGET_AHEAD));
                 if local >= target_head {
                     *state.write() = SyncState::Complete;
                     if let Some(peer) = peer_manager.get_best_peers(1).into_iter().next() {
@@ -968,7 +977,8 @@ fn validate_header_contents(
         legacy_data.extend_from_slice(header.parent_hash.as_bytes());
         legacy_data.extend_from_slice(&header.number.as_u64().to_be_bytes());
         legacy_data.extend_from_slice(&header.nonce.to_be_bytes());
-        header.mix_hash == rabbitcore::crypto::Hash::from_bytes(rabbitcore::crypto::keccak256(&legacy_data))
+        header.mix_hash
+            == rabbitcore::crypto::Hash::from_bytes(rabbitcore::crypto::keccak256(&legacy_data))
     } else {
         false
     };
@@ -977,7 +987,11 @@ fn validate_header_contents(
         return Err("mix_hash_mismatch".to_string());
     }
 
-    let pow_hash = if mix_ok { expected_mix } else { header.mix_hash };
+    let pow_hash = if mix_ok {
+        expected_mix
+    } else {
+        header.mix_hash
+    };
 
     // Verify against the block's own difficulty (not parent), matching BlockHeader::verify_pow.
     let mut digest = [0u8; 32];
@@ -1200,9 +1214,9 @@ pub(crate) fn derive_state_proof(block_hash: &Hash, snapshot: &SyncStateSnapshot
 mod tests {
     use super::*;
     use once_cell::sync::Lazy;
-    use tokio::sync::Mutex;
     use rabbitcore::account::{Account, AccountState};
     use rabbitcore::block::create_genesis_block;
+    use tokio::sync::Mutex;
 
     // Use the crate-level test lock so lib tests and sync tests don't
     // race on the global block cache.

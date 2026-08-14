@@ -27,6 +27,10 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use rabbitcore::account::Account;
+use rabbitcore::account::U256;
+use rabbitcore::block::{Block, BlockBody, BlockBodyRecord, BlockHeader, CANONICAL_BLOCK_VERSION};
+use rabbitcore::crypto::Hash;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -45,10 +49,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
 use uuid::Uuid;
-use rabbitcore::account::Account;
-use rabbitcore::account::U256;
-use rabbitcore::block::{Block, BlockBody, BlockBodyRecord, BlockHeader, CANONICAL_BLOCK_VERSION};
-use rabbitcore::crypto::Hash;
 
 static GLOBAL_PEER_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_PEER_INFOS: Lazy<RwLock<Vec<PeerInfo>>> = Lazy::new(|| RwLock::new(Vec::new()));
@@ -99,6 +99,16 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const CONTROL_FRAME_MAX_LEN: usize = 16 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const PEER_IDLE_TIMEOUT_SECS: u64 = 45;
+// Total deadline for reading one control frame (covers slow-drip frames that never
+// send a newline). Must exceed PEER_IDLE_TIMEOUT_SECS so healthy peers that only
+// answer our PINGs with PONGs are never disconnected.
+const FRAME_READ_TIMEOUT_SECS: u64 = 60;
+// Write deadline for outbound frames; guards against a peer that stops reading
+// (TCP window full) but keeps the connection open.
+const WRITE_TIMEOUT_SECS: u64 = 15;
+// Backoff after a transient accept error (EMFILE etc.) before retrying the accept
+// loop; prevents a permanent listener death on transient resource exhaustion.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 500;
 const PEER_SEND_BUFFER: usize = 256;
 const DEFAULT_DEDUP_TTL_SECS: u64 = 5 * 60;
 const MAX_DEDUP_ENTRIES: usize = 8192;
@@ -116,23 +126,54 @@ trait PeerWire: Send + Unpin {
 
 struct TcpPeerWire {
     stream: TcpStream,
+    // Connection-level read buffer. Persists across cancelled read_line futures
+    // (tokio::select! / timeout cancellation), so bytes already consumed from the
+    // kernel are never lost — this is what makes the control-frame read loop
+    // cancel-safe (P2P-C5).
+    read_buf: Vec<u8>,
 }
 
 impl TcpPeerWire {
     fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            read_buf: Vec::with_capacity(1024),
+        }
     }
 }
 
 #[async_trait]
 impl PeerWire for TcpPeerWire {
     async fn read_line(&mut self, max_len: usize) -> io::Result<Option<String>> {
-        let mut line = Vec::with_capacity(64);
         loop {
-            let mut b = [0u8; 1];
-            let read = self.stream.read(&mut b).await?;
+            // Drain a complete line from the connection buffer first.
+            if let Some(pos) = self.read_buf.iter().position(|b| *b == b'\n') {
+                let raw: Vec<u8> = self.read_buf.drain(..=pos).collect();
+                let line = &raw[..raw.len() - 1];
+                if line.len() > max_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "line frame too long",
+                    ));
+                }
+                return String::from_utf8(line.to_vec())
+                    .map(Some)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+            }
+
+            // Guard against unbounded buffering while waiting for the newline.
+            if self.read_buf.len() > max_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "line frame too long",
+                ));
+            }
+
+            // Batch read (P2P-M1): one syscall per 4 KiB chunk instead of per byte.
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
             if read == 0 {
-                return if line.is_empty() {
+                return if self.read_buf.is_empty() {
                     Ok(None)
                 } else {
                     Err(io::Error::new(
@@ -141,25 +182,25 @@ impl PeerWire for TcpPeerWire {
                     ))
                 };
             }
-            if b[0] == b'\n' {
-                break;
-            }
-            line.push(b[0]);
-            if line.len() > max_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "line frame too long",
-                ));
-            }
+            self.read_buf.extend_from_slice(&chunk[..read]);
         }
-
-        String::from_utf8(line)
-            .map(Some)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     async fn write_line(&mut self, line: &str) -> io::Result<()> {
-        self.stream.write_all(line.as_bytes()).await
+        // P2P-M2: a peer that stops reading (full TCP window) must not hang the
+        // monitor task forever. Partial writes on timeout are acceptable because
+        // the connection is being torn down anyway.
+        timeout(
+            std::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+            self.stream.write_all(line.as_bytes()),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer write timed out (peer not reading)",
+            )
+        })?
     }
 }
 
@@ -319,8 +360,8 @@ pub fn global_store_block(block: rabbitcore::block::Block) -> Result<()> {
 
     if let Some(body) = block.body.clone() {
         // Track whether the header had zero roots before reconciliation.
-        let roots_were_zero = block.header.transactions_root.is_zero()
-            && block.header.receipts_root.is_zero();
+        let roots_were_zero =
+            block.header.transactions_root.is_zero() && block.header.receipts_root.is_zero();
         block
             .header
             .reconcile_body_commitments(&body)
@@ -332,7 +373,8 @@ pub fn global_store_block(block: rabbitcore::block::Block) -> Result<()> {
         // be recomputed because it binds the transactions/receipts roots.
         // Genesis blocks (height 0) are exempt from PoW.
         if roots_were_zero && height > 0 {
-            let recomputed_mix = rabbitcore::block::compute_pow_hash(&block.header, block.header.nonce);
+            let recomputed_mix =
+                rabbitcore::block::compute_pow_hash(&block.header, block.header.nonce);
             block.header.mix_hash = recomputed_mix;
         }
         block.header.hash = block.header.compute_hash();
@@ -1362,10 +1404,10 @@ pub struct NetworkService {
 impl NetworkService {
     /// Create new network service
     pub fn new(config: NetworkConfig) -> Result<Self> {
-            configure_global_block_persistence(config.sync_blocks_path.clone())?;
-            configure_global_block_activation_height(config.canonical_block_activation_height);
+        configure_global_block_persistence(config.sync_blocks_path.clone())?;
+        configure_global_block_activation_height(config.canonical_block_activation_height);
         let local_peer_id = resolve_local_peer_id(&config)?;
-                let peer_manager = Arc::new(PeerManager::new_with_policy(
+        let peer_manager = Arc::new(PeerManager::new_with_policy(
             config.max_peers,
             config.banlist_path.clone().map(PathBuf::from),
             config.ban_duration_secs,
@@ -1431,7 +1473,12 @@ impl NetworkService {
 
         // Start discovery
         if let Some(discovery) = &self.discovery {
-            discovery.start().await?;
+            if let Err(err) = discovery.start().await {
+                // P2P-H7: on partial startup failure, tear down already-spawned
+                // listeners instead of leaking them half-open.
+                self.abort_listener_tasks();
+                return Err(err);
+            }
             tracing::info!(
                 "bootnode enode hint: enode://{}@{}:{}",
                 self.local_peer_id,
@@ -1449,7 +1496,14 @@ impl NetworkService {
 
         // Start sync
         if let Some(sync) = &self.sync_manager {
-            sync.start_default().await?;
+            if let Err(err) = sync.start_default().await {
+                // P2P-H7: same partial-startup cleanup as above.
+                self.abort_listener_tasks();
+                if let Some(task) = self.discovery_dial_task.write().take() {
+                    task.abort();
+                }
+                return Err(err);
+            }
             if self.config.sync_auto_advance {
                 self.start_sync_head_advancer(sync.clone());
             }
@@ -1462,6 +1516,16 @@ impl NetworkService {
         tracing::info!("Network service started");
 
         Ok(())
+    }
+
+    /// Abort listener tasks (used on partial startup failure and on stop).
+    fn abort_listener_tasks(&self) {
+        if let Some(task) = self.listener_task.write().take() {
+            task.abort();
+        }
+        if let Some(task) = self.ws_listener_task.write().take() {
+            task.abort();
+        }
     }
 
     /// Stop network service
@@ -1645,70 +1709,87 @@ impl NetworkService {
                             continue;
                         }
 
-                        let mut wire: BoxedPeerWire = Box::new(TcpPeerWire::new(stream));
-                        let (remote_network_id, remote_peer_id) = match inbound_handshake(
-                            wire.as_mut(),
-                            expected_network_id,
-                            &local_peer_id,
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "inbound handshake failed from {}: {}",
-                                    remote_addr,
-                                    err
-                                );
-                                continue;
-                            }
-                        };
+                        // P2P-C1: handshake (up to 5s) must not run inside the accept
+                        // loop — a slow client would serially block all inbound
+                        // accepts. Spawn a per-connection task that performs the
+                        // handshake, registers the peer and then runs the monitor.
+                        let pm = peer_manager.clone();
+                        let sm = sync_manager.clone();
+                        let expected = expected_network_id;
+                        let local = local_peer_id.clone();
+                        let ban_duration = ban_duration_secs;
+                        let max_gossip = max_gossip_per_peer_per_minute;
+                        tokio::spawn(async move {
+                            let mut wire: BoxedPeerWire = Box::new(TcpPeerWire::new(stream));
+                            let (remote_network_id, remote_peer_id) =
+                                match inbound_handshake(wire.as_mut(), expected, &local).await {
+                                    Ok(v) => v,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "inbound handshake failed from {}: {}",
+                                            remote_addr,
+                                            err
+                                        );
+                                        return;
+                                    }
+                                };
 
-                        let node_record = NodeRecord {
-                            peer_id: remote_peer_id.clone(),
-                            ip: remote_addr.ip().to_string(),
-                            tcp_port: remote_addr.port(),
-                            udp_port: remote_addr.port(),
-                            network_id: remote_network_id,
-                        };
+                            let node_record = NodeRecord {
+                                peer_id: remote_peer_id.clone(),
+                                ip: remote_addr.ip().to_string(),
+                                tcp_port: remote_addr.port(),
+                                udp_port: remote_addr.port(),
+                                network_id: remote_network_id,
+                            };
 
-                        let (tx, rx) = mpsc::channel(PEER_SEND_BUFFER);
-                        match peer_manager.add_peer_with_sender(node_record, tx) {
-                            Ok(inserted) => {
-                                if !inserted {
-                                    tracing::debug!(
-                                        "skipping duplicate inbound peer {} from {}",
-                                        remote_peer_id,
-                                        remote_addr
+                            let (tx, rx) = mpsc::channel(PEER_SEND_BUFFER);
+                            match pm.add_peer_with_sender(node_record, tx) {
+                                Ok(inserted) => {
+                                    if !inserted {
+                                        tracing::debug!(
+                                            "skipping duplicate inbound peer {} from {}",
+                                            remote_peer_id,
+                                            remote_addr
+                                        );
+                                        // Dropping the wire closes the connection.
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "failed to register inbound peer {}: {}",
+                                        remote_addr,
+                                        err
                                     );
-                                    continue;
+                                    return;
                                 }
                             }
-                            Err(err) => {
-                                tracing::warn!(
-                                    "failed to register inbound peer {}: {}",
-                                    remote_addr,
-                                    err
-                                );
-                                continue;
-                            }
-                        }
 
-                        set_global_peer_count(peer_manager.peer_count());
-                        set_global_peers(peer_manager.get_active_peer_infos());
-                        tokio::spawn(monitor_peer_socket(
-                            peer_manager.clone(),
-                            remote_peer_id,
-                            wire,
-                            rx,
-                            ban_duration_secs,
-                            max_gossip_per_peer_per_minute,
-                            sync_manager.clone(),
-                        ));
+                            set_global_peer_count(pm.peer_count());
+                            set_global_peers(pm.get_active_peer_infos());
+                            let handle = tokio::spawn(monitor_peer_socket(
+                                pm.clone(),
+                                remote_peer_id.clone(),
+                                wire,
+                                rx,
+                                ban_duration,
+                                max_gossip,
+                                sm,
+                            ));
+                            // P2P-C4: register the monitor task so remove_peer /
+                            // stop() can abort it promptly instead of waiting for
+                            // channel-drop teardown.
+                            pm.register_peer_task(&remote_peer_id, handle);
+                        });
                     }
                     Err(err) => {
+                        // P2P-M8: transient accept errors (EMFILE etc.) must not
+                        // permanently kill the listener; back off briefly and retry.
                         tracing::warn!("P2P accept error: {}", err);
-                        break;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            ACCEPT_ERROR_BACKOFF_MS,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -1788,81 +1869,93 @@ impl NetworkService {
                             continue;
                         }
 
-                        let ws_stream = match accept_async(stream).await {
-                            Ok(ws_stream) => ws_stream,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "websocket accept failed from {}: {}",
-                                    remote_addr,
-                                    err
-                                );
-                                continue;
-                            }
-                        };
-                        let mut wire: BoxedPeerWire = Box::new(WsPeerWire::new(ws_stream));
-                        let (remote_network_id, remote_peer_id) = match inbound_handshake(
-                            wire.as_mut(),
-                            expected_network_id,
-                            &local_peer_id,
-                        )
-                        .await
-                        {
-                            Ok(v) => v,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "websocket inbound handshake failed from {}: {}",
-                                    remote_addr,
-                                    err
-                                );
-                                continue;
-                            }
-                        };
-
-                        let node_record = NodeRecord {
-                            peer_id: remote_peer_id.clone(),
-                            ip: remote_ip,
-                            tcp_port: remote_addr.port(),
-                            udp_port: remote_addr.port(),
-                            network_id: remote_network_id,
-                        };
-
-                        let (tx, rx) = mpsc::channel(PEER_SEND_BUFFER);
-                        match peer_manager.add_peer_with_sender_at(node_record, remote_addr, tx) {
-                            Ok(inserted) => {
-                                if !inserted {
-                                    tracing::debug!(
-                                        "skipping duplicate websocket peer {} from {}",
-                                        remote_peer_id,
-                                        remote_addr
+                        // P2P-C1 (websocket): websocket accept + handshake also run
+                        // inside a spawned task so slow clients cannot block the
+                        // inbound accept loop.
+                        let pm = peer_manager.clone();
+                        let sm = sync_manager.clone();
+                        let expected = expected_network_id;
+                        let local = local_peer_id.clone();
+                        let ban_duration = ban_duration_secs;
+                        let max_gossip = max_gossip_per_peer_per_minute;
+                        tokio::spawn(async move {
+                            let ws_stream = match accept_async(stream).await {
+                                Ok(ws_stream) => ws_stream,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "websocket accept failed from {}: {}",
+                                        remote_addr,
+                                        err
                                     );
-                                    continue;
+                                    return;
+                                }
+                            };
+                            let mut wire: BoxedPeerWire = Box::new(WsPeerWire::new(ws_stream));
+                            let (remote_network_id, remote_peer_id) =
+                                match inbound_handshake(wire.as_mut(), expected, &local).await {
+                                    Ok(v) => v,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "websocket inbound handshake failed from {}: {}",
+                                            remote_addr,
+                                            err
+                                        );
+                                        return;
+                                    }
+                                };
+
+                            let node_record = NodeRecord {
+                                peer_id: remote_peer_id.clone(),
+                                ip: remote_ip,
+                                tcp_port: remote_addr.port(),
+                                udp_port: remote_addr.port(),
+                                network_id: remote_network_id,
+                            };
+
+                            let (tx, rx) = mpsc::channel(PEER_SEND_BUFFER);
+                            match pm.add_peer_with_sender_at(node_record, remote_addr, tx) {
+                                Ok(inserted) => {
+                                    if !inserted {
+                                        tracing::debug!(
+                                            "skipping duplicate websocket peer {} from {}",
+                                            remote_peer_id,
+                                            remote_addr
+                                        );
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "failed to register websocket peer {}: {}",
+                                        remote_addr,
+                                        err
+                                    );
+                                    return;
                                 }
                             }
-                            Err(err) => {
-                                tracing::warn!(
-                                    "failed to register websocket peer {}: {}",
-                                    remote_addr,
-                                    err
-                                );
-                                continue;
-                            }
-                        }
 
-                        set_global_peer_count(peer_manager.peer_count());
-                        set_global_peers(peer_manager.get_active_peer_infos());
-                        tokio::spawn(monitor_peer_socket(
-                            peer_manager.clone(),
-                            remote_peer_id,
-                            wire,
-                            rx,
-                            ban_duration_secs,
-                            max_gossip_per_peer_per_minute,
-                            sync_manager.clone(),
-                        ));
+                            set_global_peer_count(pm.peer_count());
+                            set_global_peers(pm.get_active_peer_infos());
+                            let handle = tokio::spawn(monitor_peer_socket(
+                                pm.clone(),
+                                remote_peer_id.clone(),
+                                wire,
+                                rx,
+                                ban_duration,
+                                max_gossip,
+                                sm,
+                            ));
+                            // P2P-C4: register the monitor task for prompt teardown.
+                            pm.register_peer_task(&remote_peer_id, handle);
+                        });
                     }
                     Err(err) => {
+                        // P2P-M8 (websocket): transient errors must not kill the listener.
                         tracing::warn!("P2P websocket accept error: {}", err);
-                        break;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            ACCEPT_ERROR_BACKOFF_MS,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -2154,15 +2247,17 @@ async fn connect_websocket_bootnode(
     set_global_peer_count(peer_manager.peer_count());
     set_global_peers(peer_manager.get_active_peer_infos());
 
-    tokio::spawn(monitor_peer_socket(
-        peer_manager,
-        remote_peer_id,
+    let handle = tokio::spawn(monitor_peer_socket(
+        peer_manager.clone(),
+        remote_peer_id.clone(),
         wire,
         rx,
         ban_duration_secs,
         max_gossip_per_peer_per_minute,
         sync_manager,
     ));
+    // P2P-C4: register the monitor task for prompt teardown on remove/stop.
+    peer_manager.register_peer_task(&remote_peer_id, handle);
 
     Ok(())
 }
@@ -2242,15 +2337,17 @@ async fn connect_node_record(
     set_global_peer_count(peer_manager.peer_count());
     set_global_peers(peer_manager.get_active_peer_infos());
 
-    tokio::spawn(monitor_peer_socket(
-        peer_manager,
-        remote_peer_id,
+    let handle = tokio::spawn(monitor_peer_socket(
+        peer_manager.clone(),
+        remote_peer_id.clone(),
         wire,
         rx,
         ban_duration_secs,
         max_gossip_per_peer_per_minute,
         sync_manager,
     ));
+    // P2P-C4: register the monitor task for prompt teardown on remove/stop.
+    peer_manager.register_peer_task(&remote_peer_id, handle);
 
     Ok(())
 }
@@ -2280,11 +2377,8 @@ async fn monitor_peer_socket(
                     tracing::debug!("heartbeat write failed for {}: {}", peer_id, err);
                     break;
                 }
-                if peer_manager
-                    .stale_peers(PEER_IDLE_TIMEOUT_SECS)
-                    .iter()
-                    .any(|id| id == &peer_id)
-                {
+                // P2P-M3: single-peer staleness check instead of a full table scan.
+                if peer_manager.is_peer_stale(&peer_id, PEER_IDLE_TIMEOUT_SECS) {
                     tracing::info!("peer {} considered stale, disconnecting", peer_id);
                     break;
                 }
@@ -2303,6 +2397,28 @@ async fn monitor_peer_socket(
                 }
             }
             frame = read_control_frame(stream.as_mut()) => {
+                // P2P-H2: sync request/response frames can be large (up to the
+                // 16 MiB control frame limit) and cheap to request — apply the
+                // same per-peer rate quota as gossip frames so a peer cannot
+                // amplify CPU/memory work (e.g. repeated GET_STATE_SNAPSHOT
+                // triggering a full-state snapshot build per request).
+                let is_sync_frame = matches!(
+                    frame,
+                    Ok(ControlFrame::SyncGetHeaders { .. })
+                        | Ok(ControlFrame::SyncHeaders(_))
+                        | Ok(ControlFrame::SyncGetBlockBody { .. })
+                        | Ok(ControlFrame::SyncBlockBody(_))
+                        | Ok(ControlFrame::SyncGetStateSnapshot { .. })
+                        | Ok(ControlFrame::SyncStateSnapshot(_))
+                );
+                if is_sync_frame {
+                    let now = current_timestamp();
+                    if !allow_rate_window(&mut inbound_window, max_gossip_per_peer_per_minute, now) {
+                        tracing::warn!("peer {} exceeded sync frame rate limit", peer_id);
+                        peer_manager.ban_peer(&peer_id, ban_duration_secs.min(300));
+                        break;
+                    }
+                }
                 match frame {
                     Ok(ControlFrame::Ping) => {
                         let _ = peer_manager.touch_peer(&peer_id);
@@ -2442,7 +2558,16 @@ enum ControlFrame {
 }
 
 async fn read_control_frame(stream: &mut dyn PeerWire) -> std::io::Result<ControlFrame> {
-    let Some(line) = stream.read_line(CONTROL_FRAME_MAX_LEN).await? else {
+    // P2P-C2: a total deadline on the whole frame read prevents a peer that drips
+    // bytes without ever sending a newline from squatting a peer slot indefinitely.
+    // The buffer-based read_line is cancel-safe, so the timeout cannot lose bytes.
+    let Some(line) = timeout(
+        std::time::Duration::from_secs(FRAME_READ_TIMEOUT_SECS),
+        stream.read_line(CONTROL_FRAME_MAX_LEN),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame read timed out"))??
+    else {
         return Ok(ControlFrame::Eof);
     };
     let normalized = line.trim();
@@ -2568,9 +2693,10 @@ async fn write_protocol_message(
         ProtocolMessage::NewComputeTx(tx_hash) => {
             Some(format!("RABBIT/COMPUTE_TX {}\n", hash_to_hex(&tx_hash)))
         }
-        ProtocolMessage::NewBlock(block) => {
-            Some(format!("RABBIT/BLOCK {}\n", hash_to_hex(&block.header.hash)))
-        }
+        ProtocolMessage::NewBlock(block) => Some(format!(
+            "RABBIT/BLOCK {}\n",
+            hash_to_hex(&block.header.hash)
+        )),
         ProtocolMessage::NewBlockHash(block_hash) => {
             Some(format!("RABBIT/BLOCK {}\n", hash_to_hex(&block_hash)))
         }
@@ -2581,9 +2707,10 @@ async fn write_protocol_message(
         ProtocolMessage::SyncGetHeaders { start, limit } => {
             Some(format!("RABBIT/GET_HEADERS {} {}\n", start, limit))
         }
-        ProtocolMessage::SyncHeaders(headers) => {
-            Some(format!("RABBIT/HEADERS {}\n", format_sync_headers(&headers)))
-        }
+        ProtocolMessage::SyncHeaders(headers) => Some(format!(
+            "RABBIT/HEADERS {}\n",
+            format_sync_headers(&headers)
+        )),
         ProtocolMessage::SyncGetBlockBody { block_hash } => Some(format!(
             "RABBIT/GET_BLOCK_BODY {}\n",
             hash_to_hex(&block_hash)
@@ -2847,7 +2974,11 @@ fn mark_seen_hash(seen: &Lazy<RwLock<HashMap<String, u64>>>, key: String, now: u
         store.retain(|_, ts| *ts >= threshold);
         // If still over limit after threshold eviction (many equal timestamps), drop arbitrarily.
         while store.len() >= MAX_DEDUP_ENTRIES {
-            if let Some(oldest_key) = store.iter().min_by_key(|(_, &ts)| ts).map(|(k, _)| k.clone()) {
+            if let Some(oldest_key) = store
+                .iter()
+                .min_by_key(|(_, &ts)| ts)
+                .map(|(k, _)| k.clone())
+            {
                 store.remove(&oldest_key);
             } else {
                 break;

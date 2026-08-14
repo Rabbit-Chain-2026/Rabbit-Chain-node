@@ -176,7 +176,10 @@ mod tests {
             ProtocolMessage::AnnounceHead(h) => assert_eq!(h, 99),
             _ => panic!("wrong variant"),
         }
-        let msg = ProtocolMessage::SyncGetHeaders { start: 5, limit: 10 };
+        let msg = ProtocolMessage::SyncGetHeaders {
+            start: 5,
+            limit: 10,
+        };
         match msg {
             ProtocolMessage::SyncGetHeaders { start, limit } => {
                 assert_eq!(start, 5);
@@ -193,8 +196,7 @@ mod tests {
             result: serde_json::json!({"status": "ok", "gas_used": 21000}),
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        let deserialized: SyncComputeTxRecord =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: SyncComputeTxRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.tx_hash, record.tx_hash);
         assert_eq!(deserialized.result["status"], "ok");
         assert_eq!(deserialized.result["gas_used"], 21000);

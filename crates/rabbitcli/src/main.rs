@@ -247,9 +247,6 @@ enum Commands {
         miner_id: String,
     },
 
-    /// Console placeholder (not implemented)
-    Console,
-
     /// Version information
     Version,
 
@@ -805,9 +802,6 @@ async fn main() -> Result<()> {
             miner_id,
         }) => {
             commands::run::run_remote_miner(rpc_url, rpc_token, miner_id).await?;
-        }
-        Some(Commands::Console) => {
-            commands::console::start_console().await?;
         }
         Some(Commands::Version) => {
             println!("RabbitChain v{}", env!("CARGO_PKG_VERSION"));
