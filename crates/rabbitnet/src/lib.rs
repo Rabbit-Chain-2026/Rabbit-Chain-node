@@ -3561,4 +3561,132 @@ mod tests {
             Some("wss://boot1.rabbitchain.org/p2p")
         );
     }
+
+    // ─── TcpPeerWire read cancel-safety (P2P-C5 regression tests) ───
+
+    /// P2P-C5: cancelling read_line mid-frame must not lose bytes already read
+    /// from the kernel. The connection-level buffer keeps them for the next call.
+    #[tokio::test]
+    async fn read_line_is_cancel_safe() {
+        use std::io::Write;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // 第一阶段：只写半行（无 \n），让客户端读到部分数据后挂起
+            sock.write_all(b"partial-line-no-newline").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            // 第二阶段：补全行尾，此时客户端第二次 read_line 应从 buffer 续读
+            sock.write_all(b"-rest\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut wire = TcpPeerWire::new(stream);
+
+        // 第一次读：读到部分字节后（无换行）被取消 —— 模拟 select! 分支 drop
+        let cancelled = {
+            let fut = wire.read_line(1024);
+            tokio::pin!(fut);
+            let mut cancelled = false;
+            tokio::select! {
+                _ = &mut fut => panic!("read_line must not complete without a newline"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    cancelled = true;
+                }
+            }
+            cancelled
+        };
+        assert!(cancelled, "select should have cancelled the read");
+
+        // 第二次读：完整行必须等于 半行+行尾（无字节丢失）
+        let line = wire.read_line(1024).await.expect("read complete line");
+        assert_eq!(
+            line.as_deref(),
+            Some("partial-line-no-newline-rest"),
+            "cancel must not lose bytes already read"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_line_cancel_safe_with_timeout_wrapper() {
+        use std::io::Write;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"abc").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            sock.write_all(b"def\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut wire = TcpPeerWire::new(stream);
+
+        // timeout() 与 select! 一样会取消内部 future；缓冲必须保住 "abc"
+        let res =
+            tokio::time::timeout(std::time::Duration::from_millis(60), wire.read_line(1024)).await;
+        assert!(res.is_err(), "short timeout must cancel the read");
+
+        let line = wire.read_line(1024).await.expect("read after timeout");
+        assert_eq!(
+            line.as_deref(),
+            Some("abcdef"),
+            "timeout must not lose bytes"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_line_rejects_overlong_frames() {
+        use std::io::Write;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&[b'x'; 2048]).await.unwrap(); // 无换行
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut wire = TcpPeerWire::new(stream);
+        let err = wire
+            .read_line(1024)
+            .await
+            .expect_err("must reject overlong");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_line_handles_eof_and_half_frame() {
+        // 对端干净关闭：空缓冲 → Ok(None)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            drop(sock);
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut wire = TcpPeerWire::new(stream);
+        assert_eq!(wire.read_line(1024).await.unwrap(), None);
+        server.await.unwrap();
+
+        // 半行后关闭：Err(UnexpectedEof)
+        use std::io::Write;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"half").await.unwrap();
+            drop(sock);
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut wire = TcpPeerWire::new(stream);
+        let err = wire
+            .read_line(1024)
+            .await
+            .expect_err("half frame must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        server.await.unwrap();
+    }
 }
