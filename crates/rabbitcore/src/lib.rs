@@ -26,6 +26,7 @@ pub mod crypto;
 pub mod game;
 pub mod governance;
 pub mod state;
+pub mod trie;
 
 // Re-export commonly used types
 pub use account::{Account, AccountManager, AccountType};

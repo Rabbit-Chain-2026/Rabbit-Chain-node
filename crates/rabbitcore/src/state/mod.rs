@@ -223,3 +223,35 @@ mod tests {
         assert_eq!(state.get_nonce(&address), 0);
     }
 }
+
+/// 计算 unspent output 集的 MPT 状态根（共识：跨节点一致）。
+///
+/// 与 rabbitstore 的 `compute_unspent_mpt_root` 同算法（同一 MPT 核心，
+/// 排序 output_id 后逐个插入 MemTrieDB），保证 header state_root 的
+/// unspent 部分与 `rabbit_getProof` 返回的根一致。空集 → zero hash。
+pub fn compute_unspent_mpt_root(outputs: &[crate::compute::ObjectOutput]) -> Hash {
+    use std::sync::Arc;
+    let mut live: Vec<&crate::compute::ObjectOutput> =
+        outputs.iter().filter(|o| !o.spent).collect();
+    if live.is_empty() {
+        return Hash::zero();
+    }
+    live.sort_by(|a, b| a.output_id.0.as_bytes().cmp(b.output_id.0.as_bytes()));
+
+    let db = Arc::new(crate::trie::MemTrieDB::new());
+    let trie = Arc::new(crate::trie::MerklePatriciaTrie::new(db));
+    for out in live {
+        let mut clean = (*out).clone();
+        clean.spent = false;
+        let value = match bincode::serialize(&clean) {
+            Ok(v) => v,
+            Err(_) => return Hash::zero(),
+        };
+        let _ = trie.insert(out.output_id.0.as_bytes(), value);
+    }
+    let root = trie.root();
+    if root == crate::trie::empty_trie_root() {
+        return Hash::zero();
+    }
+    root
+}
