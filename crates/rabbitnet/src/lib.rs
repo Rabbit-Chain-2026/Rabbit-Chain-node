@@ -1613,16 +1613,6 @@ impl NetworkService {
         Some(format!("ws://{host}:{port}/p2p"))
     }
 
-    /// Add peer
-    pub fn add_peer(&self, node_record: NodeRecord) -> Result<()> {
-        let result = self.peer_manager.add_peer(node_record);
-        if result.is_ok() {
-            set_global_peer_count(self.peer_manager.peer_count());
-            set_global_peers(self.peer_manager.get_active_peer_infos());
-        }
-        result
-    }
-
     /// Remove peer
     pub fn remove_peer(&self, peer_id: &str) -> Result<()> {
         let result = self.peer_manager.remove_peer(peer_id);
@@ -2701,9 +2691,6 @@ async fn write_protocol_message(
             Some(format!("RABBIT/BLOCK {}\n", hash_to_hex(&block_hash)))
         }
         ProtocolMessage::AnnounceHead(height) => Some(format!("RABBIT/HEAD {}\n", height)),
-        ProtocolMessage::GetBlock(block_hash) => {
-            Some(format!("RABBIT/GETBLOCK {}\n", hash_to_hex(&block_hash)))
-        }
         ProtocolMessage::SyncGetHeaders { start, limit } => {
             Some(format!("RABBIT/GET_HEADERS {} {}\n", start, limit))
         }
@@ -2726,7 +2713,6 @@ async fn write_protocol_message(
             "RABBIT/STATE_SNAPSHOT_V2 {}\n",
             encode_sync_payload(&snapshot)?
         )),
-        ProtocolMessage::Block(_) => None,
     };
 
     if let Some(line) = maybe_line {

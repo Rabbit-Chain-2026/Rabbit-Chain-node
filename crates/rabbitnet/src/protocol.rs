@@ -64,8 +64,6 @@ pub enum ProtocolMessage {
     NewBlockHash(Hash),
     /// Announce current local head height.
     AnnounceHead(u64),
-    /// Request block
-    GetBlock(Hash),
     /// Request headers in `[start, start + limit)`.
     SyncGetHeaders { start: u64, limit: u64 },
     /// Header response batch.
@@ -78,8 +76,6 @@ pub enum ProtocolMessage {
     SyncGetStateSnapshot { block_number: u64 },
     /// Snapshot response.
     SyncStateSnapshot(SyncStateSnapshot),
-    /// Block response
-    Block(Box<Block>),
 }
 
 /// Protocol trait

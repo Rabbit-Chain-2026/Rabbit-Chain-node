@@ -270,13 +270,6 @@ impl PeerManager {
         Ok(true)
     }
 
-    /// Add peer
-    pub fn add_peer(&self, node_record: crate::discovery::NodeRecord) -> Result<()> {
-        let (tx, _rx) = mpsc::channel(64);
-        let _ = self.add_peer_with_sender(node_record, tx)?;
-        Ok(())
-    }
-
     /// Remove peer
     pub fn remove_peer(&self, peer_id: &str) -> Result<()> {
         self.peers.write().remove(peer_id);
